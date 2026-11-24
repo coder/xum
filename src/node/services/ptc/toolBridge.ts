@@ -2,8 +2,9 @@
  * Tool Bridge for PTC
  *
  * Bridges Xum tools into the QuickJS sandbox, making them callable via `xum.*`
- * (canonical) and `mux.*` (compatibility alias). Handles argument validation via
- * Zod schemas and result serialization.
+ * (canonical) and `mux.*` (compatibility alias). Handles argument validation
+ * (Zod-schema tools validate host-side; JSON-Schema-based tools such as MCP
+ * pass through to server-side validation) and result serialization.
  */
 
 import { randomUUID } from "node:crypto";
@@ -13,11 +14,45 @@ import type { IJSRuntime } from "./runtime";
 import type { KernelFileLoader } from "@/node/services/tools/kernelFileLoad";
 import { KERNEL_COMPACT_ARGS_CAP_BYTES } from "@/constants/kernelOutput";
 import { RESULT_HANDLE_OFFLOAD_THRESHOLD_BYTES } from "@/constants/resultHandles";
+import { raceWithAbortAndTimeout } from "@/node/utils/concurrency/withTimeout";
+import { MAX_EXTRACTED_TOOL_MEDIA_PARTS_PER_REQUEST } from "@/common/constants/imageAttachments";
 import {
   FULL_GRANTS,
   isBridgeToolGranted,
   type CapabilityGrants,
 } from "@/common/types/capabilityGrants";
+import { formatToolInputIssues } from "@/common/utils/tools/formatToolInputIssues";
+import { isToolContentResult } from "@/common/utils/tools/toolContentResult";
+import { TOOL_DEFINITIONS } from "@/common/utils/tools/toolDefinitions";
+import { isSupportedAttachmentMediaType } from "@/common/utils/attachments/supportedAttachmentMediaTypes";
+import { isDisplayOnlyFilePart } from "@/common/utils/attachments/displayOnlyFileParts";
+import {
+  DISPLAY_DATA_STUB,
+  MEDIA_BUDGET_EXCEEDED_STUB,
+  MEDIA_DATA_STUB,
+  mediaUnsupportedStub,
+  isMediaPart,
+  type ToolAttachmentPart,
+} from "@/common/utils/attachments/toolAttachmentParts";
+import {
+  retainExemptKernelRecordResult,
+  retainPersistenceCriticalArgsFields,
+  retainWorkflowResultIdentityFields,
+  sanitizeMediaRecordCapture,
+} from "./types";
+
+/**
+ * Aggregate per-eval limits for attachment parts stripped from bridged results.
+ * Forwardable parts live outside QuickJS memory accounting, and unsupported
+ * media still consumes the byte budget to bound repeated calls.
+ */
+export const MAX_PENDING_ATTACHMENT_BYTES = 32 * 1024 * 1024;
+
+/**
+ * Result shape of an AI SDK Schema's optional custom validator
+ * (provider-utils ValidationResult, which the 'ai' package does not re-export).
+ */
+type SchemaValidationResult = { success: true; value: unknown } | { success: false; error: Error };
 
 /**
  * RLM kernel extras for register(): host bindings that only exist on
@@ -82,6 +117,24 @@ function syntheticToolCallId(toolName: string): string {
 }
 
 /**
+ * Marks the execute options of a tool call bridged from a code_execution guest.
+ * Bridged calls usually carry the runtime's nested-record callId, which looks like any
+ * other toolCallId, so callers that must tell them apart check this key instead. An
+ * own symbol key survives the `{ ...options }` copies wrappers make on the way to the
+ * tool (withExecutionScope), and `Symbol.for` survives duplicated module instances.
+ */
+const PTC_BRIDGED_EXECUTION = Symbol.for("xum.ptc.bridgedExecution");
+
+/** True for a tool execution bridged from a code_execution guest (not a direct model call). */
+export function isPtcBridgedExecution(options: unknown): boolean {
+  return (
+    typeof options === "object" &&
+    options !== null &&
+    (options as Record<symbol, unknown>)[PTC_BRIDGED_EXECUTION] === true
+  );
+}
+
+/**
  * Hard cap on a xum.load vars key. Keys are variable names; load records are
  * exempt from kernel record compaction (their summaries are bounded by
  * construction), so an unbounded key (e.g. `key: vars.large`) would ride the
@@ -117,16 +170,14 @@ function parseLoadArgs(args: unknown): { path: string; key: string } {
   return { path, key };
 }
 
-/** Tools excluded from sandbox - UI-specific or would cause recursion */
-const EXCLUDED_TOOLS = new Set([
-  "code_execution", // Prevent recursive sandbox creation
-  "ask_user_question", // Requires UI interaction
-  "propose_plan", // Mode-specific, call directly
-  "todo_write", // UI-specific
-  "todo_read", // UI-specific
-  "status_set", // UI-specific
-  "agent_report", // Must be top-level for taskService to read args from history
-]);
+const ptcExcludedTools = new Set(
+  Object.entries(TOOL_DEFINITIONS).flatMap(([name, definition]) =>
+    "ptcExcluded" in definition ? [name] : []
+  )
+);
+
+// Media-producing built-ins (attach_file, desktop_screenshot) are deliberately
+// bridgeable because attachment bytes stay outside QuickJS memory.
 
 /**
  * Bridge that exposes Xum tools in the QuickJS sandbox under canonical `xum.*` and legacy `mux.*` namespaces.
@@ -143,6 +194,14 @@ export class ToolBridge {
    * authoritative host-side record of successful loads, immune to
    * model-visible record bounding (see drainNewlyLoadedVarsKeys). */
   private newlyLoadedVarsKeys: string[] = [];
+  /** Attachment parts (model media + display-only files) stripped from
+   * bridged results, keyed per runtime so parallel code_execution calls
+   * sharing this bridge cannot claim each other's parts (ephemeral runtimes
+   * are per-call; persistent mounts serialize evals under the scope lock). */
+  private readonly pendingAttachments = new WeakMap<IJSRuntime, ToolAttachmentPart[]>();
+  /** Aggregate stripped-media bytes per runtime/eval, including unsupported
+   * media that is discarded rather than forwarded to the provider. */
+  private readonly pendingAttachmentBytes = new WeakMap<IJSRuntime, number>();
 
   constructor(tools: Record<string, Tool>, grants?: CapabilityGrants) {
     this.bridgeableTools = new Map();
@@ -153,7 +212,9 @@ export class ToolBridge {
       // code_execution is the tool that uses the bridge, not a candidate for bridging
       if (name === "code_execution") continue;
 
-      const isBridgeable = !EXCLUDED_TOOLS.has(name) && this.hasExecute(tool);
+      // status_set is dynamic and UI-specific, so it has no catalog entry.
+      const isBridgeable =
+        name !== "status_set" && !ptcExcludedTools.has(name) && this.hasExecute(tool);
       if (!isBridgeable) {
         this.nonBridgeableTools.set(name, tool);
       } else if (isBridgeToolGranted(this.grants, name)) {
@@ -210,18 +271,35 @@ export class ToolBridge {
    * not just when the parent stream is cancelled.
    */
   register(runtime: IJSRuntime, kernel?: KernelBridgeOptions): void {
+    // Every execution re-registers before eval, so this is the per-eval reset
+    // point: stale attachments from a crashed/aborted prior eval on this
+    // runtime must not leak into the next eval's drain.
+    this.pendingAttachments.delete(runtime);
+    this.pendingAttachmentBytes.delete(runtime);
     // Kernel mode bounds record/event capture at creation (host memory and
     // streamed-to-history events); ephemeral registrations keep full records
-    // (the byte-identical supplement contract). Post-eval compaction still
-    // bounds the model-visible set.
+    // (the non-RLM inline-results contract). Post-eval compaction still
+    // bounds the model-visible set. Exempt records (persistence-critical
+    // tools, media containers) keep full results through BOTH stages — see
+    // isKernelRecordResultExempt.
     runtime.setKernelRecordBounds(
       kernel !== undefined
         ? {
             argsCapBytes: KERNEL_COMPACT_ARGS_CAP_BYTES,
             resultCapBytes: RESULT_HANDLE_OFFLOAD_THRESHOLD_BYTES,
+            captureRetained: retainExemptKernelRecordResult,
+            captureArgsRetained: retainPersistenceCriticalArgsFields,
+            captureResultRetained: retainWorkflowResultIdentityFields,
           }
         : undefined
     );
+    // Media containers are budgeted at capture in BOTH modes: classic records
+    // keep full inline results by contract, but exclusive PTC makes the
+    // bridge the only route to executable MCP tools, and request-time
+    // attachment extraction rewrites only the provider copy — records/events
+    // persisted into partial.json/chat.jsonl need the budget regardless of
+    // kernel mode.
+    runtime.setCaptureResultSanitizer(sanitizeMediaRecordCapture);
     const xumObj: Record<string, (...args: unknown[]) => Promise<unknown>> = {};
 
     // Grant-denied tools get an explicit stub: the guest sees a clear
@@ -237,6 +315,13 @@ export class ToolBridge {
       const toolName = name;
 
       xumObj[name] = async (args: unknown) => {
+        // MUST be the first operation: the runtime hands over the nested
+        // record's callId through a synchronous window (see
+        // IJSRuntime.takeActiveHostCallId). Using it as the execute
+        // toolCallId lets tool-emitted UI events (workflow-run-attached,
+        // task-created, live bash output) target the transcript's nested
+        // tool call instead of an id no rendered card carries.
+        const bridgedToolCallId = runtime.takeActiveHostCallId() ?? syntheticToolCallId(toolName);
         // Defense in depth: re-check the grant at call time so a stale or
         // mutated bridge can never invoke a non-granted tool.
         if (!isBridgeToolGranted(this.grants, toolName)) {
@@ -251,20 +336,30 @@ export class ToolBridge {
           throw new Error("Execution aborted");
         }
 
-        // Validate args against tool's Zod schema
-        const validatedArgs = this.validateArgs(toolName, boundTool, args);
+        // Validate args against the tool's schema (Zod or AI SDK wrapper)
+        const validatedArgs = await this.validateArgs(toolName, boundTool, args, abortSignal);
+
+        // validateArgs races the validator against the abort signal; this
+        // recheck covers an abort that lands after validation settles but
+        // before execute (mirrors the post-await recheck in mux.load).
+        if (abortSignal?.aborted) {
+          throw new Error("Execution aborted");
+        }
 
         // Execute tool with full options (toolCallId and messages are required by type
-        // but not used by most tools - generate synthetic values for sandbox context)
-        const result: unknown = await boundTool.execute!(validatedArgs, {
+        // but not used by most tools; messages stay synthetic for sandbox context)
+        const executeOptions = {
           abortSignal,
-          toolCallId: syntheticToolCallId(toolName),
+          toolCallId: bridgedToolCallId,
           messages: [],
           context: undefined,
-        });
+          [PTC_BRIDGED_EXECUTION]: true,
+        };
+        // eslint-disable-next-line @typescript-eslint/no-non-null-assertion -- legacy site from before the ban; remove when touching this line
+        const result: unknown = await boundTool.execute!(validatedArgs, executeOptions);
 
         // Ensure result is JSON-serializable
-        return this.serializeResult(result);
+        return this.stripAttachmentParts(runtime, this.serializeResult(result));
       };
     }
 
@@ -297,6 +392,10 @@ export class ToolBridge {
     const taskTool = this.bridgeableTools.get("task");
     if (taskTool !== undefined) {
       xumObj.task_spawn = async (args: unknown) => {
+        // First operation, same synchronous-window contract as the regular
+        // bridged tools above.
+        const bridgedToolCallId =
+          runtime.takeActiveHostCallId() ?? syntheticToolCallId("task_spawn");
         // task_spawn is subject to the same grant as task (defense in depth,
         // mirroring the per-call re-check on regular bridged tools).
         if (!isBridgeToolGranted(this.grants, "task")) {
@@ -307,13 +406,21 @@ export class ToolBridge {
           throw new Error("Execution aborted");
         }
         const baseArgs = typeof args === "object" && args !== null ? args : {};
-        const validatedArgs = this.validateArgs("task", taskTool, {
-          ...baseArgs,
-          run_in_background: true,
-        });
+        const validatedArgs = await this.validateArgs(
+          "task",
+          taskTool,
+          { ...baseArgs, run_in_background: true },
+          abortSignal
+        );
+        // Same post-validation recheck as regular bridged tools: an abort that
+        // lands after validation settles must not spawn the child.
+        if (abortSignal?.aborted) {
+          throw new Error("Execution aborted");
+        }
+        // eslint-disable-next-line @typescript-eslint/no-non-null-assertion -- legacy site from before the ban; remove when touching this line
         const result: unknown = await taskTool.execute!(validatedArgs, {
           abortSignal,
-          toolCallId: syntheticToolCallId("task_spawn"),
+          toolCallId: bridgedToolCallId,
           messages: [],
           context: undefined,
         });
@@ -391,27 +498,173 @@ export class ToolBridge {
         };
   }
 
+  /**
+   * Attachment-carrying parts inside bridged tool results (e.g. attach_file)
+   * are useless as sandbox values: guests cannot see pixels, and the base64
+   * would bloat vars, result handles, model-visible records, and the
+   * host-side nested-call records/events (which sit outside QuickJS memory
+   * accounting). Supported media and display-only files are carried onto
+   * code_execution's result, while unsupported media is discarded. Nested
+   * media copies become text so request extraction cannot treat stubs as files.
+   */
+  private stripAttachmentParts(runtime: IJSRuntime, serialized: unknown): unknown {
+    if (!isToolContentResult(serialized)) {
+      return serialized;
+    }
+    const carriedParts: ToolAttachmentPart[] = [];
+    const pending = this.pendingAttachments.get(runtime) ?? [];
+    let pendingBytes = this.pendingAttachmentBytes.get(runtime) ?? 0;
+    let changed = false;
+    const strip = <T extends ToolAttachmentPart>(
+      part: T,
+      stub: string,
+      carry: boolean
+    ): T | { type: "text"; text: string } => {
+      if (
+        carry &&
+        pending.length + carriedParts.length >= MAX_EXTRACTED_TOOL_MEDIA_PARTS_PER_REQUEST
+      ) {
+        return { type: "text", text: MEDIA_BUDGET_EXCEEDED_STUB };
+      }
+      const partBytes = Buffer.byteLength(JSON.stringify(part), "utf8");
+      if (pendingBytes + partBytes > MAX_PENDING_ATTACHMENT_BYTES) {
+        return { type: "text", text: MEDIA_BUDGET_EXCEEDED_STUB };
+      }
+      const stripped = isMediaPart(part)
+        ? { type: "text" as const, text: stub }
+        : { ...part, data: stub };
+      const strippedBytes = carry ? Buffer.byteLength(JSON.stringify(stripped), "utf8") : 0;
+      const retainedBytes = partBytes + strippedBytes;
+      if (pendingBytes + retainedBytes > MAX_PENDING_ATTACHMENT_BYTES) {
+        return { type: "text", text: MEDIA_BUDGET_EXCEEDED_STUB };
+      }
+      pendingBytes += retainedBytes;
+      this.pendingAttachmentBytes.set(runtime, pendingBytes);
+      if (carry) {
+        carriedParts.push(part);
+      }
+      return stripped;
+    };
+    const newValue = serialized.value.map((item) => {
+      if (isMediaPart(item)) {
+        changed = true;
+        const supported = isSupportedAttachmentMediaType(item.mediaType);
+        return strip(
+          item,
+          supported ? MEDIA_DATA_STUB : mediaUnsupportedStub(item.mediaType),
+          supported
+        );
+      }
+      if (isDisplayOnlyFilePart(item)) {
+        changed = true;
+        return strip(item, DISPLAY_DATA_STUB, true);
+      }
+      return item;
+    });
+    if (!changed) {
+      return serialized;
+    }
+    if (carriedParts.length > 0) {
+      for (const part of carriedParts) {
+        pending.push(part);
+      }
+      this.pendingAttachments.set(runtime, pending);
+    }
+    return { type: "content", value: newValue };
+  }
+
+  /**
+   * Drain forwardable attachment parts stripped from bridged results on this
+   * runtime. register() clears stale entries before each eval, so a post-eval
+   * drain yields exactly that eval's supported media and display-only files.
+   */
+  drainPendingAttachments(runtime: IJSRuntime): ToolAttachmentPart[] {
+    const pending = this.pendingAttachments.get(runtime) ?? [];
+    this.pendingAttachments.delete(runtime);
+    this.pendingAttachmentBytes.delete(runtime);
+    return pending;
+  }
+
   private hasExecute(tool: Tool): tool is Tool & { execute: NonNullable<Tool["execute"]> } {
     return typeof tool.execute === "function";
   }
 
-  private validateArgs(toolName: string, tool: Tool, args: unknown): unknown {
-    // Access the tool's Zod schema - AI SDK tools use 'inputSchema', some use 'parameters'
-    const toolRecord = tool as { inputSchema?: z.ZodType; parameters?: z.ZodType };
-    const schema = toolRecord.inputSchema ?? toolRecord.parameters;
-    if (!schema) return args;
-
-    const result = schema.safeParse(args);
-    if (!result.success) {
-      const issues = result.error.issues.map((i) => `${i.path.join(".")}: ${i.message}`).join("; ");
-      throw new Error(`Invalid arguments for ${toolName}: ${issues}`);
+  private async validateArgs(
+    toolName: string,
+    tool: Tool,
+    args: unknown,
+    abortSignal?: AbortSignal
+  ): Promise<unknown> {
+    // Guests may call a capability with zero arguments (mux.tool()). Provider
+    // tool calls always deliver an args object, and downstream consumers (MCP
+    // servers, Zod object schemas) assume one — passing undefined through
+    // produced opaque TypeErrors instead of readable validation errors.
+    // Treat a zero-arg call as the canonical empty-args call.
+    if (args === undefined) {
+      args = {};
     }
-    return result.data;
+
+    // AI SDK tools carry their schema on 'inputSchema'; some legacy tools use 'parameters'.
+    const toolRecord = tool as { inputSchema?: unknown; parameters?: unknown };
+    const schema = toolRecord.inputSchema ?? toolRecord.parameters;
+    if (schema == null) return args;
+
+    // Built-in tools carry Zod schemas and are validated here for early,
+    // readable errors. Zod detection mirrors
+    // typeGenerator.getInputJsonSchema's "_def" check.
+    if (typeof schema === "object" && "_def" in schema) {
+      const result = (schema as z.ZodType).safeParse(args);
+      if (!result.success) {
+        throw new Error(
+          `Invalid arguments for ${toolName}: ${formatToolInputIssues(result.error.issues, args)}`
+        );
+      }
+      return result.data;
+    }
+
+    // Non-Zod tools carry the AI SDK's jsonSchema() wrapper
+    // ({ jsonSchema: <raw JSON Schema>, validate? }), which has no safeParse.
+    // A wrapper-provided validator must be honored exactly like the direct
+    // (non-kernel) call path does: it may reject invalid input or return a
+    // normalized value, and may be async (ValidationResult | PromiseLike).
+    const validate = (schema as { validate?: unknown }).validate;
+    if (typeof validate === "function") {
+      const validation = Promise.resolve(
+        (
+          validate as (
+            value: unknown
+          ) => SchemaValidationResult | PromiseLike<SchemaValidationResult>
+        )(args)
+      );
+      // Race the validator against the runtime abort signal: QuickJS eval
+      // aborts only settle suspended asyncified host calls, so a validator
+      // that never settles would otherwise block this await forever and keep
+      // a persistent kernel locked past timeouts and interrupts.
+      const raced = await raceWithAbortAndTimeout(validation, { signal: abortSignal });
+      if (raced.kind !== "ok") {
+        throw new Error("Execution aborted");
+      }
+      const result = raced.value;
+      if (!result.success) {
+        const message = result.error instanceof Error ? result.error.message : String(result.error);
+        throw new Error(`Invalid arguments for ${toolName}: ${message}`);
+      }
+      return result.value;
+    }
+
+    // Validator-less JSON Schema (e.g. MCP tools): pass through untouched,
+    // matching the direct call path; the MCP server validates (and
+    // mcpServerManager sanitizes) on its side.
+    return args;
   }
 
   private serializeResult(result: unknown): unknown {
     try {
-      // Round-trip through JSON to ensure QuickJS can handle the value
+      // Round-trip through JSON to ensure QuickJS can handle the value.
+      // Media returned by bridged MCP tools passes through intact: the guest
+      // may legitimately process the bytes, and the classic (non-RLM) record
+      // keeps the full result so extractAttachmentsFromToolOutput can lift
+      // nested media into model-visible multimodal parts at request time.
       return JSON.parse(JSON.stringify(result));
     } catch {
       return { error: "Result not JSON-serializable" };

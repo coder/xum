@@ -1,9 +1,11 @@
 import { describe, expect, mock, spyOn, test } from "bun:test";
 import { createMuxMessage, type MuxMessage } from "@/common/types/message";
 import { Err, Ok } from "@/common/types/result";
-import type { AIService } from "@/node/services/aiService";
 import type { MCPServerManager } from "@/node/services/mcpServerManager";
-import { createAgentSessionHarness } from "@/node/services/agentSession.testHarness";
+import {
+  createAgentSessionHarness,
+  createStartedTurnHandle,
+} from "@/node/services/agentSession.testHarness";
 
 function promptMetadata() {
   return {
@@ -72,7 +74,7 @@ describe("AgentSession MCP prompt snapshots", () => {
       expect(emittedIds.indexOf(snapshotId)).toBeGreaterThanOrEqual(0);
       expect(emittedIds.indexOf(snapshotId)).toBeLessThan(emittedIds.indexOf(userId));
     } finally {
-      harness.session.dispose();
+      await harness.session.dispose();
       await harness.cleanup();
     }
   });
@@ -127,7 +129,7 @@ describe("AgentSession MCP prompt snapshots", () => {
           .map((message) => message.metadata?.mcpPromptSnapshot?.promptName)
       ).toEqual(["first", "second"]);
     } finally {
-      harness.session.dispose();
+      await harness.session.dispose();
       await harness.cleanup();
     }
   });
@@ -156,12 +158,12 @@ describe("AgentSession MCP prompt snapshots", () => {
       if (!history.success) throw new Error(history.error);
       expect(history.data).toHaveLength(0);
     } finally {
-      harness.session.dispose();
+      await harness.session.dispose();
       await harness.cleanup();
     }
   });
 
-  test("rolls back persisted snapshot rows when the user row append fails", async () => {
+  test("publishes no snapshot rows when manual trigger acceptance fails", async () => {
     const getPrompt = mock(() => Promise.resolve({ text: "Expanded prompt" }));
     const harness = await createAgentSessionHarness({
       workspaceId: "workspace",
@@ -169,13 +171,10 @@ describe("AgentSession MCP prompt snapshots", () => {
     });
 
     try {
-      const realAppend = harness.historyService.appendToHistory.bind(harness.historyService);
-      const appendToHistory = spyOn(harness.historyService, "appendToHistory").mockImplementation(
-        async (workspaceId: string, message: MuxMessage) => {
-          if (message.metadata?.mcpPromptSnapshot) return realAppend(workspaceId, message);
-          return Err("disk full");
-        }
-      );
+      const acceptance = spyOn(
+        harness.historyService,
+        "acceptCompactionReplacement"
+      ).mockResolvedValueOnce(Err("disk full"));
 
       const result = await harness.session.sendMessage("Using MCP prompt coder/review: src", {
         model: "anthropic:claude-3-5-sonnet-latest",
@@ -183,14 +182,14 @@ describe("AgentSession MCP prompt snapshots", () => {
         muxMetadata: promptMetadata(),
       });
       expect(result.success).toBe(false);
-      appendToHistory.mockRestore();
+      acceptance.mockRestore();
 
       const history = await harness.historyService.getLastMessages("workspace", 10);
       expect(history.success).toBe(true);
       if (!history.success) throw new Error(history.error);
       expect(history.data).toHaveLength(0);
     } finally {
-      harness.session.dispose();
+      await harness.session.dispose();
       await harness.cleanup();
     }
   });
@@ -222,19 +221,19 @@ describe("AgentSession MCP prompt snapshots", () => {
       expect(history.data).toHaveLength(1);
       expect(history.data[0]?.metadata?.mcpPromptSnapshot).toBeUndefined();
     } finally {
-      harness.session.dispose();
+      await harness.session.dispose();
       await harness.cleanup();
     }
   });
 
   test("excludes crash-orphaned snapshots from provider requests", async () => {
     const streamMessage = mock((_args: { messages: MuxMessage[] }) =>
-      Promise.resolve(Ok(undefined))
+      Promise.resolve(Ok(createStartedTurnHandle(harness.session.closingSignal)))
     );
     const harness = await createAgentSessionHarness({
       workspaceId: "workspace",
       aiServiceOverrides: {
-        streamMessage: streamMessage as unknown as AIService["streamMessage"],
+        streamMessage,
       },
     });
 
@@ -263,7 +262,7 @@ describe("AgentSession MCP prompt snapshots", () => {
       expect(requestMessages.length).toBeGreaterThan(0);
       expect(requestMessages.map((message) => message.id)).not.toContain("orphan-snap");
     } finally {
-      harness.session.dispose();
+      await harness.session.dispose();
       await harness.cleanup();
     }
   });
@@ -305,7 +304,7 @@ describe("AgentSession MCP prompt snapshots", () => {
       expect(truncateAfterMessage.mock.calls).toHaveLength(1);
       expect(truncateAfterMessage.mock.calls[0][1]).toBe(snapshotId);
     } finally {
-      harness.session.dispose();
+      await harness.session.dispose();
       await harness.cleanup();
     }
   });

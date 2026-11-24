@@ -1,4 +1,3 @@
-import { Target } from "lucide-react";
 import { useEffect, useState } from "react";
 import { Input } from "@/browser/components/Input/Input";
 import { useAPI } from "@/browser/contexts/API";
@@ -166,26 +165,6 @@ export function GoalDefaultsControls(props: GoalDefaultsControlsProps) {
           className="accent-accent mt-1 h-4 w-4"
         />
       </label>
-    </div>
-  );
-}
-
-export function GoalsSection() {
-  return (
-    <div className="space-y-6">
-      <div>
-        <h2 className="text-foreground mb-2 text-lg font-semibold">Goals</h2>
-        <p className="text-muted text-sm">
-          Workspace goals let you pin an objective to a workspace and track progress across turns.
-        </p>
-      </div>
-      <div className="border-border-light bg-surface-secondary rounded-lg border p-4">
-        <div className="mb-4 flex items-center gap-2 text-sm font-medium">
-          <Target className="h-4 w-4" aria-hidden="true" />
-          Goal defaults
-        </div>
-        <GoalDefaultsControls />
-      </div>
     </div>
   );
 }

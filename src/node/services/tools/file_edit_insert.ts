@@ -1,3 +1,4 @@
+import { fileToolSandboxContext } from "@/node/services/agentSandbox/fileToolSandbox";
 import { tool } from "ai";
 import type { FileEditInsertToolArgs, FileEditInsertToolResult } from "@/common/types/tools";
 import {
@@ -9,6 +10,7 @@ import type { ToolConfiguration, ToolFactory } from "@/common/utils/tools/tools"
 import { TOOL_DEFINITIONS } from "@/common/utils/tools/toolDefinitions";
 import { generateDiff, resolvePathWithinCwd, validatePlanModeAccess } from "./fileCommon";
 import { executeFileEditOperation } from "./file_edit_operation";
+import { whitespaceMismatchHint } from "./file_edit_replace_shared";
 import { convertNewlines, detectFileEol } from "./eol";
 import { fileExists } from "@/node/utils/runtime/fileExists";
 import { writeFileString } from "@/node/utils/runtime/helpers";
@@ -36,11 +38,11 @@ interface GuardResolutionSuccess {
   index: number;
 }
 
-function guardFailure(error: string): InsertOperationFailure {
+function guardFailure(error: string, hint?: string): InsertOperationFailure {
   return {
     success: false,
     error,
-    note: READ_AND_RETRY_NOTE,
+    note: hint === undefined ? READ_AND_RETRY_NOTE : `${EDIT_FAILED_NOTE_PREFIX} ${hint}`,
   };
 }
 
@@ -57,7 +59,13 @@ export const createFileEditInsertTool: ToolFactory = (config: ToolConfiguration)
           correctedPath,
           warning: pathWarning,
           resolvedPath,
-        } = resolvePathWithinCwd(path, config.cwd, config.runtime);
+        } = await resolvePathWithinCwd(
+          path,
+          config.cwd,
+          config.runtime,
+          "write",
+          fileToolSandboxContext(config)
+        );
         path = correctedPath;
 
         // Validate plan mode access restrictions
@@ -199,7 +207,10 @@ function findUniqueSubstringIndex(
 ): GuardResolutionSuccess | InsertOperationFailure {
   const firstIndex = haystack.indexOf(needle);
   if (firstIndex === -1) {
-    return guardFailure(`Guard mismatch: unable to find ${label} substring in the current file.`);
+    return guardFailure(
+      `Guard mismatch: unable to find ${label} substring in the current file.`,
+      whitespaceMismatchHint(haystack, needle)
+    );
   }
 
   const secondIndex = haystack.indexOf(needle, firstIndex + needle.length);

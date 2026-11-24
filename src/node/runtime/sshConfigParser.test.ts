@@ -1,7 +1,7 @@
 import * as fs from "fs/promises";
 import * as os from "os";
 import * as path from "path";
-import { resolveSSHConfig } from "./sshConfigParser";
+import { listSSHConfigHosts, resolveSSHConfig } from "./sshConfigParser";
 
 describe("resolveSSHConfig", () => {
   test("applies Host + Match host proxy rules", async () => {
@@ -82,5 +82,48 @@ describe("resolveSSHConfig", () => {
 
       await fs.rm(tempDir, { recursive: true, force: true });
     }
+  });
+});
+
+describe("listSSHConfigHosts", () => {
+  async function withConfig<T>(content: string | null, run: () => Promise<T>): Promise<T> {
+    const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "mux-ssh-hosts-"));
+    const previous = { USERPROFILE: process.env.USERPROFILE, HOME: process.env.HOME };
+    process.env.USERPROFILE = tempDir;
+    process.env.HOME = tempDir;
+    try {
+      if (content !== null) {
+        await fs.mkdir(path.join(tempDir, ".ssh"), { recursive: true });
+        await fs.writeFile(path.join(tempDir, ".ssh", "config"), content, "utf8");
+      }
+      return await run();
+    } finally {
+      for (const [key, value] of Object.entries(previous)) {
+        if (value === undefined) delete process.env[key];
+        else process.env[key] = value;
+      }
+      await fs.rm(tempDir, { recursive: true, force: true });
+    }
+  }
+
+  test("lists each alias once, in file order, without patterns", async () => {
+    const config = [
+      "Host devbox",
+      "  HostName 10.0.0.5",
+      "Host gpu-01 gpu-02",
+      "  User ml",
+      "Host *.internal !bastion",
+      "  ProxyJump bastion",
+      "Host devbox",
+      "  Port 2222",
+      "Match host other",
+      "  User nobody",
+      "",
+    ].join("\n");
+    expect(await withConfig(config, listSSHConfigHosts)).toEqual(["devbox", "gpu-01", "gpu-02"]);
+  });
+
+  test("is empty without a config file", async () => {
+    expect(await withConfig(null, listSSHConfigHosts)).toEqual([]);
   });
 });

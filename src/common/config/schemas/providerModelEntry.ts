@@ -10,5 +10,3 @@ export const ProviderModelEntrySchema = z.union([
     })
     .strict(),
 ]);
-
-export type ProviderModelEntry = z.infer<typeof ProviderModelEntrySchema>;

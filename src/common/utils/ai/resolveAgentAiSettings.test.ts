@@ -2,7 +2,11 @@ import { describe, expect, it } from "bun:test";
 
 import type { ResolveAgentAiSettingsInput } from "@/common/types/agentAiSettings";
 import { collectDeclaredAncestorLayers } from "./agentAncestorLayers";
-import { InvalidExplicitAiSettingError, resolveAgentAiSettings } from "./resolveAgentAiSettings";
+import {
+  InvalidExplicitAiSettingError,
+  resolveAgentAiSettings,
+  resolveAgentCacheTtl,
+} from "./resolveAgentAiSettings";
 
 // Unrecognized providers fall through to the shared default thinking policy
 // (["off","low","medium","high"], floor "off"), so precedence assertions are
@@ -10,7 +14,7 @@ import { InvalidExplicitAiSettingError, resolveAgentAiSettings } from "./resolve
 const MODEL_A = "custom:model-a";
 const MODEL_B = "custom:model-b";
 const MODEL_C = "custom:model-c";
-const PRO_MODEL = "openai:gpt-5.6";
+const PRO_MODEL = "openai:gpt-6.1-sol";
 
 function base(overrides: Partial<ResolveAgentAiSettingsInput>): ResolveAgentAiSettingsInput {
   return {
@@ -21,6 +25,17 @@ function base(overrides: Partial<ResolveAgentAiSettingsInput>): ResolveAgentAiSe
 }
 
 describe("resolveAgentAiSettings precedence", () => {
+  it("inherits the calling chat Exec model before global Exec defaults", () => {
+    const result = resolveAgentAiSettings({
+      targetAgentId: "exec",
+      profile: "subagent",
+      agentAiDefaults: { exec: { modelString: "anthropic:claude-fable-5-1" } },
+      parentRuntime: { model: "openai:gpt-5-pro" },
+      parentWorkspaceExecSettings: { model: "openai:gpt-6-astra", thinkingLevel: "high" },
+    });
+    expect(result.selected.model).toBe("openai:gpt-6-astra");
+  });
+
   it("explicit values win independently per field", () => {
     const result = resolveAgentAiSettings(
       base({
@@ -243,6 +258,114 @@ describe("resolveAgentAiSettings precedence", () => {
   });
 });
 
+describe("calling workspace Exec inheritance", () => {
+  const parent = { model: MODEL_A, thinkingLevel: "high" as const, reasoningMode: "pro" as const };
+  const input: ResolveAgentAiSettingsInput = {
+    targetAgentId: "exec",
+    profile: "subagent",
+    parentWorkspaceExecSettings: parent,
+    agentAiDefaults: {
+      exec: { modelString: MODEL_B, thinkingLevel: "low", reasoningMode: "standard" },
+    },
+    parentRuntime: { model: MODEL_C, thinkingLevel: "medium" },
+  };
+
+  it("inherits every supplied field with provenance, even without global config", () => {
+    for (const agentAiDefaults of [input.agentAiDefaults, undefined]) {
+      const result = resolveAgentAiSettings({ ...input, agentAiDefaults });
+      expect(result.selected).toEqual(parent);
+      for (const source of Object.values(result.sources)) {
+        expect(source).toEqual({ tier: "parent-workspace-exec", agentId: "exec" });
+      }
+      expect(result.effective.reasoningMode).toBeUndefined();
+    }
+  });
+
+  it("keeps explicit invocation, target workspace, and sub-agent profile precedence", () => {
+    const subagent = { modelString: MODEL_C };
+    const withSubagent = {
+      ...input,
+      agentAiDefaults: { exec: { modelString: MODEL_B, subagent } },
+    };
+    expect(resolveAgentAiSettings(withSubagent).sources.model.tier).toBe("config-subagent");
+    const workspace = { ...withSubagent, targetWorkspaceSettings: { model: MODEL_B } };
+    expect(resolveAgentAiSettings(workspace).sources.model.tier).toBe("workspace");
+    const explicit = resolveAgentAiSettings({ ...workspace, explicit: { model: MODEL_C } });
+    expect(explicit.sources.model.tier).toBe("explicit");
+    expect(explicit.selected.thinkingLevel).toBe("high");
+    expect(explicit.sources.thinkingLevel.tier).toBe("parent-workspace-exec");
+  });
+
+  it("resolves partial profile and parent layers independently", () => {
+    const thinkingOnly = resolveAgentAiSettings({
+      ...input,
+      agentAiDefaults: { exec: { modelString: MODEL_B, subagent: { thinkingLevel: "low" } } },
+    });
+    expect(thinkingOnly.selected).toEqual({ ...parent, thinkingLevel: "low" });
+    const modelOnly = resolveAgentAiSettings({
+      ...input,
+      agentAiDefaults: { exec: { modelString: MODEL_B, subagent: { modelString: MODEL_C } } },
+    });
+    expect(modelOnly.selected).toEqual({ ...parent, model: MODEL_C });
+    const reasoningOnly = resolveAgentAiSettings({
+      ...input,
+      parentWorkspaceExecSettings: { reasoningMode: "pro" },
+    });
+    expect(reasoningOnly.selected).toEqual({
+      model: MODEL_B,
+      thinkingLevel: "low",
+      reasoningMode: "pro",
+    });
+    const missing = resolveAgentAiSettings({ ...input, parentWorkspaceExecSettings: undefined });
+    expect(missing.sources.model.tier).toBe("config");
+  });
+
+  it("falls through empty parent models without discarding valid fields", () => {
+    const result = resolveAgentAiSettings({
+      ...input,
+      parentWorkspaceExecSettings: { model: " ", thinkingLevel: "medium" },
+    });
+    expect(result.selected.model).toBe(MODEL_B);
+    expect(result.selected.thinkingLevel).toBe("medium");
+    expect(result.diagnostics).toHaveLength(1);
+  });
+
+  it.each(["plan", "explore", "desktop", "custom"])(
+    "does not promote Exec context for %s targets or ancestors",
+    (targetAgentId) => {
+      for (const ancestors of [undefined, [{ agentId: "exec" }]]) {
+        const scoped = { ...input, targetAgentId, ancestors };
+        expect(resolveAgentAiSettings(scoped)).toEqual(
+          resolveAgentAiSettings({ ...scoped, parentWorkspaceExecSettings: undefined })
+        );
+      }
+    }
+  );
+
+  it("leaves interactive Exec unchanged", () => {
+    const scoped = { ...input, profile: "interactive" as const };
+    expect(resolveAgentAiSettings(scoped)).toEqual(
+      resolveAgentAiSettings({ ...scoped, parentWorkspaceExecSettings: undefined })
+    );
+  });
+
+  it("normalizes thinking and gates reasoning against the final model", () => {
+    const result = resolveAgentAiSettings({
+      ...input,
+      parentWorkspaceExecSettings: {
+        model: "openai:gpt-5.2",
+        thinkingLevel: "off",
+        reasoningMode: "pro",
+      },
+      minThinkingLevelByModel: { "openai:gpt-5.2": "high" },
+    });
+    expect(result.selected.thinkingLevel).toBe("off");
+    expect(result.effective.thinkingLevel).toBe("high");
+    expect(result.selected.reasoningMode).toBe("pro");
+    expect(result.effective.reasoningMode).toBeUndefined();
+  });
+});
+
 describe("resolveAgentAiSettings normalization and clamping", () => {
   it("numeric thinking input maps into the resolved model's policy", () => {
     // gemini-3 allows ["low", "high"]: index 0 is its lowest allowed level.
@@ -313,6 +436,24 @@ describe("resolveAgentAiSettings normalization and clamping", () => {
     expect(result.effective.reasoningMode).toBeUndefined();
   });
 
+  it("keeps selected cyber but drops it from effective settings where Cyber is unavailable", () => {
+    const resolve = (model: string, cyberModelEnabled = true) =>
+      resolveAgentAiSettings(
+        base({
+          targetWorkspaceSettings: { model, reasoningMode: "cyber" },
+          providersConfig: {
+            openai: { apiKeySet: true, isEnabled: true, isConfigured: true, cyberModelEnabled },
+          },
+        })
+      );
+
+    expect(resolve(PRO_MODEL).effective.reasoningMode).toBe("cyber");
+    for (const result of [resolve(PRO_MODEL, false), resolve("openai:gpt-6-luna")]) {
+      expect(result.selected.reasoningMode).toBe("cyber");
+      expect(result.effective.reasoningMode).toBeUndefined();
+    }
+  });
+
   it("invalid persisted candidates fall through with diagnostics", () => {
     const result = resolveAgentAiSettings(
       base({
@@ -329,6 +470,64 @@ describe("resolveAgentAiSettings normalization and clamping", () => {
       InvalidExplicitAiSettingError
     );
   });
+});
+
+describe("resolveAgentCacheTtl precedence", () => {
+  const cases: Array<{
+    name: string;
+    input: Parameters<typeof resolveAgentCacheTtl>[0];
+    expected: ReturnType<typeof resolveAgentCacheTtl>;
+  }> = [
+    {
+      name: "the agent's Settings value beats its own frontmatter",
+      input: {
+        targetAgentId: "explore",
+        agentAiDefaults: { explore: { cacheTtl: "1h" } },
+        targetDefinitionAiDefaults: { cacheTtl: "5m" },
+        ancestors: [{ agentId: "exec" }],
+      },
+      expected: { value: "1h", source: { tier: "config", agentId: "explore" } },
+    },
+    {
+      name: "the agent's own frontmatter beats its base's Settings value",
+      input: {
+        targetAgentId: "explore",
+        agentAiDefaults: { exec: { cacheTtl: "1h" } },
+        targetDefinitionAiDefaults: { cacheTtl: "5m" },
+        ancestors: [{ agentId: "exec" }],
+      },
+      expected: { value: "5m", source: { tier: "definition", agentId: "explore" } },
+    },
+    {
+      name: "a base's Settings value beats that base's frontmatter",
+      input: {
+        targetAgentId: "worker",
+        agentAiDefaults: { exec: { cacheTtl: "1h" } },
+        ancestors: [{ agentId: "exec", definitionAiDefaults: { cacheTtl: "5m" } }],
+      },
+      expected: { value: "1h", source: { tier: "config", agentId: "exec" } },
+    },
+    {
+      name: "an agent without a declared base gets no implicit Exec value",
+      input: { targetAgentId: "worker", agentAiDefaults: { exec: { cacheTtl: "1h" } } },
+      expected: undefined,
+    },
+    {
+      name: "an invalid persisted value falls through to the frontmatter",
+      input: {
+        targetAgentId: "worker",
+        agentAiDefaults: { worker: { cacheTtl: "2h" as "1h" } },
+        targetDefinitionAiDefaults: { cacheTtl: "1h" },
+      },
+      expected: { value: "1h", source: { tier: "definition", agentId: "worker" } },
+    },
+  ];
+
+  for (const testCase of cases) {
+    it(testCase.name, () => {
+      expect(resolveAgentCacheTtl(testCase.input)).toEqual(testCase.expected);
+    });
+  }
 });
 
 describe("collectDeclaredAncestorLayers", () => {

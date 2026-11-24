@@ -99,11 +99,23 @@ cp -r "$REPO_ROOT/patches" "$CHECK_DIR/patches"
 cp "$REPO_ROOT/package.json" "$CHECK_DIR/package.json"
 
 # Strip devDependencies so bun only resolves production deps (matching published package).
-node -e "
-  const pkg = JSON.parse(require('fs').readFileSync('$CHECK_DIR/package.json', 'utf8'));
+# The CLI below runs whatever the install resolves, so the install takes the release-age floor of
+# the repository's bunfig.toml: a compromised release is usually caught and pulled within days
+# (#7227). The floor exempts the repository's own exceptions and the versions package.json pins
+# exactly, which a PR reviewed (bun.lock may hold one from before it passed the floor).
+bun -e '
+  const [dir, root] = process.argv.slice(1);
+  const pkg = await Bun.file(dir + "/package.json").json();
   delete pkg.devDependencies;
-  require('fs').writeFileSync('$CHECK_DIR/package.json', JSON.stringify(pkg, null, 2) + '\n');
-"
+  await Bun.write(dir + "/package.json", JSON.stringify(pkg, null, 2) + "\n");
+  const install = Bun.TOML.parse(await Bun.file(root + "/bunfig.toml").text()).install;
+  const deps = { ...pkg.dependencies, ...pkg.optionalDependencies };
+  const exact = Object.keys(deps).filter((name) => /^\d+\.\d+\.\d+(-[\w.-]+)?$/.test(deps[name]));
+  const excludes = [...new Set([...(install.minimumReleaseAgeExcludes ?? []), ...exact])];
+  const bunfig = ["[install]", "minimumReleaseAge = " + install.minimumReleaseAge];
+  bunfig.push("minimumReleaseAgeExcludes = " + JSON.stringify(excludes));
+  await Bun.write(dir + "/bunfig.toml", bunfig.join("\n") + "\n");
+' "$CHECK_DIR" "$REPO_ROOT"
 
 # Publish waves (e.g. AWS SDK) can transiently request sibling versions not yet visible on the registry.
 if ! (cd "$CHECK_DIR" && "$REPO_ROOT/scripts/retry.sh" 5 60 bun install --ignore-scripts); then

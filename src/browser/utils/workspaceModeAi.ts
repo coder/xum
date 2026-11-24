@@ -1,5 +1,6 @@
 import type { AgentAiDefaults } from "@/common/types/agentAiDefaults";
-import type { AiSettingSource } from "@/common/types/agentAiSettings";
+import { isValidModelFormat } from "@/common/utils/ai/models";
+import type { AiSettingSource, ResolveAgentAiSettingsInput } from "@/common/types/agentAiSettings";
 import {
   coerceOpenAIReasoningMode,
   coerceThinkingLevel,
@@ -22,6 +23,30 @@ function normalizeAgentId(agentId: string): string {
 }
 
 /**
+ * The model an agent's Settings card inherits, its own Settings model left out: the shared
+ * resolver over the layers a run resolves (agents.list `aiLayers`), so each layer's Settings and
+ * frontmatter rank as in the backend, and a settings base has replaced the bases that the merged
+ * `aiDefaults` still hold. Undefined when no Settings entry or definition sets one.
+ */
+export function resolveInheritedLayerModel(
+  agentId: string,
+  layers: Pick<ResolveAgentAiSettingsInput, "targetDefinitionAiDefaults" | "ancestors">,
+  agentAiDefaults: AgentAiDefaults
+): string | undefined {
+  const resolved = resolveAgentAiSettings({
+    targetAgentId: agentId,
+    profile: "interactive",
+    agentAiDefaults: {
+      ...agentAiDefaults,
+      [agentId]: { ...agentAiDefaults[agentId], modelString: undefined },
+    },
+    ...layers,
+  });
+  const tier = resolved.sources.model?.tier;
+  return tier === "config" || tier === "definition" ? resolved.selected.model : undefined;
+}
+
+/**
  * Field-wise configured defaults for an agent through its declared base chain,
  * delegating precedence to the shared resolver. Values are "configured" only
  * when the resolver sourced them from a config tier, so system defaults and
@@ -37,16 +62,39 @@ export function resolveConfiguredAiDefaults(
   agentId: string,
   agentAiDefaults: AgentAiDefaults,
   agentBaseById?: ReadonlyMap<string, string | undefined>
-): { modelString?: string; thinkingLevel?: ThinkingLevel; reasoningMode?: OpenAIReasoningMode } {
+): {
+  modelString?: string;
+  thinkingLevel?: ThinkingLevel;
+  reasoningMode?: OpenAIReasoningMode;
+  // Each Auto flag is true only when the nearest config layer deciding that dimension chose Auto.
+  autoModelRouting?: true;
+  autoThinkingLevel?: true;
+} {
   const normalizedAgentId = normalizeAgentId(agentId);
   const descriptorsById = new Map([...(agentBaseById ?? [])].map(([id, base]) => [id, { base }]));
+  const ancestors = collectDeclaredAncestorLayers(normalizedAgentId, descriptorsById);
   const resolved = resolveAgentAiSettings({
     targetAgentId: normalizedAgentId,
     profile: "interactive",
     agentAiDefaults,
-    ancestors: collectDeclaredAncestorLayers(normalizedAgentId, descriptorsById),
+    ancestors,
   });
   const fromConfig = (source: AiSettingSource | undefined) => source?.tier === "config";
+
+  // The nearest declared layer setting Auto or a concrete value decides each dimension.
+  // The implicit exec fallback contributes only reasoningMode.
+  const chainIds = [normalizedAgentId, ...ancestors.map((ancestor) => ancestor.agentId)];
+  const resolveConfiguredAuto = (
+    flag: "autoModelRouting" | "autoThinkingLevel",
+    source: AiSettingSource | undefined
+  ): true | undefined => {
+    for (const id of chainIds) {
+      if (agentAiDefaults[id]?.[flag] === true) return true;
+      if (fromConfig(source) && source?.agentId === id) return undefined;
+    }
+    return undefined;
+  };
+
   return {
     modelString: fromConfig(resolved.sources.model) ? resolved.selected.model : undefined,
     thinkingLevel: fromConfig(resolved.sources.thinkingLevel)
@@ -55,6 +103,8 @@ export function resolveConfiguredAiDefaults(
     reasoningMode: fromConfig(resolved.sources.reasoningMode)
       ? resolved.selected.reasoningMode
       : undefined,
+    autoModelRouting: resolveConfiguredAuto("autoModelRouting", resolved.sources.model),
+    autoThinkingLevel: resolveConfiguredAuto("autoThinkingLevel", resolved.sources.thinkingLevel),
   };
 }
 
@@ -87,11 +137,11 @@ export function resolveWorkspaceAiSettingsForAgent(args: {
     args.agentAiDefaults,
     args.agentBaseById
   );
-  const configuredModel = configuredDefaults.modelString;
-  const workspaceOverrideModel =
-    args.useWorkspaceByAgentFallback && typeof workspaceOverride?.model === "string"
-      ? workspaceOverride.model
-      : undefined;
+  const cachedModel =
+    typeof workspaceOverride?.model === "string" ? workspaceOverride.model.trim() : "";
+  const workspaceModel = isValidModelFormat(cachedModel) ? cachedModel : undefined;
+  const configuredModel = workspaceModel ? undefined : configuredDefaults.modelString;
+  const workspaceOverrideModel = args.useWorkspaceByAgentFallback ? workspaceModel : undefined;
   const inheritedModelCandidate =
     workspaceOverrideModel ??
     (typeof args.existingModel === "string" ? args.existingModel : undefined) ??
@@ -106,11 +156,15 @@ export function resolveWorkspaceAiSettingsForAgent(args: {
 
   // Persisted workspace settings can be stale/corrupt; re-validate inherited values
   // so mode sync keeps self-healing behavior instead of propagating invalid options.
+  const workspaceThinking = coerceThinkingLevel(workspaceOverride?.thinkingLevel);
   const workspaceOverrideThinking = args.useWorkspaceByAgentFallback
-    ? coerceThinkingLevel(workspaceOverride?.thinkingLevel)
+    ? workspaceThinking
     : undefined;
   const inheritedThinking = workspaceOverrideThinking ?? coerceThinkingLevel(args.existingThinking);
-  const resolvedThinking = configuredDefaults.thinkingLevel ?? inheritedThinking ?? "off";
+  const resolvedThinking =
+    (workspaceThinking != null ? undefined : configuredDefaults.thinkingLevel) ??
+    inheritedThinking ??
+    "off";
 
   // An existing per-agent bucket owns the reasoning choice outright (matching
   // targetWorkspaceBucketToLayer): a configured Pro default must not re-inject

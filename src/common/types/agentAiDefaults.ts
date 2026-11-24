@@ -4,7 +4,8 @@ import type {
   AgentAiSubagentProfile,
   SubagentAiDefaults,
 } from "@/common/config/schemas/appConfigOnDisk";
-import { AgentIdSchema } from "@/common/orpc/schemas";
+import { CacheTtlSchema } from "@/common/config/schemas/providersConfig";
+import { AgentIdSchema } from "@/common/schemas/ids";
 import { normalizeAgentId } from "@/common/utils/agentIds";
 import { coerceOpenAIReasoningMode, coerceThinkingLevel, type ThinkingLevel } from "./thinking";
 
@@ -24,22 +25,42 @@ function normalizeProfileFields(entry: Record<string, unknown>): AgentAiSubagent
   return { modelString, thinkingLevel, reasoningMode };
 }
 
+/** The entry fields other than the nested delegated `subagent` profile. */
+export const AGENT_AI_DEFAULTS_SCALAR_FIELDS = [
+  ...SUBAGENT_PROFILE_FIELDS,
+  "autoModelRouting",
+  "autoThinkingLevel",
+  "enabled",
+  "cacheTtl",
+] as const;
+
 function isEmptyProfile(profile: AgentAiSubagentProfile): boolean {
   return SUBAGENT_PROFILE_FIELDS.every((field) => profile[field] === undefined);
+}
+
+/** An entry that sets nothing; callers drop it to keep the map sparse. */
+export function isEmptyAgentAiDefaultsEntry(entry: AgentAiDefaultsEntry): boolean {
+  return (
+    AGENT_AI_DEFAULTS_SCALAR_FIELDS.every((field) => entry[field] === undefined) &&
+    entry.subagent === undefined
+  );
 }
 
 /**
  * Drops delegated fields equal to the base profile: the delegated profile is a
  * sparse diff, so equal values must fall through to the base at read time
  * instead of freezing a copy that a later base edit would silently miss.
+ * Explicit canonical Exec fields are exempt: absence inherits from the calling
+ * chat before the global profile. Legacy-only mirrors retain their old cleanup.
  */
 function pruneSubagentProfile(
   profile: AgentAiSubagentProfile,
-  base: AgentAiDefaultsEntry
+  base: AgentAiDefaultsEntry,
+  explicitFields?: AgentAiSubagentProfile
 ): AgentAiSubagentProfile | undefined {
   const pruned: AgentAiSubagentProfile = { ...profile };
   for (const field of SUBAGENT_PROFILE_FIELDS) {
-    if (pruned[field] !== undefined && pruned[field] === base[field]) {
+    if (explicitFields?.[field] === undefined && pruned[field] === base[field]) {
       delete pruned[field];
     }
   }
@@ -61,27 +82,33 @@ export function normalizeAgentAiDefaults(raw: unknown): AgentAiDefaults {
     const base = normalizeProfileFields(entry);
 
     const enabled = typeof entry.enabled === "boolean" ? entry.enabled : undefined;
-    const advisorEnabled =
-      typeof entry.advisorEnabled === "boolean" ? entry.advisorEnabled : undefined;
 
-    const normalized: AgentAiDefaultsEntry = { ...base, enabled, advisorEnabled };
+    const autoModelRouting = entry.autoModelRouting === true ? true : undefined;
+    const autoThinkingLevel = entry.autoThinkingLevel === true ? true : undefined;
+    // An invalid persisted TTL is dropped so the agent inherits instead (self-healing).
+    const cacheTtl = CacheTtlSchema.safeParse(entry.cacheTtl).data;
+
+    const normalized: AgentAiDefaultsEntry = {
+      ...base,
+      autoModelRouting,
+      autoThinkingLevel,
+      enabled,
+      cacheTtl,
+    };
 
     if (entry.subagent && typeof entry.subagent === "object" && !Array.isArray(entry.subagent)) {
+      const profile = normalizeProfileFields(entry.subagent as Record<string, unknown>);
       const subagent = pruneSubagentProfile(
-        normalizeProfileFields(entry.subagent as Record<string, unknown>),
-        normalized
+        profile,
+        normalized,
+        agentId === "exec" ? profile : undefined
       );
       if (subagent) {
         normalized.subagent = subagent;
       }
     }
 
-    if (
-      isEmptyProfile(normalized) &&
-      enabled === undefined &&
-      advisorEnabled === undefined &&
-      normalized.subagent === undefined
-    ) {
+    if (isEmptyAgentAiDefaultsEntry(normalized)) {
       continue;
     }
 
@@ -132,7 +159,11 @@ export function mergeLegacySubagentAiDefaults(
     merged.modelString ??= legacyEntry.modelString;
     merged.thinkingLevel ??= legacyEntry.thinkingLevel;
     merged.reasoningMode ??= legacyEntry.reasoningMode;
-    const pruned = pruneSubagentProfile(merged, base);
+    const pruned = pruneSubagentProfile(
+      merged,
+      base,
+      agentId === "exec" ? base.subagent : undefined
+    );
     if (pruned) {
       base.subagent = pruned;
     } else {

@@ -6,16 +6,11 @@
  * if a request can be rebuilt byte-for-byte from the log, no request-time
  * injection of live state exists.
  *
- * The reconstruction reuses the SAME production code paths, never a
- * reimplementation:
- * - prepareProviderRequestMessages / addInterruptedSentinel (aiService)
- * - prepareMessagesForProvider (messagePipeline)
- * - createCachedSystemMessage / createOpenAICachedSystemMessage
- *   (StreamManager.buildStreamRequestConfig applies the same wrapping)
- * - the real AI SDK streamText conversion (ModelMessage → LanguageModelV4
- *   prompt), captured through a stub model that never performs network I/O,
- *   with the same per-step message transforms StreamManager's prepareStep
- *   applies.
+ * The reconstruction reuses the production assemblePromptPayload entry point
+ * and the real AI SDK streamText conversion (ModelMessage → LanguageModelV4
+ * prompt), captured through a stub model that never performs network I/O,
+ * with the same per-step message transforms StreamManager's prepareStep
+ * applies.
  *
  * Guarantee scope: same log + same config + same binary. Request-time inputs
  * that chat.jsonl alone cannot provide (plan-transition content,
@@ -25,29 +20,26 @@
  * a divergence — surfacing them is the point of the auditor.
  */
 
-import { streamText, type ModelMessage, type SystemModelMessage, type Tool } from "ai";
+import { streamText, type Instructions, type ModelMessage, type Tool } from "ai";
 import type {
   LanguageModelV4,
   LanguageModelV4CallOptions,
   LanguageModelV4StreamPart,
 } from "@ai-sdk/provider";
-import { addInterruptedSentinel } from "@/browser/utils/messages/modelMessageTransform";
 import type { ProvidersConfigMap } from "@/common/orpc/types";
 import type { PostCompactionAttachment } from "@/common/types/attachment";
-import { filterOrphanedMcpPromptSnapshots, type MuxMessage } from "@/common/types/message";
-import type { ThinkingLevel } from "@/common/types/thinking";
 import {
-  createCachedSystemMessage,
-  createOpenAICachedSystemMessage,
-  type AnthropicCacheTtl,
-} from "@/common/utils/ai/cacheStrategy";
+  filterOrphanedMcpPromptSnapshots,
+  type MuxMessage,
+  type VolatileSystemTailRecord,
+} from "@/common/types/message";
+import type { ThinkingLevel } from "@/common/types/thinking";
+import type { AnthropicCacheTtl } from "@/common/utils/ai/cacheStrategy";
 import { normalizeToCanonical } from "@/common/utils/ai/models";
 import assert from "@/common/utils/assert";
-import {
-  prepareProviderRequestMessages,
-  replaceOrAppendMessageById,
-} from "@/node/services/aiService";
-import { prepareMessagesForProvider } from "@/node/services/messagePipeline";
+import { dedupeNativeToolReferences } from "@/common/utils/tools/toolCatalog";
+import { replaceOrAppendMessageById } from "@/node/services/aiService";
+import { assemblePromptPayload } from "@/node/services/turnContextAssembler";
 import { parseModelString } from "@/node/services/providerModelFactory";
 import { extractToolMediaAsUserMessagesFromModelMessages } from "@/node/utils/messages/extractToolMediaAsUserMessagesFromModelMessages";
 import { stripWorkflowRunRecordsFromModelMessages } from "@/node/utils/messages/stripWorkflowRunRecordsFromModelMessages";
@@ -74,6 +66,17 @@ export interface ReplayRequestInputs {
   routeProvider?: string;
   providersConfig?: ProvidersConfigMap | null;
   anthropicCacheTtl?: AnthropicCacheTtl | null;
+  /** Volatile system tail length from the turn-envelope row (absent = one block). */
+  systemPromptVolatileSuffixLength?: number;
+  /**
+   * The turn's MuxMetadata.volatileSystemTail. The envelope records the system tail the
+   * request sent (frozen inside a segment), so the rebuild derives the live tail from this.
+   */
+  volatileSystemTail?: VolatileSystemTailRecord;
+  /** The turn's MuxMetadata.customInstructions, skillIndex and toolInstructions, likewise. */
+  customInstructions?: VolatileSystemTailRecord;
+  skillIndex?: VolatileSystemTailRecord;
+  toolInstructions?: VolatileSystemTailRecord;
   /**
    * Resolved wire provider name from the turn-envelope row. Falls back to
    * name-canonicalization of the model string when absent (legacy envelopes) —
@@ -92,13 +95,29 @@ export interface ReplayRequestInputs {
    * fallback request via replaceOrAppendMessageById.
    */
   partialContinuation?: MuxMessage | null;
+  /**
+   * MCP Apps model context message from the turn-envelope blob. Request-only
+   * (never in chat.jsonl); assemblePromptPayload inserts it where production does.
+   */
+  mcpAppModelContext?: MuxMessage | null;
+  /**
+   * Native tool search: deferred tool names, whose replayed tool_catalog_search results
+   * production rewrites into tool_reference blocks. Derived from the recorded wire tools.
+   */
+  deferLoadingToolNames?: ReadonlySet<string>;
+  /**
+   * The budget production trimmed a compaction request's history to, from the recorded
+   * DevTools run (DevToolsRun.compactionInputBudgetTokens). It depends on the 1M setting and
+   * the retry scale, which no durable log row carries.
+   */
+  compactionInputBudgetTokens?: number;
   workspaceId: string;
 }
 
 /** The rebuilt request at both comparison levels. */
 export interface ReplayBuiltRequest {
   /** streamText `system` argument after production cache wrapping. */
-  system: string | SystemModelMessage | undefined;
+  system: Instructions | undefined;
   /** Provider-ready ModelMessages (post prepareMessagesForProvider + cache system prepend). */
   messages: ModelMessage[];
   /**
@@ -128,7 +147,7 @@ export function deriveWireProviderName(modelString: string): string {
  * whose bytes depended on a live download is not log-reconstructible anyway).
  */
 export async function captureLanguageModelPrompt(params: {
-  system: string | SystemModelMessage | undefined;
+  system: Instructions | undefined;
   messages: ModelMessage[];
   modelId: string;
   /** Optional: capture the wire tool definitions too (fixture generation). */
@@ -187,8 +206,9 @@ export async function captureLanguageModelPrompt(params: {
       // prepareStep — they run on step 0 too, so the recorded prompt
       // includes them.
       const withoutWorkflowRunRecords = stripWorkflowRunRecordsFromModelMessages(stepMessages);
-      const rewritten =
-        await extractToolMediaAsUserMessagesFromModelMessages(withoutWorkflowRunRecords);
+      const rewritten = dedupeNativeToolReferences(
+        await extractToolMediaAsUserMessagesFromModelMessages(withoutWorkflowRunRecords)
+      );
       return rewritten === stepMessages ? undefined : { messages: rewritten };
     },
   });
@@ -214,59 +234,38 @@ export async function buildReplayRequest(inputs: ReplayRequestInputs): Promise<R
     inputs.partialContinuation != null
       ? replaceOrAppendMessageById(filteredMessages, inputs.partialContinuation)
       : filteredMessages;
-  const { providerRequestMessages } = prepareProviderRequestMessages(
-    requestMessages,
-    wireProviderName,
-    inputs.thinkingLevel
-  );
-  const messagesWithSentinel = addInterruptedSentinel(providerRequestMessages);
-
-  const finalMessages = await prepareMessagesForProvider({
-    messagesWithSentinel,
+  const payload = await assemblePromptPayload({
+    history: requestMessages,
+    systemMessage: inputs.systemPrompt,
+    volatileSystemSuffixLength: inputs.systemPromptVolatileSuffixLength,
+    replayedTurn: {
+      record: inputs.volatileSystemTail,
+      customInstructions: inputs.customInstructions,
+      skillIndex: inputs.skillIndex,
+      toolInstructions: inputs.toolInstructions,
+    },
+    modelString: inputs.modelString,
+    routeProvider: inputs.routeProvider,
+    providerForMessages: wireProviderName,
+    effectiveThinkingLevel: inputs.thinkingLevel,
     effectiveAgentId: inputs.effectiveAgentId,
     toolNamesForSentinel: inputs.toolNamesForSentinel,
     planContentForTransition: inputs.planContentForTransition,
     planFilePath: inputs.planFilePath,
     postCompactionAttachments: inputs.postCompactionAttachments,
-    providerForMessages: wireProviderName,
-    effectiveThinkingLevel: inputs.thinkingLevel,
-    modelString: inputs.modelString,
     providersConfig: inputs.providersConfig,
     anthropicCacheTtl: inputs.anthropicCacheTtl,
     workspaceId: inputs.workspaceId,
+    deferLoadingToolNames: inputs.deferLoadingToolNames,
+    compactionInputBudgetTokens: inputs.compactionInputBudgetTokens,
+    requestContextMessage: inputs.mcpAppModelContext ?? undefined,
   });
 
-  // StreamManager.buildStreamRequestConfig's system handling: Anthropic-cache
-  // models move the system prompt into messages[0] with cache control; the
-  // direct-OpenAI explicit-cache path wraps it as a structured message.
-  let system: string | SystemModelMessage | undefined = inputs.systemPrompt;
-  let messages = finalMessages;
-  const cachedSystemMessage = createCachedSystemMessage(
-    inputs.systemPrompt,
-    inputs.modelString,
-    inputs.anthropicCacheTtl,
-    inputs.providersConfig
-  );
-  if (cachedSystemMessage) {
-    messages = [cachedSystemMessage, ...finalMessages];
-    system = undefined;
-  } else {
-    const openaiCachedSystem = createOpenAICachedSystemMessage(
-      inputs.systemPrompt,
-      inputs.modelString,
-      inputs.routeProvider,
-      inputs.providersConfig ?? null
-    );
-    if (openaiCachedSystem) {
-      system = openaiCachedSystem;
-    }
-  }
-
   const { prompt } = await captureLanguageModelPrompt({
-    system,
-    messages,
+    system: payload.system,
+    messages: payload.messages,
     modelId: inputs.modelString,
   });
 
-  return { system, messages, lmPrompt: prompt };
+  return { system: payload.system, messages: payload.messages, lmPrompt: prompt };
 }

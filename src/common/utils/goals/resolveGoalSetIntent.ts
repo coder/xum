@@ -36,6 +36,44 @@ export function mergeGoalDefaults(
 }
 
 /**
+ * The stored form of a per-workspace override: every field present (`null`
+ * means "follow the global default"), or `null` when every field is `null`, so
+ * "no override" is one canonical state with no record at all.
+ */
+export function canonicalGoalDefaultsOverride(
+  override: WorkspaceGoalDefaultsOverride
+): WorkspaceGoalDefaultsOverride | null {
+  const canonical = {
+    defaultBudgetCents: override.defaultBudgetCents ?? null,
+    defaultTurnCap: override.defaultTurnCap ?? null,
+    alwaysRequireExplicitBudget: override.alwaysRequireExplicitBudget ?? null,
+  };
+  return Object.values(canonical).every((value) => value === null) ? null : canonical;
+}
+
+/**
+ * Whether storing `next` (a canonicalGoalDefaultsOverride result) over the
+ * stored record `prior` changes nothing. A stored record whose fields are all
+ * `null` still differs from `null`: storing `null` removes that record.
+ */
+export function sameGoalDefaultsOverride(
+  prior: WorkspaceGoalDefaultsOverride | undefined,
+  next: WorkspaceGoalDefaultsOverride | null
+): boolean {
+  if (next == null) {
+    return prior == null;
+  }
+  if (prior == null) {
+    return false;
+  }
+  return (
+    (prior.defaultBudgetCents ?? null) === next.defaultBudgetCents &&
+    (prior.defaultTurnCap ?? null) === next.defaultTurnCap &&
+    (prior.alwaysRequireExplicitBudget ?? null) === next.alwaysRequireExplicitBudget
+  );
+}
+
+/**
  * Inputs passed by callers (slash command, command palette, GoalTab) when
  * creating a goal. Each field is optional — defaults fill in the rest.
  *

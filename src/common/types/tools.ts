@@ -4,11 +4,16 @@
  */
 
 import type { z } from "zod";
-import type { AgentSkillDescriptor, AgentSkillFrontmatter } from "@/common/types/agentSkill";
+import type {
+  AgentSkillDescriptor,
+  AgentSkillFrontmatter,
+  AgentSkillScope,
+} from "@/common/types/agentSkill";
 import type {
   AgentReportToolResultSchema,
   AgentSkillReadFileToolResultSchema,
   MCPPromptGetToolResultSchema,
+  ModelsListToolResultSchema,
   AgentSkillReadToolResultSchema,
   AskUserQuestionQuestionSchema,
   AskUserQuestionToolResultSchema,
@@ -63,8 +68,6 @@ export type AgentSkillReadFileToolArgs = z.infer<
   typeof TOOL_DEFINITIONS.agent_skill_read_file.schema
 >;
 export type AgentSkillReadFileToolResult = z.infer<typeof AgentSkillReadFileToolResultSchema>;
-
-export type MCPPromptGetToolArgs = z.infer<typeof TOOL_DEFINITIONS.mcp_prompt_get.schema>;
 export type MCPPromptGetToolResult = z.infer<typeof MCPPromptGetToolResultSchema>;
 
 // agent_skill_list args + result
@@ -72,6 +75,11 @@ export type AgentSkillListToolArgs = z.infer<typeof TOOL_DEFINITIONS.agent_skill
 export type AgentSkillListToolResult =
   | { success: true; skills: AgentSkillDescriptor[] }
   | { success: false; error: string };
+
+// models_list args + result (entries are the shared AvailableModel domain type)
+export type { AvailableModel } from "@/common/utils/ai/selectableModels";
+export type ModelsListToolArgs = z.infer<typeof TOOL_DEFINITIONS.models_list.schema>;
+export type ModelsListToolResult = z.infer<typeof ModelsListToolResultSchema>;
 
 // agent_skill_write result
 export type AgentSkillWriteToolResult =
@@ -128,15 +136,24 @@ export type SkillsCatalogReadToolResult =
       owner: string;
       repo: string;
       path: string;
-      frontmatter: AgentSkillFrontmatter;
+      /** On the first page only (no offset_chars). */
+      frontmatter?: AgentSkillFrontmatter;
       body: string;
       url: string;
+      /** Set when body is one page of a longer body (see offset_chars). */
+      nextCharOffset?: number;
+      startCharOffset?: number;
+      /** Content hash of the copy the pages come from; pass it back with offset_chars. */
+      snapshot?: string;
+      note?: string;
     }
   | { success: false; error: string };
 
 export interface AskUserQuestionUiOnlyPayload {
   questions: AskUserQuestionQuestion[];
   answers: Record<string, string>;
+  /** "message": asked without waiting; answers arrive later as a steering user message. */
+  answerDelivery?: "message";
 }
 
 export interface FileEditUiOnlyPayload {
@@ -168,6 +185,17 @@ export type HeartbeatToolResult = z.infer<typeof HeartbeatToolResultSchema>;
 // Timeline-event tool types, derived from schema (avoid drift)
 export type TimelineEventToolArgs = z.infer<typeof TOOL_DEFINITIONS.timeline_event.schema>;
 export type TimelineEventToolResult = z.infer<typeof TimelineEventToolResultSchema>;
+
+// Status-update tool types (status page agent mode)
+export type StatusUpdateToolResult =
+  | { success: true; queued: true; note?: string }
+  | { success: false; error: string };
+
+// Session-history tool types, derived from schema (avoid drift)
+export type SessionHistoryToolArgs = z.infer<typeof TOOL_DEFINITIONS.session_history.schema>;
+export type SessionHistoryToolResult = z.infer<
+  typeof TOOL_DEFINITIONS.session_history.resultSchema
+>;
 
 // Memory tool types, derived from schema (avoid drift)
 export type MemoryToolArgs = z.infer<typeof TOOL_DEFINITIONS.memory.schema>;
@@ -247,6 +275,20 @@ export const FILE_EDIT_TOOL_NAMES = [
 export const FILE_READ_TOOL_NAMES = ["file_read"] as const;
 
 /**
+ * Field a successful direct file_read / file_edit_* result carries when the touched
+ * file matches a path-scoped skill (`paths` frontmatter). Unlike the model-only
+ * `__mux_notifications`, it is persisted to chat.jsonl: the pointer stays in the
+ * append-only prompt prefix, and later turns of the same context window see it and
+ * do not surface the skill again.
+ */
+export const PATH_SKILLS_RESULT_FIELD = "path_skills" as const;
+
+export interface PathSkillsResultField {
+  message: string;
+  skills: Array<{ name: string; scope: AgentSkillScope; description: string }>;
+}
+
+/**
  * Prefix for edit failure notes (agent-only messages).
  * This prefix signals to the agent that the file was not modified.
  */
@@ -258,7 +300,6 @@ export const EDIT_FAILED_NOTE_PREFIX = "EDIT FAILED - file was NOT modified.";
 export const NOTE_READ_FILE_RETRY = "Read the file to get current content, then retry.";
 export const NOTE_READ_FILE_FIRST_RETRY =
   "Read the file first to get the exact current content, then retry.";
-export const NOTE_READ_FILE_AGAIN_RETRY = "Read the file again and retry.";
 
 /**
  * Tool description warning for file edit tools
@@ -337,10 +378,6 @@ export type TaskWorkspaceLifecycleToolArgs = z.infer<typeof TaskWorkspaceLifecyc
 export type TaskWorkspaceLifecycleToolSuccessResult = z.infer<
   typeof TaskWorkspaceLifecycleToolResultSchema
 >;
-
-export type TaskWorkspaceLifecycleToolResult =
-  | TaskWorkspaceLifecycleToolSuccessResult
-  | ToolErrorResult;
 
 // One per-target outcome row, discriminated on `status` (12 lifecycle states).
 export type TaskWorkspaceLifecycleTargetResult =
@@ -494,6 +531,23 @@ export interface ToolSearchToolResult {
   matches: Array<{ name: string; description: string; serverName?: string }>;
   /** Total deferred-catalog size, so the model/UI can see there are more undiscovered tools. */
   totalDeferred: number;
+  /**
+   * Present when an oversized definition kept a keyword search from
+   * auto-loading. Nothing was loaded (`matches` is empty, so activation and
+   * replay seeding skip the result by construction); the ranked candidates are
+   * listed, with approximate wire-token sizes, for an explicit exact-name
+   * re-search. Inline type literals (like `matches`) keep the result
+   * JSONValue-assignable for scoped-mode toModelOutput.
+   */
+  discovery?: {
+    candidates: Array<{
+      name: string;
+      serverName?: string;
+      approxTokens: number;
+      oversized?: true;
+    }>;
+    note: string;
+  };
 }
 
 // Notify Tool Types

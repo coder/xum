@@ -154,6 +154,15 @@ function parseTimeZone(value: unknown): string {
   return timeZone;
 }
 
+/**
+ * The zone whose calendar dates bound a range; absent follows the bucket zone. A range defined
+ * in another zone (the UTC month) bounds its dates there while its buckets follow the display
+ * zone.
+ */
+function parseFilterTimeZone(value: unknown, bucketTimeZone: string): string {
+  return value == null ? bucketTimeZone : parseTimeZone(value);
+}
+
 function parseTimingMetric(value: unknown): TimingMetric {
   assert(
     value === "ttft" || value === "duration" || value === "tps",
@@ -224,6 +233,7 @@ async function querySpendOverTime(
     from: string | null;
     to: string | null;
     timeZone: string;
+    filterTimeZone: string;
   }
 ): Promise<SpendOverTimeRow[]> {
   const bucketExpression: Record<Granularity, string> = {
@@ -247,12 +257,17 @@ async function querySpendOverTime(
         CASE
           WHEN timestamp IS NOT NULL THEN timezone(?, to_timestamp(timestamp / 1000.0))
           ELSE NULL
-        END AS localized_timestamp
+        END AS localized_timestamp,
+        CASE
+          WHEN timestamp IS NOT NULL THEN CAST(timezone(?, to_timestamp(timestamp / 1000.0)) AS DATE)
+          ELSE NULL
+        END AS filter_timestamp_date
       FROM events
     ), localized_events AS (
       SELECT
         event_times.*,
-        COALESCE(CAST(localized_timestamp AS DATE), date) AS calendar_date
+        COALESCE(CAST(localized_timestamp AS DATE), date) AS calendar_date,
+        COALESCE(filter_timestamp_date, date) AS filter_date
       FROM event_times
     )
     SELECT
@@ -262,14 +277,15 @@ async function querySpendOverTime(
     FROM localized_events
     WHERE
       (? IS NULL OR project_path = ?)
-      AND (? IS NULL OR calendar_date >= CAST(? AS DATE))
-      AND (? IS NULL OR calendar_date <= CAST(? AS DATE))
+      AND (? IS NULL OR filter_date >= CAST(? AS DATE))
+      AND (? IS NULL OR filter_date <= CAST(? AS DATE))
       ${bucketNullFilter}
     GROUP BY 1, 2
     ORDER BY 1 ASC, 2 ASC
     `,
     [
       params.timeZone,
+      params.filterTimeZone,
       params.projectPath,
       params.projectPath,
       params.from,
@@ -500,7 +516,13 @@ async function queryAgentCostBreakdown(
     conn,
     `
     SELECT
-      COALESCE(agent_id, 'unknown') AS agent_id,
+      -- Headless rows (status, memory, dropped streams) run outside any agent turn: group them by
+      -- their source tool_name (headless:<source>) so they do not land in "unknown" (#5766).
+      COALESCE(
+        agent_id,
+        CASE WHEN tool_name LIKE 'headless:%' THEN tool_name END,
+        'unknown'
+      ) AS agent_id,
       COALESCE(SUM(total_cost_usd), 0) AS cost_usd,
       COALESCE(
         SUM(input_tokens + output_tokens + reasoning_tokens + cached_tokens + cache_create_tokens),
@@ -626,12 +648,14 @@ export async function executeNamedQuery(
     }
 
     case "getSpendOverTime": {
+      const timeZone = parseTimeZone(params.timeZone);
       return querySpendOverTime(conn, {
         granularity: parseGranularity(params.granularity),
         projectPath: parseOptionalString(params.projectPath),
         from: parseDateFilter(params.from),
         to: parseDateFilter(params.to),
-        timeZone: parseTimeZone(params.timeZone),
+        timeZone,
+        filterTimeZone: parseFilterTimeZone(params.filterTimeZone, timeZone),
       });
     }
 

@@ -1,7 +1,7 @@
+import * as path from "path";
 import { afterEach, beforeEach, describe, expect, spyOn, test } from "bun:test";
 import { existsSync } from "fs";
 import * as fs from "fs/promises";
-import * as path from "path";
 import { TIMELINE_FILE_NAME } from "@/common/constants/paths";
 import {
   TIMELINE_TEXT_MAX_LENGTH,
@@ -37,21 +37,17 @@ function message(
 }
 
 describe("TimelineService", () => {
-  let enabled: boolean;
   let service: TimelineService;
   let historyService: Awaited<ReturnType<typeof createTestHistoryService>>["historyService"];
   let config: Awaited<ReturnType<typeof createTestHistoryService>>["config"];
   let cleanup: () => Promise<void>;
 
   beforeEach(async () => {
-    enabled = true;
     const testHistory = await createTestHistoryService();
     historyService = testHistory.historyService;
     config = testHistory.config;
     cleanup = testHistory.cleanup;
-    service = new TimelineService(config, historyService, {
-      isExperimentEnabled: () => enabled,
-    });
+    service = new TimelineService(config, historyService);
   });
 
   afterEach(async () => {
@@ -60,7 +56,7 @@ describe("TimelineService", () => {
   });
 
   function timelinePath(workspaceId = WORKSPACE_ID): string {
-    return path.join(config.getSessionDir(workspaceId), TIMELINE_FILE_NAME);
+    return path.join(config.sessionsDir, workspaceId, TIMELINE_FILE_NAME);
   }
 
   test("continues monotonic sequences after service restart", async () => {
@@ -68,9 +64,7 @@ describe("TimelineService", () => {
     service.record(WORKSPACE_ID, draft("second"));
     await service.flush();
 
-    service = new TimelineService(config, historyService, {
-      isExperimentEnabled: () => enabled,
-    });
+    service = new TimelineService(config, historyService);
     service.record(WORKSPACE_ID, draft("third"));
     await service.flush();
 
@@ -126,7 +120,7 @@ describe("TimelineService", () => {
       kind: "future.event.kind",
       source: { system: "agent" },
     };
-    await fs.mkdir(config.getSessionDir(WORKSPACE_ID), { recursive: true });
+    await fs.mkdir(path.join(config.sessionsDir, WORKSPACE_ID), { recursive: true });
     await fs.writeFile(timelinePath(), `${JSON.stringify(unknownEvent)}\n`, "utf-8");
 
     const page = await service.list(WORKSPACE_ID, {});
@@ -144,7 +138,7 @@ describe("TimelineService", () => {
       source: { system: "chat" },
       data: { toolName: "bash", durationMs: 40, digest: "git status" },
     };
-    await fs.mkdir(config.getSessionDir(WORKSPACE_ID), { recursive: true });
+    await fs.mkdir(path.join(config.sessionsDir, WORKSPACE_ID), { recursive: true });
     await fs.writeFile(timelinePath(), `${JSON.stringify(retired)}\n`, "utf-8");
 
     service.record(WORKSPACE_ID, draft("after-retired"));
@@ -164,7 +158,7 @@ describe("TimelineService", () => {
       source: { system: "agent" },
       data: { description: "Landed the slice", unknownFutureField: "keep me readable" },
     };
-    await fs.mkdir(config.getSessionDir(WORKSPACE_ID), { recursive: true });
+    await fs.mkdir(path.join(config.sessionsDir, WORKSPACE_ID), { recursive: true });
     await fs.writeFile(timelinePath(), `${JSON.stringify(forwardCompatible)}\n`, "utf-8");
 
     const page = await service.list(WORKSPACE_ID, {});
@@ -229,7 +223,7 @@ describe("TimelineService", () => {
       anchor: { messageId: "message-1", stepId: "future-step" },
       status: "queued",
     };
-    await fs.mkdir(config.getSessionDir(WORKSPACE_ID), { recursive: true });
+    await fs.mkdir(path.join(config.sessionsDir, WORKSPACE_ID), { recursive: true });
     await fs.writeFile(timelinePath(), `${JSON.stringify(forwardCompatible)}\n`, "utf-8");
 
     const page = await service.list(WORKSPACE_ID, {});
@@ -256,20 +250,6 @@ describe("TimelineService", () => {
 
     const preview = await service.previewAnchor(WORKSPACE_ID, { toolCallId: "call-1" });
     expect(preview).toEqual({ role: "assistant", textExcerpt: "Investigate retry backoff" });
-  });
-
-  test("does not create a file when the experiment is off", async () => {
-    enabled = false;
-    service.record(WORKSPACE_ID, draft("disabled"));
-    await service.flush();
-
-    let error: unknown;
-    try {
-      await fs.stat(timelinePath());
-    } catch (caught) {
-      error = caught;
-    }
-    expect(error).toMatchObject({ code: "ENOENT" });
   });
 
   test("rejects an invalid draft without consuming a sequence number", async () => {
@@ -355,12 +335,12 @@ describe("TimelineService", () => {
   test("drops records for a closed workspace so a late append cannot recreate its session dir", async () => {
     service.record(WORKSPACE_ID, draft("before-close"));
     await service.closeWorkspace(WORKSPACE_ID);
-    await fs.rm(config.getSessionDir(WORKSPACE_ID), { recursive: true, force: true });
+    await fs.rm(path.join(config.sessionsDir, WORKSPACE_ID), { recursive: true, force: true });
 
     service.record(WORKSPACE_ID, draft("after-close"));
     await service.flush();
 
-    expect(existsSync(config.getSessionDir(WORKSPACE_ID))).toBe(false);
+    expect(existsSync(path.join(config.sessionsDir, WORKSPACE_ID))).toBe(false);
   });
 
   test("keeps a new event readable after an interrupted write left an unterminated line", async () => {
@@ -424,12 +404,12 @@ describe("TimelineService", () => {
     });
 
     const archived = await fs.readFile(
-      path.join(config.getSessionDir(WORKSPACE_ID), "chat-archive.jsonl"),
+      path.join(config.sessionsDir, WORKSPACE_ID, "chat-archive.jsonl"),
       "utf-8"
     );
     expect(archived).toContain('"id":"target"');
     const active = await fs.readFile(
-      path.join(config.getSessionDir(WORKSPACE_ID), "chat.jsonl"),
+      path.join(config.sessionsDir, WORKSPACE_ID, "chat.jsonl"),
       "utf-8"
     );
     expect(active).not.toContain('"id":"target"');

@@ -7,6 +7,7 @@
  */
 import { useState, useEffect, useCallback, useRef } from "react";
 import { useAPI } from "@/browser/contexts/API";
+import { isConnectionLostError } from "@/browser/contexts/connectionLink";
 import type {
   CoderInfo,
   CoderTemplate,
@@ -91,6 +92,22 @@ interface UseCoderWorkspaceReturn {
  * State ownership: coderConfig is owned by parent (selectedRuntime.coder).
  * This hook derives `enabled` from coderConfig and manages only async data.
  */
+/** The first line of a list request's error, for the picker's error text. */
+function formatCoderListError(error: unknown): string {
+  const message =
+    error instanceof Error ? error.message.split("\n")[0].slice(0, 200).trim() : "Unknown error";
+  return message || "Unknown error";
+}
+
+/** True while `config` still selects the template (and org) a presets request was made for. */
+function isTemplateSelected(
+  config: CoderWorkspaceConfig | null,
+  template: string,
+  org: string | undefined
+): boolean {
+  return config?.template === template && config.templateOrg === org;
+}
+
 export function useCoderWorkspace({
   coderConfig,
   onCoderConfigChange,
@@ -122,6 +139,10 @@ export function useCoderWorkspace({
   const [loadingTemplates, setLoadingTemplates] = useState(false);
   const [loadingPresets, setLoadingPresets] = useState(false);
   const [loadingWorkspaces, setLoadingWorkspaces] = useState(false);
+  // What the lists show: a reload of shown data keeps it on screen instead of a spinner.
+  const templatesShownRef = useRef(false);
+  const workspacesShownRef = useRef(false);
+  const shownPresetsKeyRef = useRef<string | null>(null);
 
   const fetchCoderInfo = useCallback(async () => {
     // Advance sequence before the API guard so that an API context change
@@ -141,8 +162,9 @@ export function useCoderWorkspace({
       if (info.state !== "available" && coderConfigRef.current != null) {
         onCoderConfigChangeRef.current(null);
       }
-    } catch {
-      if (seq !== latestAuthSeqRef.current) {
+    } catch (error) {
+      // A lost connection says nothing about the CLI: keep the info and the user's Coder config.
+      if (seq !== latestAuthSeqRef.current || isConnectionLostError(error)) {
         return;
       }
 
@@ -180,15 +202,19 @@ export function useCoderWorkspace({
 
   // Fetch templates when Coder is enabled
   useEffect(() => {
-    if (!api || !enabled || coderInfo?.state !== "available") {
+    if (!enabled || coderInfo?.state !== "available") {
+      templatesShownRef.current = false;
       setTemplates([]);
       setTemplatesError(null);
       setLoadingTemplates(false);
       return;
     }
+    // Offline, keep the shown templates: the reconnect reloads them.
+    if (!api) return;
 
     let mounted = true;
-    setLoadingTemplates(true);
+    // Only the first load shows "loading": a reload keeps the shown templates.
+    if (!templatesShownRef.current) setLoadingTemplates(true);
     setTemplatesError(null);
 
     api.coder
@@ -196,6 +222,7 @@ export function useCoderWorkspace({
       .then((result) => {
         if (!mounted) return;
         if (result.ok) {
+          templatesShownRef.current = true;
           setTemplates(result.templates);
           setTemplatesError(null);
           // Auto-select first template if none selected
@@ -212,13 +239,9 @@ export function useCoderWorkspace({
         }
       })
       .catch((error) => {
-        if (!mounted) return;
-        const message =
-          error instanceof Error
-            ? error.message.split("\n")[0].slice(0, 200).trim()
-            : "Unknown error";
+        if (!mounted || isConnectionLostError(error)) return;
         setTemplates([]);
-        setTemplatesError(message || "Unknown error");
+        setTemplatesError(formatCoderListError(error));
       })
       .finally(() => {
         if (mounted) {
@@ -234,15 +257,19 @@ export function useCoderWorkspace({
 
   // Fetch existing workspaces when Coder is enabled
   useEffect(() => {
-    if (!api || !enabled || coderInfo?.state !== "available") {
+    if (!enabled || coderInfo?.state !== "available") {
+      workspacesShownRef.current = false;
       setExistingWorkspaces([]);
       setWorkspacesError(null);
       setLoadingWorkspaces(false);
       return;
     }
+    // Offline, keep the shown workspaces: the reconnect reloads them.
+    if (!api) return;
 
     let mounted = true;
-    setLoadingWorkspaces(true);
+    // Only the first load shows "loading": a reload keeps the shown workspaces.
+    if (!workspacesShownRef.current) setLoadingWorkspaces(true);
     setWorkspacesError(null);
 
     api.coder
@@ -250,6 +277,7 @@ export function useCoderWorkspace({
       .then((result) => {
         if (!mounted) return;
         if (result.ok) {
+          workspacesShownRef.current = true;
           setExistingWorkspaces(result.workspaces);
           setWorkspacesError(null);
         } else {
@@ -259,13 +287,9 @@ export function useCoderWorkspace({
         }
       })
       .catch((error) => {
-        if (!mounted) return;
-        const message =
-          error instanceof Error
-            ? error.message.split("\n")[0].slice(0, 200).trim()
-            : "Unknown error";
+        if (!mounted || isConnectionLostError(error)) return;
         setExistingWorkspaces([]);
-        setWorkspacesError(message || "Unknown error");
+        setWorkspacesError(formatCoderListError(error));
       })
       .finally(() => {
         if (mounted) {
@@ -280,20 +304,33 @@ export function useCoderWorkspace({
 
   // Fetch presets when template changes (only for "new" mode)
   useEffect(() => {
-    if (!api || !enabled || !coderConfig?.template || coderConfig.existingWorkspace) {
+    if (!enabled || !coderConfig?.template || coderConfig.existingWorkspace) {
+      shownPresetsKeyRef.current = null;
       setPresets([]);
       setPresetsError(null);
       setLoadingPresets(false);
       return;
     }
-
-    let mounted = true;
-    setLoadingPresets(true);
-    setPresetsError(null);
-
     // Capture template/org at request time to detect stale responses
     const templateAtRequest = coderConfig.template;
     const orgAtRequest = coderConfig.templateOrg;
+    const presetsKey = JSON.stringify([templateAtRequest, orgAtRequest]);
+    if (shownPresetsKeyRef.current !== presetsKey) {
+      // The shown presets belong to another template: never offer them, offline either.
+      shownPresetsKeyRef.current = null;
+      setPresets([]);
+    }
+    // Offline, keep the shown presets of this template: the reconnect reloads them.
+    if (!api) {
+      setLoadingPresets(false);
+      return;
+    }
+
+    let mounted = true;
+    // Every load sets "loading", a reload (reconnect) too: ChatInput blocks a Coder send on it,
+    // so no send can use a preset the server removed while offline.
+    setLoadingPresets(true);
+    setPresetsError(null);
 
     api.coder
       .listPresets({ template: templateAtRequest, org: orgAtRequest })
@@ -303,14 +340,12 @@ export function useCoderWorkspace({
         }
 
         // Stale response guard: if user changed template/org while request was in-flight, ignore this response
-        if (
-          coderConfigRef.current?.template !== templateAtRequest ||
-          coderConfigRef.current?.templateOrg !== orgAtRequest
-        ) {
+        if (!isTemplateSelected(coderConfigRef.current, templateAtRequest, orgAtRequest)) {
           return;
         }
 
         if (result.ok) {
+          shownPresetsKeyRef.current = presetsKey;
           setPresets(result.presets);
           setPresetsError(null);
 
@@ -326,7 +361,11 @@ export function useCoderWorkspace({
               if (onlyPreset && currentConfig.preset !== onlyPreset.name) {
                 onCoderConfigChange({ ...currentConfig, preset: onlyPreset.name });
               }
-            } else if (result.presets.length >= 2 && !currentConfig.preset) {
+            } else if (
+              result.presets.length >= 2 &&
+              // Also a kept preset the server removed (for example while offline).
+              !result.presets.some((preset) => preset.name === currentConfig.preset)
+            ) {
               // Auto-select default preset if available, otherwise first preset
               // This keeps UI and config in sync (UI falls back to first preset for display)
               const defaultPreset = result.presets.find((p) => p.isDefault);
@@ -344,28 +383,20 @@ export function useCoderWorkspace({
         }
       })
       .catch((error) => {
-        if (!mounted) {
+        if (!mounted || isConnectionLostError(error)) {
           return;
         }
-        if (
-          coderConfigRef.current?.template !== templateAtRequest ||
-          coderConfigRef.current?.templateOrg !== orgAtRequest
-        ) {
+        if (!isTemplateSelected(coderConfigRef.current, templateAtRequest, orgAtRequest)) {
           return;
         }
-        const message =
-          error instanceof Error
-            ? error.message.split("\n")[0].slice(0, 200).trim()
-            : "Unknown error";
         setPresets([]);
-        setPresetsError(message || "Unknown error");
+        setPresetsError(formatCoderListError(error));
       })
       .finally(() => {
         // Only clear loading for the active request (not stale ones)
         if (
           mounted &&
-          coderConfigRef.current?.template === templateAtRequest &&
-          coderConfigRef.current?.templateOrg === orgAtRequest
+          isTemplateSelected(coderConfigRef.current, templateAtRequest, orgAtRequest)
         ) {
           setLoadingPresets(false);
         }

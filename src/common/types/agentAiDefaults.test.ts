@@ -21,6 +21,18 @@ describe("normalizeAgentAiDefaults reasoningMode", () => {
   });
 });
 
+describe("normalizeAgentAiDefaults cacheTtl", () => {
+  test("keeps an entry that only sets cacheTtl", () => {
+    expect(normalizeAgentAiDefaults({ explore: { cacheTtl: "1h" } })).toEqual({
+      explore: { cacheTtl: "1h" },
+    });
+  });
+
+  test("drops an invalid cacheTtl and the then-empty entry", () => {
+    expect(normalizeAgentAiDefaults({ explore: { cacheTtl: "2h" } })).toEqual({});
+  });
+});
+
 describe("normalizeAgentAiDefaults nested subagent profiles", () => {
   test("keeps a nested profile that only sets reasoningMode", () => {
     const result = normalizeAgentAiDefaults({
@@ -36,9 +48,9 @@ describe("normalizeAgentAiDefaults nested subagent profiles", () => {
     expect(result.explore).toBeUndefined();
   });
 
-  test("prunes nested fields equal to the base entry", () => {
+  test("prunes non-Exec nested fields equal to the base entry", () => {
     const result = normalizeAgentAiDefaults({
-      exec: {
+      explore: {
         modelString: "openai:gpt-5.6-sol",
         thinkingLevel: "high",
         subagent: {
@@ -48,11 +60,21 @@ describe("normalizeAgentAiDefaults nested subagent profiles", () => {
       },
     });
 
-    expect(result.exec).toEqual({
+    expect(result.explore).toEqual({
       modelString: "openai:gpt-5.6-sol",
       thinkingLevel: "high",
       subagent: { thinkingLevel: "xhigh" },
     });
+  });
+
+  test("keeps explicit Exec fields equal to global defaults", () => {
+    const profile = {
+      modelString: "openai:gpt-5.6-sol",
+      thinkingLevel: "high" as const,
+      reasoningMode: "standard" as const,
+    };
+    const result = normalizeAgentAiDefaults({ exec: { ...profile, subagent: profile } });
+    expect(result.exec?.subagent).toEqual(profile);
   });
 
   test("drops an empty nested subagent object", () => {
@@ -72,5 +94,32 @@ describe("normalizeAgentAiDefaults nested subagent profiles", () => {
     });
 
     expect(result.exec).toEqual({ enabled: true });
+  });
+});
+
+describe("normalizeAgentAiDefaults Auto routing flags", () => {
+  test("keeps an entry that only sets Auto flags", () => {
+    const result = normalizeAgentAiDefaults({
+      exec: { autoModelRouting: true, autoThinkingLevel: true },
+    });
+    expect(result.exec).toEqual({ autoModelRouting: true, autoThinkingLevel: true });
+  });
+
+  test("drops non-true flags and the then-empty entry", () => {
+    const result = normalizeAgentAiDefaults({
+      exec: { autoModelRouting: false, autoThinkingLevel: "yes" },
+    });
+    expect(result.exec).toBeUndefined();
+  });
+
+  test("never copies flags into the delegated profile", () => {
+    const result = normalizeAgentAiDefaults({
+      exec: {
+        autoModelRouting: true,
+        subagent: { modelString: "openai:gpt-5.6-sol", autoModelRouting: true },
+      },
+    });
+    expect(result.exec?.autoModelRouting).toBe(true);
+    expect(result.exec?.subagent).toEqual({ modelString: "openai:gpt-5.6-sol" });
   });
 });

@@ -1,6 +1,8 @@
+import assert from "node:assert";
 import { Worker } from "node:worker_threads";
 import { join, dirname, sep, extname } from "node:path";
 import { log } from "@/node/services/log";
+import type { EncodingName, TokenizerWorkerData } from "./tokenizer.worker";
 
 interface WorkerRequest {
   messageId: number;
@@ -23,14 +25,19 @@ interface WorkerErrorResponse {
 
 type WorkerResponse = WorkerSuccessResponse | WorkerErrorResponse;
 
-let messageIdCounter = 0;
-const pendingPromises = new Map<
-  number,
-  { resolve: (value: unknown) => void; reject: (error: Error) => void }
->();
+interface PendingRequest {
+  resolve: (value: unknown) => void;
+  reject: (error: Error) => void;
+}
 
-// Track if worker is alive - reject immediately if dead
-let workerError: Error | null = null;
+interface EncodingWorker {
+  worker: Worker;
+  pending: Map<number, PendingRequest>;
+  // Set once the worker dies (e.g., failed to load); later calls reject immediately.
+  error: Error | null;
+}
+
+let messageIdCounter = 0;
 
 // Resolve worker path
 // In production: both workerPool.js and tokenizer.worker.js are in dist/utils/main/
@@ -61,75 +68,92 @@ if (isBun && extname(__filename) === ".ts") {
 }
 
 const workerPath = join(workerDir, workerFile);
-const worker = new Worker(workerPath);
 
-// Handle messages from worker
-worker.on("message", (response: WorkerResponse) => {
-  const pending = pendingPromises.get(response.messageId);
-  if (!pending) {
-    log.error(`No pending promise for messageId ${response.messageId}`);
-    return;
-  }
+// One worker per encoding, spawned on first use: loading an encoding is seconds of synchronous CPU
+// (o200k_base ~10 s), so a shared worker would block every other encoding's counts behind it (#4816).
+const encodingWorkers = new Map<EncodingName, EncodingWorker>();
 
-  pendingPromises.delete(response.messageId);
+function spawnWorker(encoding: EncodingName): EncodingWorker {
+  assert(!encodingWorkers.has(encoding), `Tokenizer worker for '${encoding}' already exists`);
+  const workerData: TokenizerWorkerData = { encoding };
+  const entry: EncodingWorker = {
+    worker: new Worker(workerPath, { workerData }),
+    pending: new Map(),
+    error: null,
+  };
+  encodingWorkers.set(encoding, entry);
 
-  if ("error" in response) {
-    const error = new Error(response.error.message);
-    error.stack = response.error.stack;
-    pending.reject(error);
-  } else {
-    pending.resolve(response.result);
-  }
-});
-
-// Handle worker errors
-worker.on("error", (error: Error) => {
-  log.error("Worker error:", error);
-  workerError = error;
-  // Reject all pending promises
-  for (const pending of pendingPromises.values()) {
-    pending.reject(error);
-  }
-  pendingPromises.clear();
-});
-
-// Handle worker exit
-worker.on("exit", (code) => {
-  if (code !== 0) {
-    log.error(`Worker stopped with exit code ${code}`);
-    const error = new Error(`Worker stopped with exit code ${code}`);
-    workerError = error;
-    for (const pending of pendingPromises.values()) {
+  const failAll = (error: Error) => {
+    entry.error = error;
+    for (const pending of entry.pending.values()) {
       pending.reject(error);
     }
-    pendingPromises.clear();
-  }
-});
+    entry.pending.clear();
+  };
 
-// Don't block process exit
-worker.unref();
+  // Handle messages from worker
+  entry.worker.on("message", (response: WorkerResponse) => {
+    const pending = entry.pending.get(response.messageId);
+    if (!pending) {
+      log.error(`No pending promise for messageId ${response.messageId}`);
+      return;
+    }
+
+    entry.pending.delete(response.messageId);
+
+    if ("error" in response) {
+      const error = new Error(response.error.message);
+      error.stack = response.error.stack;
+      pending.reject(error);
+    } else {
+      pending.resolve(response.result);
+    }
+  });
+
+  // Handle worker errors
+  entry.worker.on("error", (error: Error) => {
+    log.error(`Tokenizer worker (${encoding}) error:`, error);
+    failAll(error);
+  });
+
+  // Handle worker exit
+  entry.worker.on("exit", (code) => {
+    if (code !== 0) {
+      log.error(`Tokenizer worker (${encoding}) stopped with exit code ${code}`);
+      failAll(new Error(`Worker stopped with exit code ${code}`));
+    }
+  });
+
+  // Don't block process exit
+  entry.worker.unref();
+  return entry;
+}
 
 /**
- * Run a task on the worker thread
- * @param taskName The name of the task to run (e.g., "countTokens", "encodingName")
+ * Run a task on the worker thread that serves `encoding`, spawning it on first use.
+ * Spawning is synchronous here, so concurrent calls can never create two workers for one encoding.
+ * @param encoding The encoding whose worker should run the task
+ * @param taskName The name of the task to run (e.g., "countTokensBatch", "ready")
  * @param data The data to pass to the task
  * @returns A promise that resolves with the task result
  */
-export function run<T>(taskName: string, data: unknown): Promise<T> {
+export function run<T>(encoding: EncodingName, taskName: string, data: unknown): Promise<T> {
+  const entry = encodingWorkers.get(encoding) ?? spawnWorker(encoding);
+
   // If worker already died (e.g., failed to load), reject immediately
   // This prevents hanging promises when the worker is not available
-  if (workerError) {
-    return Promise.reject(workerError);
+  if (entry.error) {
+    return Promise.reject(entry.error);
   }
 
   const messageId = messageIdCounter++;
   const request: WorkerRequest = { messageId, taskName, data };
 
   return new Promise<T>((resolve, reject) => {
-    pendingPromises.set(messageId, {
+    entry.pending.set(messageId, {
       resolve: resolve as (value: unknown) => void,
       reject,
     });
-    worker.postMessage(request);
+    entry.worker.postMessage(request);
   });
 }

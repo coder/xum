@@ -20,13 +20,13 @@ import { detectDefaultTrunkBranch } from "@/node/git";
 import type { FrontendWorkspaceMetadata } from "@/common/types/workspace";
 import type { UpdateStatus } from "@/common/orpc/types";
 
-type MutableUpdateService = {
+interface MutableUpdateService {
   check: (options?: { source?: "auto" | "manual" }) => Promise<void>;
   download: () => Promise<void>;
-  install: () => void;
+  install: (options?: { force?: boolean }) => void;
   currentStatus: UpdateStatus;
   notifySubscribers: () => void;
-};
+}
 
 function getUpdateService(env: TestEnvironment): MutableUpdateService {
   return env.services.updateService as unknown as MutableUpdateService;
@@ -50,9 +50,7 @@ function setUpdateStatus(updateService: MutableUpdateService, status: UpdateStat
 
 async function openAboutDialog(view: RenderedApp) {
   const trigger = await waitFor(() => {
-    const triggerButton = view.container.querySelector(
-      'button[aria-label="Open about dialog"]'
-    ) as HTMLButtonElement | null;
+    const triggerButton = view.container.querySelector('button[aria-label="Open about dialog"]');
     if (!triggerButton) {
       throw new Error("About dialog trigger was not found in the title bar");
     }
@@ -62,9 +60,8 @@ async function openAboutDialog(view: RenderedApp) {
   fireEvent.click(trigger);
 
   const dialog = await waitFor(() => {
-    const dialogElement = view.container.ownerDocument.body.querySelector(
-      '[role="dialog"]'
-    ) as HTMLElement | null;
+    const dialogElement =
+      view.container.ownerDocument.body.querySelector<HTMLElement>('[role="dialog"]');
     if (!dialogElement) {
       throw new Error("About dialog did not open");
     }
@@ -255,6 +252,41 @@ describe("About dialog (UI)", () => {
       await waitFor(() => {
         expect(installSpy).toHaveBeenCalledTimes(1);
       });
+    } finally {
+      updateService.install = originalInstall;
+    }
+  });
+
+  test("install-blocked status offers Restart anyway, which forces api.update.install", async () => {
+    if (!view) {
+      throw new Error("App was not rendered");
+    }
+
+    const updateService = getUpdateService(env);
+    const originalInstall = updateService.install;
+    const installSpy = jest.fn((_options?: { force?: boolean }) => undefined);
+    updateService.install = installSpy as typeof updateService.install;
+
+    try {
+      setUpdateStatus(updateService, {
+        type: "install-blocked",
+        info: { version: "v9.9.10" },
+        blockers: [{ kind: "active-streams", count: 2 }],
+      });
+      setDesktopApiEnabled();
+
+      const dialog = await openAboutDialog(view);
+      const forceButton = await waitFor(() => {
+        return dialog.getByRole("button", { name: "Restart anyway" });
+      });
+
+      fireEvent.click(forceButton);
+
+      await waitFor(() => {
+        expect(installSpy).toHaveBeenCalledTimes(1);
+      });
+      expect(installSpy.mock.calls[0][0]).toEqual({ force: true });
+      expect(dialog.getByRole("button", { name: "Install & restart" })).toBeTruthy();
     } finally {
       updateService.install = originalInstall;
     }

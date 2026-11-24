@@ -10,26 +10,27 @@
  */
 
 import type { Tool } from "ai";
+import { cloneToolPreservingDescriptors } from "@/common/utils/tools/cloneToolPreservingDescriptors";
 import { resolveXumEnvironmentValue } from "@/common/compat/legacyMux";
 import { getErrorMessage } from "@/common/utils/errors";
-import { EXPERIMENT_IDS, type ExperimentId } from "@/common/constants/experiments";
-import type { SendMessageOptions } from "@/common/orpc/types";
-
-/** Renderer-sent experiment flags (SendMessageOptions.experiments). */
-type SendMessageExperiments = SendMessageOptions["experiments"];
-
-import { applyToolPolicy, type ToolPolicy } from "@/common/utils/tools/toolPolicy";
+import {
+  applyToolPolicy,
+  applyToolPolicyToNames,
+  buildRequiredToolPatterns,
+  type ToolPolicy,
+} from "@/common/utils/tools/toolPolicy";
 import { applyCapabilityGrants } from "@/common/utils/tools/capabilityGrants";
+import { TOOL_SEARCH_TOOL_NAME } from "@/common/utils/tools/toolCatalog";
 import type { CapabilityGrants } from "@/common/types/capabilityGrants";
 // PTC types only — modules lazy-loaded to avoid loading typescript/prettier at startup
 import type {
   PTCEventWithParent,
   createCodeExecutionTool as CreateCodeExecutionToolFn,
-  retargetCodeExecutionTool as RetargetCodeExecutionToolFn,
 } from "@/node/services/tools/code_execution";
 import type { QuickJSRuntimeFactory } from "@/node/services/ptc/quickjsRuntime";
 import type { ToolBridge } from "@/node/services/ptc/toolBridge";
 import type { PTCExecutionResult } from "@/node/services/ptc/types";
+import type { SessionLocks } from "@/node/services/sessionLocks/sessionLocks";
 import { sandboxHostService, type SandboxMount } from "@/node/services/sandbox/sandboxHostService";
 import { createRefinementRollbackTool } from "@/node/services/tools/refinement_rollback";
 import type { KernelFileLoader } from "@/node/services/tools/kernelFileLoad";
@@ -50,7 +51,6 @@ import { getRuntimeTypeForTelemetry, roundToBase2 } from "@/common/telemetry/uti
 // Dynamic imports are justified: PTC pulls in ~10MB of dependencies that would slow startup.
 interface PTCModules {
   createCodeExecutionTool: typeof CreateCodeExecutionToolFn;
-  retargetCodeExecutionTool: typeof RetargetCodeExecutionToolFn;
   QuickJSRuntimeFactory: typeof QuickJSRuntimeFactory;
   ToolBridge: typeof ToolBridge;
   runtimeFactory: QuickJSRuntimeFactory | null;
@@ -71,49 +71,11 @@ async function getPTCModules(): Promise<PTCModules> {
 
   ptcModules = {
     createCodeExecutionTool: codeExecution.createCodeExecutionTool,
-    retargetCodeExecutionTool: codeExecution.retargetCodeExecutionTool,
     QuickJSRuntimeFactory: quickjs.QuickJSRuntimeFactory,
     ToolBridge: toolBridge.ToolBridge,
     runtimeFactory: null,
   };
   return ptcModules;
-}
-
-/**
- * Lazy-loading wrapper around code_execution's retargetCodeExecutionTool for
- * callers (aiService) that must not statically import the PTC modules.
- * Returns false when either tool was not created by createCodeExecutionTool.
- */
-export async function retargetCodeExecution(target: Tool, donor: Tool): Promise<boolean> {
-  const ptc = await getPTCModules();
-  return ptc.retargetCodeExecutionTool(target, donor);
-}
-
-/**
- * Reinstate a request.assemble middleware's code_execution replacement over a
- * rebuilt instance while reconciling stale model-facing metadata. A wrapper
- * built by spreading the pre-hook tool (`{ ...tool, execute: wrapped }`)
- * inherits its description, whose embedded TypeScript definitions still
- * advertise tools the rebuild removed/replaced — execution fails closed, but
- * the model keeps being instructed those tools exist. When the wrapper
- * inherited the pre-hook description verbatim, swap in the rebuilt
- * description; middleware that authored its own description keeps it (it took
- * ownership of the model-facing contract).
- */
-export function reconcileHookReplacedCodeExecution(
-  preHook: Tool,
-  hookReplacement: Tool,
-  rebuilt: Tool
-): Tool {
-  if (
-    hookReplacement.description !== undefined &&
-    hookReplacement.description === preHook.description &&
-    rebuilt.description !== undefined &&
-    rebuilt.description !== hookReplacement.description
-  ) {
-    return { ...hookReplacement, description: rebuilt.description };
-  }
-  return hookReplacement;
 }
 
 // ---------------------------------------------------------------------------
@@ -128,10 +90,25 @@ export interface ApplyToolPolicyAndExperimentsOptions {
   extraTools?: Record<string, Tool>;
   /** Composed tool policy (agent → caller → system workspace). */
   effectiveToolPolicy: ToolPolicy | undefined;
+  /**
+   * #5253: when set, advertise the union of these policies (every agent the
+   * workspace can switch to) and refuse, at execution time, calls that
+   * `effectiveToolPolicy` denies. See AgentResolutionResult.
+   */
+  switchableAgentToolPolicies?: ToolPolicy[];
+  /**
+   * The caller's own per-turn policy (SendMessageOptions.toolPolicy), already
+   * composed into `effectiveToolPolicy`. Only names a refusal as the caller's
+   * and detects a no-tools contract: the switchable union does not carry its
+   * enable/disable rules, so a caller-denied tool is refused, not removed.
+   */
+  callerToolPolicy?: ToolPolicy;
+  /** Active agent id, named in the refusal of a disallowed call. */
+  activeAgentId?: string;
   /** PTC experiment flags. */
   experiments?: {
+    tokenBudget?: boolean;
     programmaticToolCalling?: boolean;
-    programmaticToolCallingExclusive?: boolean;
     /**
      * RLM mode: graduate code_execution onto the persistent per-workspace
      * kernel mount (shared `vars`, snapshot/restore). Gated on the PTC parent
@@ -149,8 +126,17 @@ export interface ApplyToolPolicyAndExperimentsOptions {
    * kernelFileLoader backs mux.load (r12 bulk ingestion) — built by the
    * caller from the workspace cwd/runtime pair the file tools use; only
    * honored in kernel mode with file_read bridged.
+   * locks take refinement_rollback's rollback and target locks (phase 4: SessionLocks).
+   * blocksGlobalWrites says, at call time, whether the agent sandbox covers this workspace, so
+   * refinement_rollback refuses to restore global memory and global skills.
    */
-  sandbox?: { workspaceId: string; sessionDir: string; kernelFileLoader?: KernelFileLoader };
+  sandbox?: {
+    workspaceId: string;
+    sessionDir: string;
+    kernelFileLoader?: KernelFileLoader;
+    locks?: SessionLocks;
+    blocksGlobalWrites?: () => boolean;
+  };
   /**
    * Capability grants for this assembly (registry-with-filters posture).
    * Omitted = session-scope full grants (identical to pre-grants behavior).
@@ -165,29 +151,127 @@ export function persistentSandboxMountsEnabled(): boolean {
   return resolveXumEnvironmentValue("SANDBOX_PERSISTENT_MOUNTS", process.env) === "1";
 }
 
+/** Same name, description and schema; execute refuses before any side effect (#5253). */
+function refuseToolForAgent(
+  name: string,
+  tool: Tool,
+  activeAgentId: string,
+  callerToolPolicy: ToolPolicy | undefined
+): Tool {
+  const refused = cloneToolPreservingDescriptors(tool);
+  // A caller denial lasts for this turn only; switching agents does not lift it.
+  const deniedByCaller =
+    callerToolPolicy !== undefined && applyToolPolicyToNames([name], callerToolPolicy).length === 0;
+  const error = deniedByCaller
+    ? `Tool '${name}' is disabled for this turn.`
+    : `Tool '${name}' is not allowed in ${activeAgentId} mode. Switch agents to use it.`;
+  refused.execute = () => Promise.resolve({ success: false, error });
+  return refused;
+}
+
 /**
- * Backfill the PTC/RLM experiment trio from the backend's persisted overrides
- * (same `?? isExperimentEnabled` pattern as other backend-gated experiments in
- * streamMessage). A renderer with no origin-local override sends `undefined`
- * for these flags while the effective UI and /refine gate resolve against the
- * backend override — tool assembly must agree or a persisted-RLM workspace
- * silently streams with the non-persistent flat/PTC toolset. Explicit
- * renderer values (true or false) always win over the backend fallback.
+ * Whether a denied tool can stay advertised as a refusal stub. If not, it stays
+ * absent: the tool block then changes on that switch (one cache miss), but the
+ * policy still holds.
+ * - Provider-executed tools (native web_search) and tools without a local
+ *   execute never run the refusal.
+ * - Memory's description carries the memory index, so an agent denied memory
+ *   must not see it.
+ * - A refused tool_catalog_search would still make tool search defer the MCP
+ *   tools (prepareToolSearch reads presence), and every search would then be
+ *   refused, leaving those allowed tools unreachable.
  */
-export function resolveBackendGatedPtcExperiments(
-  experiments: SendMessageExperiments | undefined,
-  isExperimentEnabled: (experimentId: ExperimentId) => boolean
-): NonNullable<SendMessageExperiments> {
-  return {
-    ...experiments,
-    programmaticToolCalling:
-      experiments?.programmaticToolCalling ??
-      isExperimentEnabled(EXPERIMENT_IDS.PROGRAMMATIC_TOOL_CALLING),
-    programmaticToolCallingExclusive:
-      experiments?.programmaticToolCallingExclusive ??
-      isExperimentEnabled(EXPERIMENT_IDS.PROGRAMMATIC_TOOL_CALLING_EXCLUSIVE),
-    rlm: experiments?.rlm ?? isExperimentEnabled(EXPERIMENT_IDS.RLM),
-  };
+function canRefuseAtExecution(name: string, tool: Tool): boolean {
+  if (tool.type === "provider" || tool.execute == null) return false;
+  return name !== "memory" && name !== TOOL_SEARCH_TOOL_NAME;
+}
+
+/**
+ * One tool set across agent-mode switches (#5253, user decision): every tool
+ * some switchable agent allows stays advertised, so switching between exec,
+ * plan or a custom agent keeps the tools block and the prompt cache
+ * byte-identical. The active agent's policy moves to execution time: a
+ * disallowed tool keeps its name, description and schema, but its execute
+ * returns a refusal before any side effect. Every channel (direct calls, PTC
+ * bridge, MCP) runs this execute, so this is the security boundary that the
+ * missing tool used to be. A caller policy's denials ride the same refusal:
+ * the switchable policies do not carry them (see AgentResolutionResult).
+ */
+function applySwitchableAgentPolicies(
+  tools: Record<string, Tool>,
+  activePolicy: ToolPolicy | undefined,
+  switchablePolicies: ToolPolicy[],
+  activeAgentId: string,
+  callerToolPolicy: ToolPolicy | undefined
+): Record<string, Tool> {
+  const active = applyToolPolicy(tools, activePolicy);
+  const result: Record<string, Tool> = {};
+  for (const policy of switchablePolicies) {
+    for (const [name, tool] of Object.entries(applyToolPolicy(tools, policy))) {
+      if (name in active || name in result || !canRefuseAtExecution(name, tool)) continue;
+      result[name] = refuseToolForAgent(name, tool, activeAgentId, callerToolPolicy);
+    }
+  }
+  // Keep the input record's order so the advertised order does not depend on
+  // which agent is active.
+  return Object.fromEntries(
+    Object.keys(tools).flatMap((name) => {
+      const tool = active[name] ?? result[name];
+      return tool === undefined ? [] : [[name, tool] as const];
+    })
+  );
+}
+
+/**
+ * Whether `policy` leaves no tool at all: none of `tools`, and no synthesized
+ * code_execution. Such a policy is a no-tools contract. The synthesized name is
+ * probed explicitly: an allowlist like [disable .*, enable code_execution]
+ * empties the base record yet clearly intends the exclusive entry point to
+ * exist. An undefined policy allows everything, so it never leaves no tools.
+ */
+function policyLeavesNoTools(tools: Record<string, Tool>, policy: ToolPolicy | undefined): boolean {
+  return (
+    Object.keys(applyToolPolicy(tools, policy)).length === 0 &&
+    applyToolPolicyToNames(["code_execution"], policy).length === 0
+  );
+}
+
+/**
+ * Whether policy lets the PTC branch run (#7028): the active policy must allow
+ * the code_execution name, so a deny stops PTC, allowlists that do not list it
+ * included ("allowlist" means [disable .*, enable ...]). A policy that leaves no
+ * tools at all (a no-tools contract such as compaction's `.*` disable) stops it
+ * too. Otherwise the model gets the policy-filtered flat tools.
+ *
+ * Even when another switchable agent allows code_execution, a refusing stub is
+ * no option: exclusive PTC moves every bridgeable tool behind code_execution, so
+ * the refusal would also hide the allowed ones. A switch between such agents
+ * changes the tool block (one cache miss), as an absent tool does (#5253).
+ *
+ * Only policy decides, never capability grants: a least-privilege grants ceiling
+ * stubs bridged tools but keeps code_execution as the entry point.
+ */
+function policyAllowsPtc(
+  tools: Record<string, Tool>,
+  activePolicy: ToolPolicy | undefined
+): boolean {
+  return (
+    !policyLeavesNoTools(tools, activePolicy) &&
+    applyToolPolicyToNames(["code_execution"], activePolicy).length > 0
+  );
+}
+
+/**
+ * mux.load reads files host-side and rides file_read. A refused file_read stays
+ * bridgeable (its stub has an execute), and ToolBridge offers mux.load by that
+ * name alone, so the loader is withheld unless the active policy allows
+ * file_read: a refusal must leave no second way to read files.
+ */
+function kernelFileLoaderAllowedBy(
+  activePolicy: ToolPolicy | undefined,
+  loader: KernelFileLoader | undefined
+): KernelFileLoader | undefined {
+  return applyToolPolicyToNames(["file_read"], activePolicy).length > 0 ? loader : undefined;
 }
 
 /**
@@ -196,9 +280,11 @@ export function resolveBackendGatedPtcExperiments(
  * Steps:
  * 1. Merge extra tools (CLI tools bypass policy — injected by runtime, not user)
  * 2. Apply tool policy (agent → caller → system workspace deny/enable rules)
- * 3. If PTC experiment is enabled, lazy-load PTC and create code_execution tool:
- *    - Supplement mode: adds code_execution alongside existing tools
- *    - Exclusive mode: replaces bridgeable tools with code_execution only
+ * 3. If PTC experiment is enabled, lazy-load PTC and create code_execution tool,
+ *    replacing bridgeable tools with code_execution only (exclusive posture).
+ *    A supplement mode (code_execution alongside the flat tools) used to exist
+ *    but measured ~2x tokens/cost vs both PTC-off and exclusive, so it was
+ *    removed.
  *
  * @returns The final tool set ready for the AI model.
  */
@@ -207,10 +293,25 @@ export async function applyToolPolicyAndExperiments(
 ): Promise<Record<string, Tool>> {
   const { allTools, extraTools, effectiveToolPolicy, experiments, emitNestedToolEvent, sandbox } =
     opts;
+  const applyPolicy = (tools: Record<string, Tool>): Record<string, Tool> =>
+    opts.switchableAgentToolPolicies === undefined || callerLeavesNoTools
+      ? applyToolPolicy(tools, effectiveToolPolicy)
+      : applySwitchableAgentPolicies(
+          tools,
+          effectiveToolPolicy,
+          opts.switchableAgentToolPolicies,
+          opts.activeAgentId ?? "the current",
+          opts.callerToolPolicy
+        );
 
   // Merge in extra tools (e.g., CLI-specific tools like set_exit_code).
   // These bypass policy filtering since they're injected by the runtime, not user config.
   const allToolsWithExtra = extraTools ? { ...allTools, ...extraTools } : allTools;
+
+  // A caller policy that leaves no tools (compaction's `.*` disable) is a
+  // no-tools contract: send no tools, not refusal stubs that carry every
+  // schema. Declared before applyPolicy() first runs.
+  const callerLeavesNoTools = policyLeavesNoTools(allToolsWithExtra, opts.callerToolPolicy);
 
   // Capability grants are a ceiling applied before policy: policy can narrow
   // further but can never re-add a non-granted tool.
@@ -221,32 +322,72 @@ export async function applyToolPolicyAndExperiments(
   // Apply tool policy FIRST — this must happen before PTC to ensure the sandbox
   // respects allow/deny filters. The policy-filtered tools are passed to
   // ToolBridge so the mux.* API only exposes policy-allowed tools.
-  const policyFilteredTools = applyToolPolicy(grantFilteredTools, effectiveToolPolicy);
+  const policyFilteredTools = applyPolicy(grantFilteredTools);
 
   // The bridge is built from the PRE-grant policy-filtered set: ToolBridge
   // must see grant-denied tools so it can stub them with a catchable
   // "Capability denied" guest error (not a confusing "mux.x is not a
   // function"). Model-visible sets below still use the grant-filtered tools.
   const policyFilteredPreGrant = opts.capabilityGrants
-    ? applyToolPolicy(allToolsWithExtra, effectiveToolPolicy)
+    ? applyPolicy(allToolsWithExtra)
     : policyFilteredTools;
 
-  // Handle PTC experiments — add or replace tools with code_execution
+  // Handle PTC experiment — replace bridgeable tools with code_execution.
   let toolsForModel = policyFilteredTools;
-  // RLM is exclusive-only: supplement-mode RLM measured ~2x flat tokens/cost
-  // (flat schemas + kernel type defs shipped while models still take the flat
-  // path), so enabling RLM forces the kernel-first exclusive toolset. The
-  // standalone exclusive experiment stays usable without RLM (no kernel).
+  // RLM rides the PTC parent flag: this flag is only read inside the PTC
+  // branch below, so RLM alone (PTC off) is inert by construction.
   const rlmActive = experiments?.rlm === true;
-  const exclusiveActive = experiments?.programmaticToolCallingExclusive === true || rlmActive;
-  if (experiments?.programmaticToolCalling || experiments?.programmaticToolCallingExclusive) {
+  // Policy decides whether PTC runs (see policyAllowsPtc): a policy that
+  // disables every tool (e.g. auto-compaction's `.*` disable rule, inherited
+  // alongside the original send's experiment flags) or denies the
+  // code_execution name gets the flat tools. Decided on policy, not on the
+  // grant-filtered tools, so a least-privilege grants ceiling (which stubs, not
+  // disables) keeps code_execution as the bridge entry point. The ACTIVE policy
+  // decides: the advertised union may hold refused tools.
+  if (
+    experiments?.programmaticToolCalling &&
+    policyAllowsPtc(allToolsWithExtra, effectiveToolPolicy)
+  ) {
     try {
       // Lazy-load PTC modules only when experiments are enabled
       const ptc = await getPTCModules();
 
+      // Keep mcp_prompt_get direct because sandbox declarations omit its
+      // multiline prompt catalog.
+      const promptGet = policyFilteredTools.mcp_prompt_get;
+      // Policy-REQUIRED tools stay model-visible: "require" gates run
+      // completion on a top-level toolResult for that name
+      // (StreamManager.createStopWhenCondition), which a nested xum.* call
+      // inside a code_execution record never satisfies. Sourced from the
+      // grant-and-policy-filtered record so both ceilings still apply.
+      // Promotion follows every switchable agent's require rules so the
+      // model-visible set and the bridge do not change on a mode switch.
+      const requiredPatterns = buildRequiredToolPatterns(
+        opts.switchableAgentToolPolicies?.flat() ?? effectiveToolPolicy
+      );
+      const requiredTools = Object.fromEntries(
+        Object.entries(policyFilteredTools).filter(([name]) =>
+          requiredPatterns.some((pattern) => pattern.test(name))
+        )
+      );
+
+      // Tools promoted to the model-visible set must NOT also stay bridged:
+      // the request.assemble hook contract lets middleware filter or wrap
+      // top-level tools, and a bridged duplicate would keep dispatching the
+      // pre-hook implementation behind the hook's back (the assemble-hook
+      // rebuild machinery was removed on the premise that bridged tools are
+      // never hook-visible — promotion must preserve that premise).
+      const promotedToolNames = new Set(Object.keys(requiredTools));
+      if (promptGet !== undefined) {
+        promotedToolNames.add("mcp_prompt_get");
+      }
+
       // ToolBridge uses the pre-grant policy-filtered tools — the bridge
       // enforces grants itself (denied tools become explicit error stubs).
-      const toolBridge = new ptc.ToolBridge(policyFilteredPreGrant, opts.capabilityGrants);
+      const bridgeInput = Object.fromEntries(
+        Object.entries(policyFilteredPreGrant).filter(([name]) => !promotedToolNames.has(name))
+      );
+      const toolBridge = new ptc.ToolBridge(bridgeInput, opts.capabilityGrants);
 
       // Singleton runtime factory (WASM module is expensive to load)
       ptc.runtimeFactory ??= new ptc.QuickJSRuntimeFactory();
@@ -287,41 +428,30 @@ export async function applyToolPolicyAndExperiments(
         toolBridge,
         emitNestedToolEvent,
         withMount,
-        // Kernel-first description preamble rides RLM (which is exclusive-only
-        // now); exclusive alone (or the env-var mount override) keeps today's
-        // exclusive descriptions byte-identical. createCodeExecutionTool
-        // additionally requires a live persistent mount before honoring it.
+        // Kernel-first description preamble rides RLM; PTC alone (or the
+        // env-var mount override) keeps the non-kernel exclusive descriptions.
+        // createCodeExecutionTool additionally requires a live persistent
+        // mount before honoring it.
         {
           kernelFirst: rlmActive,
-          loadFile: sandbox?.kernelFileLoader,
+          loadFile: kernelFileLoaderAllowedBy(effectiveToolPolicy, sandbox?.kernelFileLoader),
         }
       );
 
-      if (exclusiveActive) {
-        // Exclusive mode: code_execution is mandatory — it's the only way to use bridged
-        // tools. The experiment flag is the opt-in; policy cannot disable it here since
-        // that would leave no way to access tools. nonBridgeable is policy-filtered but
-        // comes from the PRE-grant bridge input, so re-apply the grants ceiling here to
-        // keep grant-denied non-bridgeable tools out of the model-visible set.
-        const nonBridgeable = opts.capabilityGrants
-          ? applyCapabilityGrants(toolBridge.getNonBridgeableTools(), opts.capabilityGrants)
-          : toolBridge.getNonBridgeableTools();
-        // Keep mcp_prompt_get direct because sandbox declarations omit its
-        // multiline prompt catalog.
-        const promptGet = policyFilteredTools.mcp_prompt_get;
-        toolsForModel = {
-          ...nonBridgeable,
-          ...(promptGet !== undefined ? { mcp_prompt_get: promptGet } : {}),
-          code_execution: codeExecutionTool,
-        };
-      } else {
-        // Supplement mode: add code_execution, then apply policy to determine final set.
-        // This correctly handles all policy combinations (require, enable, disable).
-        toolsForModel = applyToolPolicy(
-          { ...policyFilteredTools, code_execution: codeExecutionTool },
-          effectiveToolPolicy
-        );
-      }
+      // code_execution is the only way to use bridged tools, so it exists
+      // whenever PTC runs; policy decides whether PTC runs (policyAllowsPtc,
+      // #7028). nonBridgeable is policy-filtered but
+      // comes from the PRE-grant bridge input, so re-apply the grants ceiling here to
+      // keep grant-denied non-bridgeable tools out of the model-visible set.
+      const nonBridgeable = opts.capabilityGrants
+        ? applyCapabilityGrants(toolBridge.getNonBridgeableTools(), opts.capabilityGrants)
+        : toolBridge.getNonBridgeableTools();
+      toolsForModel = {
+        ...nonBridgeable,
+        ...requiredTools,
+        ...(promptGet !== undefined ? { mcp_prompt_get: promptGet } : {}),
+        code_execution: codeExecutionTool,
+      };
 
       // RLM-only model surface: ID-addressed rollback of journaled harness
       // self-modifications (refinement rows). Read inside the PTC branch by
@@ -339,27 +469,23 @@ export async function applyToolPolicyAndExperiments(
         let rollback: Record<string, Tool> = {
           refinement_rollback: createRefinementRollbackTool(sandbox),
         };
-        rollback = applyToolPolicy(rollback, effectiveToolPolicy);
+        rollback = applyPolicy(rollback);
         if (opts.capabilityGrants) {
           rollback = applyCapabilityGrants(rollback, opts.capabilityGrants);
         }
         toolsForModel = { ...toolsForModel, ...rollback };
       }
     } catch (error) {
-      // RLM fails CLOSED (r49): silently degrading to the complete flat
-      // toolset would drop the exclusive persistent kernel and its
-      // nested-result context isolation while the run is still recorded as
-      // RLM — bulk tool results would leak into model context and corrupt
-      // RLM evaluations. Surfacing the failure lets the send fail visibly
-      // and the user retry once the cause (e.g. QuickJS WASM load) clears.
-      if (rlmActive) {
-        throw new Error(
-          `RLM kernel assembly failed and RLM must not silently fall back to flat tools: ${getErrorMessage(error)}`
-        );
-      }
-      // Non-RLM PTC keeps the legacy behavior: fall back to policy-filtered
-      // tools if code_execution creation fails.
-      log.error("Failed to create code_execution tool, falling back to base tools", { error });
+      // PTC fails CLOSED (r49): the experiment is exclusive-only, so silently
+      // degrading to the complete flat toolset would change user-visible
+      // semantics while the run is still recorded as PTC (corrupting
+      // experiment results) — and for RLM would additionally drop the
+      // persistent kernel's nested-result context isolation. Surfacing the
+      // failure lets the send fail visibly and the user retry once the cause
+      // (e.g. QuickJS WASM load) clears.
+      throw new Error(
+        `PTC exclusive assembly failed and must not silently fall back to flat tools: ${getErrorMessage(error)}`
+      );
     }
   }
 

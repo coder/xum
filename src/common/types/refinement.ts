@@ -68,7 +68,6 @@ export const RefinementFileSchema = z
   .refine((file) => (file.text === undefined) !== (file.blobRef === undefined), {
     message: "refinement file requires exactly one of text or blobRef",
   });
-export type RefinementFile = z.infer<typeof RefinementFileSchema>;
 
 /**
  * Invertible file-level operations. File-level (rather than command-level)

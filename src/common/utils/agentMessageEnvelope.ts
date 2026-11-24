@@ -1,12 +1,26 @@
 /**
- * Envelope for intra-tree agent peer messages (sibling/cousin and descendant→ancestor sends via
+ * Envelope for agent peer messages (sibling/cousin, descendant→ancestor, and cross-tree sends via
  * task_send_message). Unlike parent→descendant guidance, these messages cross a trust boundary:
  * the recipient must be able to attribute the text to a specific sender without letting the
  * sender's raw text forge or terminate the envelope structure.
  */
 
-/** The sender's relationship to the recipient (what the receiving model reads). */
-export type AgentMessageRelationship = "sibling" | "descendant";
+/**
+ * The sender's relationship to the recipient (what the receiving model reads). "unrelated" means
+ * the sender shares no task-tree ancestry with the recipient (another root, or a sub-agent under
+ * another root); it describes ancestry only and grants no authority beyond a sibling's.
+ */
+// Main/side labels describe a direct conversation link, not task ownership or user authority.
+const AGENT_MESSAGE_RELATIONSHIPS = [
+  "sibling",
+  "descendant",
+  "unrelated",
+  "main_chat",
+  "side_chat",
+  "tagged",
+] as const;
+export type AgentMessageRelationship = (typeof AGENT_MESSAGE_RELATIONSHIPS)[number];
+const AGENT_MESSAGE_RELATIONSHIP_SET = new Set<unknown>(AGENT_MESSAGE_RELATIONSHIPS);
 
 export interface AgentMessageEnvelope {
   /** Sender's tree target id — doubles as the reply address for task_send_message. */
@@ -24,7 +38,7 @@ function isNonEmptyString(value: unknown): value is string {
 }
 
 function isRelationship(value: unknown): value is AgentMessageRelationship {
-  return value === "sibling" || value === "descendant";
+  return AGENT_MESSAGE_RELATIONSHIP_SET.has(value);
 }
 
 /**
@@ -46,6 +60,12 @@ export interface AgentPeerMessageMeta {
   fromWorkspaceId: string;
   fromTitle?: string;
   relationship: AgentMessageRelationship;
+  /**
+   * Set only on the user-role wake trigger: the history ID of the assistant payload row it
+   * announces. Lets the transcript fold the trigger into the payload card instead of showing a
+   * second row for one message.
+   */
+  payloadMessageId?: string;
 }
 
 /**
@@ -76,6 +96,11 @@ export function getValidAgentPeerTriggerMeta(value: unknown): AgentPeerMessageMe
     fromWorkspaceId: record.fromWorkspaceId,
     ...(typeof record.fromTitle === "string" ? { fromTitle: record.fromTitle } : {}),
     relationship: record.relationship,
+    // Display-only pairing hint: a malformed value is dropped (the trigger then renders as its
+    // own notification row) rather than failing the whole attribution closed.
+    ...(isNonEmptyString(record.payloadMessageId)
+      ? { payloadMessageId: record.payloadMessageId }
+      : {}),
   };
 }
 

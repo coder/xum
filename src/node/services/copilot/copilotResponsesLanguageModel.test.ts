@@ -122,6 +122,84 @@ describe("CopilotResponsesLanguageModel", () => {
     }
   });
 
+  it("rejects an invalid service tier before sending a request", async () => {
+    let requests = 0;
+    const model = new CopilotResponsesLanguageModel({
+      modelId: "gpt-5.4",
+      fetch: Object.assign(() => {
+        requests++;
+        return Promise.resolve(createJsonResponse({}));
+      }, globalThis.fetch),
+    });
+    const options: LanguageModelV2CallOptions = {
+      prompt: [{ role: "user", content: [{ type: "text", text: "hello" }] }],
+      providerOptions: { "github-copilot": { serviceTier: "invalid" } },
+    };
+    // eslint-disable-next-line @typescript-eslint/await-thenable -- Bun mistypes rejection matchers.
+    await expect(model.doGenerate(options)).rejects.toThrow();
+    // eslint-disable-next-line @typescript-eslint/await-thenable -- Bun mistypes rejection matchers.
+    await expect(model.doStream(options)).rejects.toThrow();
+    expect(requests).toBe(0);
+  });
+
+  it.each(["auto", "default", "flex", "priority", undefined] as const)(
+    "serializes service tier %s for generate and stream independently of reasoning",
+    async (serviceTier) => {
+      const capturedBodies: Array<Record<string, unknown>> = [];
+      const response = createCompletedResponse("stop");
+      const model = new CopilotResponsesLanguageModel({
+        modelId: "copilot-test",
+        fetch: Object.assign(
+          (_url: RequestInfo | URL, init?: RequestInit) => {
+            if (!init) {
+              throw new Error("Expected request init");
+            }
+            const body = getJsonBody(init);
+            capturedBodies.push(body);
+            return Promise.resolve(
+              body.stream
+                ? createSseResponse([
+                    { event: "response.completed", data: { type: "response.completed", response } },
+                  ])
+                : createJsonResponse(response)
+            );
+          },
+          { preconnect: globalThis.fetch.preconnect.bind(globalThis.fetch) }
+        ),
+      });
+      for (const reasoningEffort of [undefined, "medium"] as const) {
+        const options: LanguageModelV2CallOptions = {
+          prompt: [{ role: "user", content: [{ type: "text", text: "hello" }] }],
+          providerOptions: {
+            "github-copilot": {
+              ...(serviceTier && { serviceTier }),
+              ...(reasoningEffort && { reasoningEffort }),
+            },
+            // Other namespaces must never supply a fallback tier.
+            openai: { serviceTier: "priority" },
+            anthropic: { serviceTier: "priority" },
+            google: { serviceTier: "priority" },
+          },
+        };
+        await model.doGenerate(options);
+        const result = await model.doStream(options);
+        await collectStreamParts(result.stream);
+      }
+      expect(capturedBodies).toHaveLength(4);
+      for (const body of capturedBodies) {
+        expect(body.service_tier).toBe(serviceTier);
+        expect(body).not.toHaveProperty("serviceTier");
+        if (serviceTier === undefined) {
+          expect(body).not.toHaveProperty("service_tier");
+        }
+      }
+      expect(capturedBodies[0]).not.toHaveProperty("reasoning");
+      expect(capturedBodies[1]).not.toHaveProperty("reasoning");
+      expect(capturedBodies[2].reasoning).toEqual({ effort: "medium" });
+      expect(capturedBodies[3].reasoning).toEqual({ effort: "medium" });
+    }
+  );
+
   it("shapes the outbound request body for streaming calls", async () => {
     let capturedBody: Record<string, unknown> | undefined;
     restoreFetchers.push(
@@ -426,6 +504,51 @@ describe("CopilotResponsesLanguageModel", () => {
     expect(errorPart?.error instanceof Error ? errorPart.error.message : "").toContain(
       "stream closed before terminal event"
     );
+  });
+
+  // Copilot forwards OpenAI service tiers, so cost accounting needs the tier the
+  // response reports it was served at, under the key pricing reads (#4352).
+  it("reports the response's service tier as OpenAI provider metadata", async () => {
+    const tiered = { ...createCompletedResponse("stop"), service_tier: "priority" };
+    restoreFetchers.push(mockFetch(() => Promise.resolve(createJsonResponse(tiered))));
+    const generated = await createModel().doGenerate({
+      prompt: [{ role: "user", content: [{ type: "text", text: "Hello" }] }],
+    });
+    expect(generated.providerMetadata).toEqual({ openai: { serviceTier: "priority" } });
+
+    restoreFetchers.push(
+      mockFetch(() =>
+        Promise.resolve(
+          createSseResponse([
+            {
+              event: "response.completed",
+              data: {
+                type: "response.completed",
+                response: { finish_reason: "stop", service_tier: "flex" },
+              },
+            },
+          ])
+        )
+      )
+    );
+    const streamed = await createModel().doStream({
+      prompt: [{ role: "user", content: [{ type: "text", text: "Stream please" }] }],
+    });
+    const finish = (await collectStreamParts(streamed.stream)).find(
+      (part) => part.type === "finish"
+    );
+    expect(finish?.providerMetadata).toEqual({ openai: { serviceTier: "flex" } });
+
+    // No reported tier (or a non-string one) adds no metadata.
+    restoreFetchers.push(
+      mockFetch(() =>
+        Promise.resolve(createJsonResponse({ ...createCompletedResponse("stop"), service_tier: 7 }))
+      )
+    );
+    const untiered = await createModel().doGenerate({
+      prompt: [{ role: "user", content: [{ type: "text", text: "Hello" }] }],
+    });
+    expect(untiered.providerMetadata).toBeUndefined();
   });
 
   it("treats response.incomplete as a terminal finish event", async () => {

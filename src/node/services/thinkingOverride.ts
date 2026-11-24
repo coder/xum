@@ -12,16 +12,50 @@
  * Node-runtime-local: carries a callback, so it does not belong in
  * src/common/types (never crosses IPC).
  */
+import type { ServiceTier } from "@/common/config/schemas/providersConfig";
 import type { ModelMessage } from "ai";
+import type { AutoModelRoutingRecord } from "@/common/types/autoModelRouting";
 import type { ThinkingLevel } from "@/common/types/thinking";
+import type { SystemSectionRecords } from "@/common/types/message";
+
+/** What an Auto-routed stream is running on right now, as StreamManager's stream state has it. */
+export interface LiveTurnRouting {
+  model: string;
+  thinkingLevel: ThinkingLevel | undefined;
+  autoModelRouting: AutoModelRoutingRecord;
+}
 
 export interface ActiveTurnThinkingOverride {
+  /**
+   * Independent chat-local speed pick, read at each model invocation. Sharing the
+   * turn holder gives it the same admission/cleanup lifetime without touching Auto thinking.
+   */
+  serviceTier?: ServiceTier;
   /** Raw level requested mid-turn; consumed at the next prepareStep (incl. step 1). */
   pending?: ThinkingLevel;
+  /**
+   * The user moved the slider during this turn. Auto's stuck-turn escalation
+   * (autoThinkingEscalation.ts) writes `pending` too, but defers to the user for
+   * the rest of the turn once this is set.
+   */
+  manual?: boolean;
   /** Effective level after the most recent successful application. */
   applied?: ThinkingLevel;
+  /**
+   * Set when the turn published a Token Budget stage (#5286): its first provider request is the
+   * payload the stage counted, so `pending` waits until after that request.
+   */
+  holdBeforeFirstRequest?: boolean;
   /** Sink wired by StreamManager to the owning streamInfo (metadata). */
   onApplied?: (level: ThinkingLevel) => void;
+  /**
+   * Sink wired by AgentSession for Auto-routed turns: StreamManager reports every mid-turn
+   * change to what the stream runs on (an applied slider move or Auto raise, a refusal
+   * fallback). The session's stream context is what a mid-stream compaction follow-up is
+   * built from after the stream is stopped, so it must follow, or the resumed turn drops
+   * back to the tier's model and level and re-arms a claim the user withdrew.
+   */
+  onLiveRoutingChanged?: (live: LiveTurnRouting) => void;
 }
 
 /**
@@ -36,8 +70,13 @@ export interface RebuiltThinkingProviderOptions {
   providerOptions: Record<string, unknown>;
 }
 
+/**
+ * `beforeFirstStep`: no provider request of this turn has been prepared yet, so the
+ * level resolves as at turn start (Sonnet 5.5 "off" can still send `between_tools`).
+ */
 export type RebuildProviderOptionsForThinkingLevel = (
-  level: ThinkingLevel
+  level: ThinkingLevel,
+  beforeFirstStep?: boolean
 ) => RebuiltThinkingProviderOptions | null;
 
 /**
@@ -46,10 +85,16 @@ export type RebuildProviderOptionsForThinkingLevel = (
  * the pre-construction quiescence fold). Message preparation is
  * thinking-level-dependent, so an options-only rebuild would send messages
  * transformed for the wrong mode. Returns the fully prepared first-step
- * messages; implementations also emit a superseding turn envelope so replay
- * matches the wire request.
+ * messages (and their volatile-tail record); implementations also emit a
+ * superseding turn envelope so replay matches the wire request.
  */
 export type RebuildFirstStepForThinkingLevel = (
   effectiveLevel: ThinkingLevel,
   providerOptions: Record<string, unknown>
-) => Promise<ModelMessage[]>;
+) => Promise<{
+  messages: ModelMessage[];
+  /** The rebuilt request's records for the turn's row (MuxMetadata.volatileSystemTail etc.). */
+  systemRecords?: SystemSectionRecords;
+  /** Its system content's token count, tail rows included (MuxMetadata.systemMessageTokens). */
+  systemMessageTokens?: number;
+}>;

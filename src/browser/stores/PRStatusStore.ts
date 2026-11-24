@@ -3,13 +3,13 @@
  *
  * Architecture:
  * - Lives outside React lifecycle (stable references)
- * - Detects workspace PR from current branch via `gh pr view`
+ * - Detects workspace PR via branch, tracked merge ref, then commit SHA fallbacks
  * - Caches status with TTL
  * - Refreshes on focus (like GitStatusStore)
  * - Notifies subscribers when status changes
  *
  * PR detection:
- * - Branch-based: Runs `gh pr view` without URL to detect PR for current branch
+ * - Tries `gh pr view` for the current branch, its tracked merge ref, then its commit SHA
  */
 
 import type { RouterClient } from "@orpc/server";
@@ -25,10 +25,17 @@ import type {
 import type { FrontendWorkspaceMetadata } from "@/common/types/workspace";
 import { createLRUCache } from "@/browser/utils/lruCache";
 import {
+  PR_STATUS_CACHE_ENTRY_PREFIX,
+  PR_STATUS_CACHE_INDEX_KEY,
+  PR_STATUS_CACHE_MAX_ENTRIES,
+} from "@/common/constants/storage";
+import {
   canRunPassiveRuntimeCommand,
   onPassiveRuntimeEligible,
   type PassiveRuntimeDeps,
 } from "@/browser/utils/runtimeExecutionPolicy";
+import { deferWhileChatReplayPending, type ChatReplayGate } from "@/browser/utils/chatReplayGate";
+import { getStatusInputChanges } from "@/browser/utils/statusRefreshInputs";
 /**
  * Parse a GitHub PR URL to extract owner, repo, and number.
  * Returns null if the URL is not a valid GitHub PR URL.
@@ -53,10 +60,33 @@ const STATUS_CACHE_TTL_MS = 5 * 1000;
 // How long to wait before retrying after an error
 const ERROR_RETRY_DELAY_MS = 5 * 1000;
 const STACK_CACHE_TTL_MS = 60_000;
+// A checkout-change probe that fails is retried (one refresh debounce apart) at most this many
+// times in total, so a persistent gh failure cannot keep bypassing the cache TTLs.
+const MAX_METADATA_CHANGE_PROBE_ATTEMPTS = 3;
 
 // GraphQL query for merge queue data (not available in `gh pr view --json`).
 const MERGE_QUEUE_QUERY =
   "query($owner:String!,$repo:String!,$number:Int!){repository(owner:$owner,name:$repo){pullRequest(number:$number){mergeQueueEntry{state position}}}}";
+
+export const DETECT_PR_SCRIPT = `fields='number,url,state,mergeable,mergeStateStatus,title,isDraft,headRefName,baseRefName,statusCheckRollup'
+if out=$(gh pr view --json "$fields" 2>/dev/null); then printf '%s\n' "$out"; exit 0; fi
+branch=$(git branch --show-current 2>/dev/null)
+merge_ref=$(git config "branch.$branch.merge" 2>/dev/null)
+merge_ref=\${merge_ref#refs/heads/}
+# The tracked merge ref covers local branches tracking a differently named remote branch.
+if [ -n "$merge_ref" ] && [ "$merge_ref" != "$branch" ]; then
+  if out=$(gh pr view "$merge_ref" --json "$fields" 2>/dev/null); then printf '%s\n' "$out"; exit 0; fi
+fi
+sha=$(git rev-parse HEAD 2>/dev/null)
+if [ -n "$sha" ]; then
+  # The SHA lookup is the only fallback with zero local hints after a differently named refspec push.
+  # Open-only avoids matching the merged PR that introduced an ancestor of a fresh workspace HEAD.
+  num=$(gh api "repos/{owner}/{repo}/commits/$sha/pulls" --jq '[.[] | select(.state == "open")][0].number' 2>/dev/null)
+  if [ -n "$num" ] && [ "$num" != "null" ]; then
+    if out=$(gh pr view "$num" --json "$fields" 2>/dev/null); then printf '%s\n' "$out"; exit 0; fi
+  fi
+fi
+echo '{"no_pr":true}'`;
 
 interface PersistedPRStatus {
   prLink: GitHubPRLink | null;
@@ -65,9 +95,9 @@ interface PersistedPRStatus {
 }
 
 const prStatusLRU = createLRUCache<PersistedPRStatus>({
-  entryPrefix: "prStatus:",
-  indexKey: "prStatusIndex",
-  maxEntries: 50,
+  entryPrefix: PR_STATUS_CACHE_ENTRY_PREFIX,
+  indexKey: PR_STATUS_CACHE_INDEX_KEY,
+  maxEntries: PR_STATUS_CACHE_MAX_ENTRIES,
   // No TTL - we refresh on mount anyway, just want instant display
 });
 
@@ -310,7 +340,13 @@ export class PRStatusStore {
   private workspacePRSubscriptions = new MapStore<string, WorkspacePRCacheEntry>();
   private workspacePRCache = new Map<string, WorkspacePRCacheEntry>();
   private workspaceStackCache = new Map<string, WorkspaceStackCacheEntry>();
+  // Workspaces whose checkout inputs changed since their last successful probe. Their PR and stack
+  // caches describe the previous checkout, so refreshes probe them regardless of cache TTLs until
+  // both probes succeed or the attempts run out. A newer change replaces the entry object.
+  private metadataChangedWorkspaces = new Map<string, { failedAttempts: number }>();
   private runtimeRetryUnsubscribers = new Map<string, () => void>();
+  private chatReplayGate: ChatReplayGate | null = null;
+  private chatReplayRetryUnsubscribers = new Map<string, () => void>();
 
   // Track active subscriptions per workspace so we only refresh workspaces that are actually visible.
   private workspaceSubscriptionCounts = new Map<string, number>();
@@ -352,6 +388,11 @@ export class PRStatusStore {
   }
 
   setClient(client: RouterClient<AppRouter> | null): void {
+    // AppLoader re-applies the same client on every workspace metadata event; only a new
+    // client (first connect or reconnect) warrants a refresh.
+    if (client === this.client) {
+      return;
+    }
     this.client = client;
 
     if (!client) {
@@ -364,11 +405,34 @@ export class PRStatusStore {
     }
   }
 
+  /** Defer refreshes of a workspace while its chat replay is pending; null disables gating. */
+  setChatReplayGate(gate: ChatReplayGate | null): void {
+    this.chatReplayGate = gate;
+  }
+
   syncWorkspaces(metadata: Map<string, FrontendWorkspaceMetadata>): void {
-    if (!this.isActive && metadata.size > 0) {
+    const reactivated = !this.isActive && metadata.size > 0;
+    if (reactivated) {
       this.isActive = true;
     }
 
+    // Like GitStatusStore: unrelated metadata events must not spawn gh probes, so refresh only
+    // when a subscribed workspace's status inputs changed. Changes to undisplayed workspaces are
+    // remembered so their first refresh after resubscribing bypasses the cache TTLs.
+    const isSubscribed = (workspaceId: string) => this.workspaceSubscriptionCounts.has(workspaceId);
+    const changedWorkspaceIds = getStatusInputChanges(
+      this.workspaceMetadata,
+      metadata,
+      isSubscribed
+    );
+    for (const workspaceId of changedWorkspaceIds) {
+      this.metadataChangedWorkspaces.set(workspaceId, { failedAttempts: 0 });
+    }
+    for (const workspaceId of this.metadataChangedWorkspaces.keys()) {
+      if (!metadata.has(workspaceId)) {
+        this.metadataChangedWorkspaces.delete(workspaceId);
+      }
+    }
     this.workspaceMetadata = metadata;
     for (const [id, unsubscribe] of this.runtimeRetryUnsubscribers) {
       if (!metadata.has(id)) {
@@ -376,8 +440,16 @@ export class PRStatusStore {
         this.runtimeRetryUnsubscribers.delete(id);
       }
     }
+    for (const [id, unsubscribe] of this.chatReplayRetryUnsubscribers) {
+      if (!metadata.has(id)) {
+        unsubscribe();
+        this.chatReplayRetryUnsubscribers.delete(id);
+      }
+    }
     this.refreshController.bindListeners();
-    this.refreshController.requestImmediate();
+    if (reactivated || changedWorkspaceIds.some(isSubscribed)) {
+      this.refreshController.requestImmediate();
+    }
   }
 
   /** Subscriptions drive refresh, so consumers do not monitor workspaces separately. */
@@ -408,6 +480,8 @@ export class PRStatusStore {
         this.workspaceSubscriptionCounts.delete(workspaceId);
         this.runtimeRetryUnsubscribers.get(workspaceId)?.();
         this.runtimeRetryUnsubscribers.delete(workspaceId);
+        this.chatReplayRetryUnsubscribers.get(workspaceId)?.();
+        this.chatReplayRetryUnsubscribers.delete(workspaceId);
       } else {
         this.workspaceSubscriptionCounts.set(workspaceId, next);
       }
@@ -505,8 +579,9 @@ export class PRStatusStore {
     this.workspacePRSubscriptions.bump(workspaceId);
   }
 
-  private async detectWorkspaceStack(workspaceId: string): Promise<void> {
-    if (!this.client || !this.isActive) return;
+  /** Returns whether gh answered (a stack or "no stack"); false on a failed or empty run. */
+  private async detectWorkspaceStack(workspaceId: string): Promise<boolean> {
+    if (!this.client || !this.isActive) return false;
 
     const existing = this.workspaceStackCache.get(workspaceId);
     this.workspaceStackCache.set(workspaceId, {
@@ -523,26 +598,28 @@ export class PRStatusStore {
         options: repoRootBashOptions(20),
       });
 
-      if (!this.isActive) return;
+      if (!this.isActive) return false;
       if (!result.success || !result.data.success || !result.data.output) {
         this.writeWorkspaceStack(workspaceId, null);
-        return;
+        return false;
       }
 
       const stack = parseStackViewOutput(result.data.output);
       if (!stack) {
         this.writeWorkspaceStack(workspaceId, null);
-        return;
+        return true;
       }
 
       const enrichedStack = await this.enrichWorkspaceStack(workspaceId, stack);
       if (this.isActive) {
         this.writeWorkspaceStack(workspaceId, enrichedStack);
       }
+      return true;
     } catch {
       if (this.isActive) {
         this.writeWorkspaceStack(workspaceId, null);
       }
+      return false;
     }
   }
 
@@ -595,10 +672,11 @@ export class PRStatusStore {
   }
 
   /**
-   * Detect PR for workspace's current branch via `gh pr view`.
+   * Detect a workspace PR using branch, tracked merge ref, and commit SHA fallbacks.
    */
-  private async detectWorkspacePR(workspaceId: string): Promise<void> {
-    if (!this.client || !this.isActive) return;
+  /** Returns whether gh answered with a PR or "no PR"; false on a failed, empty or invalid run. */
+  private async detectWorkspacePR(workspaceId: string): Promise<boolean> {
+    if (!this.client || !this.isActive) return false;
 
     // Mark as loading
     const existing = this.workspacePRCache.get(workspaceId);
@@ -611,16 +689,15 @@ export class PRStatusStore {
     this.workspacePRSubscriptions.bump(workspaceId);
 
     try {
-      // Run gh pr view without URL - detects PR for current branch
       const result = await this.client.workspace.executeBash({
         workspaceId,
-        script: `gh pr view --json number,url,state,mergeable,mergeStateStatus,title,isDraft,headRefName,baseRefName,statusCheckRollup 2>/dev/null || echo '{"no_pr":true}'`,
+        script: DETECT_PR_SCRIPT,
         // gh requires the runtime environment for devcontainer workspaces where
         // the CLI / auth may only exist inside the container.
-        options: repoRootBashOptions(15),
+        options: repoRootBashOptions(30),
       });
 
-      if (!this.isActive) return;
+      if (!this.isActive) return false;
 
       if (!result.success || !result.data.success) {
         const existing = this.workspacePRCache.get(workspaceId);
@@ -632,15 +709,17 @@ export class PRStatusStore {
           fetchedAt: Date.now(),
         });
         this.workspacePRSubscriptions.bump(workspaceId);
-        return;
+        return false;
       }
 
+      let answered = false;
       const output = result.data.output;
       if (output) {
         const parsed = JSON.parse(output) as Record<string, unknown>;
 
         if ("no_pr" in parsed) {
           // No PR for this branch
+          answered = true;
           this.workspacePRCache.set(workspaceId, {
             prLink: null,
             loading: false,
@@ -685,6 +764,7 @@ export class PRStatusStore {
               occurrenceCount: 1,
             };
 
+            answered = true;
             this.workspacePRCache.set(workspaceId, {
               prLink,
               status,
@@ -710,8 +790,9 @@ export class PRStatusStore {
       }
 
       this.workspacePRSubscriptions.bump(workspaceId);
+      return answered;
     } catch (err) {
-      if (!this.isActive) return;
+      if (!this.isActive) return false;
 
       const existing = this.workspacePRCache.get(workspaceId);
       this.workspacePRCache.set(workspaceId, {
@@ -722,6 +803,7 @@ export class PRStatusStore {
         fetchedAt: Date.now(),
       });
       this.workspacePRSubscriptions.bump(workspaceId);
+      return false;
     }
   }
 
@@ -890,11 +972,26 @@ export class PRStatusStore {
     const refreshes: Array<Promise<void>> = [];
 
     for (const workspaceId of workspaceIds) {
-      const shouldFetchPR = this.shouldFetchWorkspace(this.workspacePRCache.get(workspaceId), now);
-      const shouldFetchStack = this.shouldFetchStack(
-        this.workspaceStackCache.get(workspaceId),
-        now
-      );
+      // #4662: defer gh pr/stack probes while the workspace's chat replay is pending.
+      if (
+        deferWhileChatReplayPending(
+          this.chatReplayGate,
+          this.chatReplayRetryUnsubscribers,
+          workspaceId,
+          () => this.refreshController.requestImmediate()
+        )
+      ) {
+        continue;
+      }
+
+      // Unrelated metadata events do not retry refreshes, so cache TTLs must not swallow the one
+      // refresh a checkout change requests (including a change made while a probe was in flight).
+      const metadataChange = this.metadataChangedWorkspaces.get(workspaceId);
+      const metadataChanged = metadataChange != null;
+      const shouldFetchPR =
+        metadataChanged || this.shouldFetchWorkspace(this.workspacePRCache.get(workspaceId), now);
+      const shouldFetchStack =
+        metadataChanged || this.shouldFetchStack(this.workspaceStackCache.get(workspaceId), now);
       if (!shouldFetchPR && !shouldFetchStack) {
         continue;
       }
@@ -935,15 +1032,45 @@ export class PRStatusStore {
         continue;
       }
 
+      const probes: Array<Promise<boolean>> = [];
       if (shouldFetchPR) {
-        refreshes.push(this.detectWorkspacePR(workspaceId));
+        probes.push(this.detectWorkspacePR(workspaceId));
       }
       if (shouldFetchStack) {
-        refreshes.push(this.detectWorkspaceStack(workspaceId));
+        probes.push(this.detectWorkspaceStack(workspaceId));
       }
+      refreshes.push(
+        Promise.all(probes).then((results) => {
+          if (metadataChange != null) {
+            this.settleMetadataChangeProbe(workspaceId, metadataChange, results.every(Boolean));
+          }
+        })
+      );
     }
 
     await Promise.all(refreshes);
+  }
+
+  /**
+   * Clears a checkout-change mark once its probes succeeded, or schedules a bounded retry: no
+   * unrelated metadata event retries the probe, so a transient failure would otherwise leave the
+   * previous checkout's PR/stack on screen until the next focus or subscription.
+   */
+  private settleMetadataChangeProbe(
+    workspaceId: string,
+    change: { failedAttempts: number },
+    succeeded: boolean
+  ): void {
+    // A newer change replaced this mark during the probe; that change gets its own refresh.
+    if (this.metadataChangedWorkspaces.get(workspaceId) !== change) {
+      return;
+    }
+    change.failedAttempts += succeeded ? 0 : 1;
+    if (succeeded || change.failedAttempts >= MAX_METADATA_CHANGE_PROBE_ATTEMPTS) {
+      this.metadataChangedWorkspaces.delete(workspaceId);
+      return;
+    }
+    this.refreshController.schedule();
   }
 
   /**
@@ -951,12 +1078,17 @@ export class PRStatusStore {
    */
   dispose(): void {
     this.isActive = false;
+    this.metadataChangedWorkspaces.clear();
     this.mergeQueueRefreshPending.clear();
     this.mergeQueueRefreshInFlight.clear();
     for (const unsubscribe of this.runtimeRetryUnsubscribers.values()) {
       unsubscribe();
     }
     this.runtimeRetryUnsubscribers.clear();
+    for (const unsubscribe of this.chatReplayRetryUnsubscribers.values()) {
+      unsubscribe();
+    }
+    this.chatReplayRetryUnsubscribers.clear();
     this.refreshController.dispose();
   }
 }

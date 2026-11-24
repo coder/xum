@@ -32,6 +32,14 @@ export const BRANCH_SUMMARY_TARGET_WORDS = 250;
 export const BRANCH_SUMMARY_MAX_OUTPUT_TOKENS = 512;
 
 /**
+ * Extra output-token headroom for candidates that cannot disable thinking
+ * (Opus 5.5, Fable/Mythos): thinking counts toward max_tokens, so without it
+ * thinking can exhaust the summary budget above. BRANCH_SUMMARY_TIMEOUT_MS,
+ * not this cap, still bounds wall time.
+ */
+export const BRANCH_SUMMARY_THINKING_HEADROOM_TOKENS = 1_536;
+
+/**
  * Hard wall-clock bound for the whole summary generation (all candidate
  * models share one deadline). Sized to cover the full output cap at real
  * side-channel throughput: dogfooded haiku streams ~100 tok/s with ~0.6s

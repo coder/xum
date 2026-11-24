@@ -2,6 +2,8 @@ import {
   MCP_TOOL_RESULT_MAX_TEXT_BYTES,
   MCP_TOOL_RESULT_MAX_TOTAL_BYTES,
 } from "@/common/constants/toolLimits";
+import assert from "@/common/utils/assert";
+import { isPlainObject } from "@/common/utils/isPlainObject";
 import { log } from "@/node/services/log";
 
 /**
@@ -203,6 +205,73 @@ function toGuardedMediaPart(
   return { type: "media", data: data ?? "", mediaType };
 }
 
+/** Only an object-valued `_meta` is protocol metadata; malformed values pass through. */
+function carriesMeta(value: unknown): boolean {
+  return isPlainObject(value) && isPlainObject(value._meta);
+}
+
+/** A content block's own `_meta`, or its embedded resource contents' `_meta`. */
+function blockCarriesMeta(block: unknown): boolean {
+  return (
+    carriesMeta(block) ||
+    (isPlainObject(block) && block.type === "resource" && carriesMeta(block.resource))
+  );
+}
+
+function hasProtocolMeta(result: Record<string, unknown>): boolean {
+  return (
+    carriesMeta(result) || (Array.isArray(result.content) && result.content.some(blockCarriesMeta))
+  );
+}
+
+function copyWithoutMeta(value: Record<string, unknown>): Record<string, unknown> {
+  const copy = { ...value };
+  if (isPlainObject(copy._meta)) {
+    delete copy._meta;
+  }
+  return copy;
+}
+
+function omitBlockMeta(block: unknown): unknown {
+  if (!isPlainObject(block) || !blockCarriesMeta(block)) {
+    return block;
+  }
+  const copy = copyWithoutMeta(block);
+  if (block.type === "resource" && isPlainObject(block.resource)) {
+    copy.resource = copyWithoutMeta(block.resource);
+  }
+  return copy;
+}
+
+/**
+ * Drop protocol-defined `_meta` from a raw MCP tool result: the result root,
+ * each content block, and an embedded resource's inner contents.
+ *
+ * Why: `_meta` is reserved for protocol/host metadata (tracing, widget
+ * hydration, host hints), and nothing in Xum consumes it beyond the server
+ * identity key, which the caller extracts first. Persisted output is replayed
+ * to the model verbatim as JSON on later turns, and it counts toward the total
+ * serialized cap, so large metadata could otherwise flatten small useful text.
+ * `_meta` keys elsewhere (inside structuredContent, text, or a legacy
+ * toolResult) are application data and stay.
+ *
+ * Copy-on-write: never mutates the input, and returns the input itself when
+ * there is nothing to strip.
+ */
+export function omitMCPProtocolMeta(result: unknown): unknown {
+  if (!isPlainObject(result) || !hasProtocolMeta(result)) {
+    return result;
+  }
+  const stripped = copyWithoutMeta(result);
+  if (Array.isArray(result.content)) {
+    stripped.content = result.content.map(omitBlockMeta);
+  }
+  assert(!hasProtocolMeta(stripped), "MCP result still carries protocol _meta after omission");
+  return stripped;
+}
+
+const MCP_ERROR_CONTENT_MARKER = "[Tool reported an error]";
+
 /**
  * Transform MCP tool result to AI SDK format.
  * Converts MCP binary content (image, audio, embedded blob resources) to AI
@@ -332,10 +401,22 @@ export function transformMCPResult(result: unknown): unknown {
   // carrying binary payloads get an explicit text marker instead of bypassing
   // the media conversion (and its size guard).
   if (typed.isError) {
-    transformedContent.unshift({ type: "text", text: "[Tool reported an error]" });
+    transformedContent.unshift({ type: "text", text: MCP_ERROR_CONTENT_MARKER });
   }
 
   return { type: "content", value: transformedContent };
+}
+
+/**
+ * Whether a tool output is an MCP error result that transformMCPResult rewrote into the content
+ * shape (it carried binary parts), where the leading marker text is the only sign of the error.
+ */
+export function isMCPErrorContentOutput(output: unknown): boolean {
+  if (!isPlainObject(output) || output.type !== "content" || !Array.isArray(output.value)) {
+    return false;
+  }
+  const first: unknown = output.value[0];
+  return isPlainObject(first) && first.type === "text" && first.text === MCP_ERROR_CONTENT_MARKER;
 }
 
 /**

@@ -14,16 +14,16 @@ import React, {
   forwardRef,
 } from "react";
 import { cn } from "@/common/lib/utils";
-import { ChevronDown, Eye, Settings, ShieldCheck, Star } from "lucide-react";
+import { ChevronDown, Eye, Route, Settings, Star } from "lucide-react";
 
 import { COMPOSER_PICKER_PANEL_CLASS, composerPickerOptionClass } from "../composerPickerStyles";
 import { ProviderIcon } from "../ProviderIcon/ProviderIcon";
 import { Tooltip, TooltipTrigger, TooltipContent } from "../Tooltip/Tooltip";
 import { useSettings } from "@/browser/contexts/SettingsContext";
-import { usePolicy } from "@/browser/contexts/PolicyContext";
 import { useProvidersConfig } from "@/browser/hooks/useProvidersConfig";
 import { useRouting } from "@/browser/hooks/useRouting";
 
+import { autoFocusUnlessPhone } from "@/browser/utils/env";
 import { stopKeyboardPropagation } from "@/browser/utils/events";
 import { formatModelDisplayName } from "@/common/utils/ai/modelDisplay";
 import { formatProviderDisplayName } from "@/common/utils/providers/customProviders";
@@ -46,6 +46,46 @@ import { DESKTOP_TITLEBAR_HEIGHT_PX } from "@/browser/hooks/useDesktopTitlebar";
 const PANEL_TOP_CLEARANCE_PX = DESKTOP_TITLEBAR_HEIGHT_PX + 8;
 // Below this the panel is unusable; prefer slight bar overlap in pathological layouts.
 const PANEL_MIN_HEIGHT_PX = 150;
+const PANEL_EDGE_MARGIN_PX = 8;
+
+/**
+ * Fit the panel inside the nearest ancestor that clips it (the transcript scrollport the composer
+ * sits in, the scrolling creation page). On a phone the panel at the model pill overflowed that
+ * ancestor sideways, which then scrolled to show the focused search field and stayed shifted
+ * after the panel closed. With the keyboard up the ancestor's top cut off the search field.
+ * `left` is the shift from the trigger's left edge.
+ */
+export function getPanelPlacement(
+  trigger: HTMLElement,
+  panelWidth: number
+): { left: number; maxHeight: number } {
+  let clip = { top: 0, left: 0, right: window.innerWidth };
+  for (let el = trigger.parentElement; el != null; el = el.parentElement) {
+    // One axis that is not visible makes the other clip too, so overflowX finds both.
+    const style = getComputedStyle(el);
+    if (style.overflowX === "visible") continue;
+    const box = el.getBoundingClientRect();
+    const contentLeft = box.left + el.clientLeft;
+    clip = {
+      top: box.top + el.clientTop,
+      left: contentLeft + (parseFloat(style.paddingLeft) || 0),
+      right: contentLeft + el.clientWidth - (parseFloat(style.paddingRight) || 0),
+    };
+    break;
+  }
+
+  const triggerBox = trigger.getBoundingClientRect();
+  const overflow = triggerBox.left + panelWidth - (clip.right - PANEL_EDGE_MARGIN_PX);
+  const left = overflow <= 0 ? 0 : -Math.min(overflow, Math.max(triggerBox.left - clip.left, 0));
+
+  const topLimit = clip.top + PANEL_EDGE_MARGIN_PX;
+  const maxHeight = Math.max(
+    triggerBox.top - Math.max(topLimit, PANEL_TOP_CLEARANCE_PX),
+    // Past a clipping ancestor's top the panel is cut off, so the floor stops there.
+    Math.min(PANEL_MIN_HEIGHT_PX, triggerBox.top - topLimit)
+  );
+  return { left, maxHeight };
+}
 
 interface ModelSelectorProps {
   value: string;
@@ -63,6 +103,14 @@ interface ModelSelectorProps {
   variant?: "default" | "box";
   className?: string;
   tooltipExtraContent?: React.ReactNode;
+  /**
+   * Auto-model-routing experiment: when provided, an "Auto" row is pinned above the
+   * model list. While active the trigger reads "Auto" and no concrete model is marked
+   * selected; picking a concrete model still calls onChange (the owner turns Auto off).
+   */
+  autoRouting?: { active: boolean; onSelect: () => void };
+  /** Accessible name for the trigger when no visible label identifies the picker. */
+  triggerAriaLabel?: string;
 }
 
 export interface ModelSelectorRef {
@@ -87,12 +135,12 @@ export const ModelSelector = forwardRef<ModelSelectorRef, ModelSelectorProps>(
       variant = "default",
       className,
       tooltipExtraContent,
+      autoRouting,
+      triggerAriaLabel,
     },
     ref
   ) => {
     useSettings(); // Context must be available for nested components
-    const policyState = usePolicy();
-    const policyEnforced = policyState.status.state === "enforced";
     const routing = useRouting();
     const { config: providersConfig } = useProvidersConfig();
     const [isOpen, setIsOpen] = useState(false);
@@ -112,20 +160,33 @@ export const ModelSelector = forwardRef<ModelSelectorRef, ModelSelectorProps>(
       setHighlightedIndex(0);
     }, []);
 
-    // Clamp the panel to the space above the trigger so it stays fully visible.
-    const [panelMaxHeight, setPanelMaxHeight] = useState<number | null>(null);
+    // Clamp the panel to the space above the trigger so it stays fully visible, and keep it
+    // inside the pane it opens in.
+    const [panelPlacement, setPanelPlacement] = useState<ReturnType<
+      typeof getPanelPlacement
+    > | null>(null);
+    const panelRef = useRef<HTMLDivElement>(null);
     useLayoutEffect(() => {
       if (!isOpen) return;
 
-      const updatePanelMaxHeight = () => {
-        const triggerTop = containerRef.current?.getBoundingClientRect().top;
-        if (triggerTop === undefined) return;
-        setPanelMaxHeight(Math.max(triggerTop - PANEL_TOP_CLEARANCE_PX, PANEL_MIN_HEIGHT_PX));
+      const updatePanelPlacement = () => {
+        const container = containerRef.current;
+        const panel = panelRef.current;
+        if (container == null || panel == null) return;
+        setPanelPlacement(getPanelPlacement(container, panel.offsetWidth));
       };
 
-      updatePanelMaxHeight();
-      window.addEventListener("resize", updatePanelMaxHeight);
-      return () => window.removeEventListener("resize", updatePanelMaxHeight);
+      updatePanelPlacement();
+      // Opening the panel focuses its search field, and on iOS the keyboard that brings up
+      // resizes only the visual viewport. The shell shrinks with it and moves the trigger up, so
+      // a height measured before that ran the panel off the top of the screen.
+      const viewport = window.visualViewport;
+      window.addEventListener("resize", updatePanelPlacement);
+      viewport?.addEventListener("resize", updatePanelPlacement);
+      return () => {
+        window.removeEventListener("resize", updatePanelPlacement);
+        viewport?.removeEventListener("resize", updatePanelPlacement);
+      };
     }, [isOpen]);
 
     // Close dropdown on outside click
@@ -152,14 +213,16 @@ export const ModelSelector = forwardRef<ModelSelectorRef, ModelSelectorProps>(
       setInputValue(""); // Clear input to show all models
       setShowAllModels(false);
 
-      // Start with current value highlighted
+      // Start with current value highlighted (the Auto row while Auto is active, so
+      // Enter keeps the routing choice instead of committing the fallback model).
       const currentIndex = models.indexOf(value);
-      setHighlightedIndex(currentIndex >= 0 ? currentIndex : 0);
+      setHighlightedIndex(autoRouting?.active === true ? -1 : currentIndex >= 0 ? currentIndex : 0);
 
-      // Focus input after dropdown renders.
-      const timer = setTimeout(() => inputRef.current?.focus(), 0);
+      // Focus input after dropdown renders. Not on phones: the keyboard that opens leaves the panel
+      // room for its search field and hardly a row of models. Tapping the field still types.
+      const timer = setTimeout(() => autoFocusUnlessPhone(() => inputRef.current?.focus()), 0);
       return () => clearTimeout(timer);
-    }, [isOpen, models, value]);
+    }, [isOpen, models, value, autoRouting?.active]);
 
     // Build model list: visible models + (if showAllModels) hidden models
     const baseModels = showAllModels ? [...models, ...hiddenModels] : models;
@@ -184,18 +247,33 @@ export const ModelSelector = forwardRef<ModelSelectorRef, ModelSelectorProps>(
       }
     }
 
+    // The pinned Auto row lives at index -1 so ArrowUp from the first model reaches it.
+    const autoRowIndex = autoRouting ? -1 : 0;
+    const autoRowHighlighted = autoRouting != null && highlightedIndex === -1;
+
     // If the list shrinks (e.g., a model is hidden), keep the highlight in-bounds.
     useEffect(() => {
+      if (highlightedIndex < autoRowIndex) {
+        setHighlightedIndex(autoRowIndex);
+        return;
+      }
       if (filteredModels.length === 0) {
-        setHighlightedIndex(0);
+        if (highlightedIndex > 0) setHighlightedIndex(0);
         return;
       }
       if (highlightedIndex >= filteredModels.length) {
         setHighlightedIndex(filteredModels.length - 1);
       }
-    }, [filteredModels.length, highlightedIndex]);
+    }, [autoRowIndex, filteredModels.length, highlightedIndex]);
+
+    const canSave = autoRowHighlighted || filteredModels.length > 0;
 
     const handleSave = () => {
+      if (autoRowHighlighted) {
+        autoRouting.onSelect();
+        handleCancel();
+        return;
+      }
       // No matches - do nothing, let user keep typing or cancel
       if (filteredModels.length === 0) {
         return;
@@ -220,7 +298,7 @@ export const ModelSelector = forwardRef<ModelSelectorRef, ModelSelectorProps>(
       if (e.key === "Enter") {
         e.preventDefault();
         // Only call onComplete if save succeeded (had matches)
-        if (filteredModels.length > 0) {
+        if (canSave) {
           handleSave();
           onComplete?.();
         }
@@ -245,7 +323,7 @@ export const ModelSelector = forwardRef<ModelSelectorRef, ModelSelectorProps>(
 
       if (e.key === "ArrowUp") {
         e.preventDefault();
-        setHighlightedIndex((prev) => Math.max(prev - 1, 0));
+        setHighlightedIndex((prev) => Math.max(prev - 1, autoRowIndex));
         return;
       }
     };
@@ -308,15 +386,19 @@ export const ModelSelector = forwardRef<ModelSelectorRef, ModelSelectorProps>(
       : cn("bg-transparent rounded-sm text-[11px]", className ?? "w-32");
 
     const hasValue = value.trim().length > 0;
+    const autoActive = autoRouting?.active === true;
+    // While Auto is active the concrete value is only the fallback, not the selection.
+    const isModelSelected = (model: string) => value === model && !autoActive;
     const explicitGateway = hasValue ? getExplicitGatewayPrefix(value) : undefined;
     const canonicalValue = hasValue ? normalizeToCanonical(value) : "";
-    const selectedProvider = hasValue ? getModelProvider(canonicalValue) : "";
-    const displayValue = hasValue
-      ? formatModelStringForDisplay(canonicalValue)
-      : (emptyLabel ?? "");
-    const compactDisplayValue = hasValue
-      ? formatCompactModelStringForDisplay(canonicalValue)
-      : displayValue;
+    const selectedProvider = hasValue && !autoActive ? getModelProvider(canonicalValue) : "";
+    const displayValue = autoActive
+      ? "Auto"
+      : hasValue
+        ? formatModelStringForDisplay(canonicalValue)
+        : (emptyLabel ?? "");
+    const compactDisplayValue =
+      hasValue && !autoActive ? formatCompactModelStringForDisplay(canonicalValue) : displayValue;
 
     // Explicit gateway selections short-circuit route resolution: the user
     // intentionally pinned a gateway, so display that gateway directly instead
@@ -341,11 +423,15 @@ export const ModelSelector = forwardRef<ModelSelectorRef, ModelSelectorProps>(
               )}
               role="combobox"
               aria-expanded={isOpen}
+              // A combobox takes no name from its content, so fall back to a name that
+              // includes the visible model (button-name, #5951).
+              aria-label={triggerAriaLabel ?? (displayValue ? `Model: ${displayValue}` : "Model")}
               variant="ghost"
               size="xs"
               onClick={() => setIsOpen((prev) => !prev)}
             >
               <span className="flex min-w-0 items-center gap-1.5">
+                {autoActive && <Route aria-hidden="true" className="h-3 w-3 shrink-0 opacity-70" />}
                 {selectedProvider && (
                   <ProviderIcon
                     provider={selectedProvider}
@@ -383,7 +469,11 @@ export const ModelSelector = forwardRef<ModelSelectorRef, ModelSelectorProps>(
             align={tooltipExtraContent ? "start" : "center"}
             className={cn(tooltipExtraContent && "max-w-80 whitespace-normal")}
           >
-            {explicitGateway ? value.trim() : canonicalValue}
+            {autoActive
+              ? `Auto: routes each prompt by difficulty (falls back to ${canonicalValue})`
+              : explicitGateway
+                ? value.trim()
+                : canonicalValue}
             {routedViaDisplayName ? (
               <>
                 <br />
@@ -403,7 +493,15 @@ export const ModelSelector = forwardRef<ModelSelectorRef, ModelSelectorProps>(
         {/* Dropdown content - rendered inline for testability */}
         {isOpen && (
           <div
-            style={panelMaxHeight != null ? { maxHeight: panelMaxHeight } : undefined}
+            ref={panelRef}
+            style={
+              panelPlacement == null
+                ? undefined
+                : {
+                    maxHeight: panelPlacement.maxHeight,
+                    ...(panelPlacement.left !== 0 && { left: panelPlacement.left }),
+                  }
+            }
             className={cn(
               "absolute bottom-full left-0 z-[1020] mb-1 flex w-82 flex-col",
               COMPOSER_PICKER_PANEL_CLASS
@@ -422,6 +520,42 @@ export const ModelSelector = forwardRef<ModelSelectorRef, ModelSelectorProps>(
               />
               {error && <div className="text-danger-soft mt-1 text-[10px]">{error}</div>}
             </div>
+
+            {autoRouting && (
+              <button
+                type="button"
+                role="option"
+                aria-selected={autoActive}
+                data-auto-routing-option
+                data-highlighted={autoRowHighlighted}
+                onMouseDown={(e) => e.preventDefault()}
+                onMouseEnter={() => setHighlightedIndex(-1)}
+                onClick={(e) => {
+                  e.preventDefault();
+                  e.stopPropagation();
+                  autoRouting.onSelect();
+                  handleCancel();
+                }}
+                className={cn(
+                  composerPickerOptionClass(
+                    { isHighlighted: autoRowHighlighted, isSelected: autoActive },
+                    "py-1"
+                  ),
+                  "border-border-light w-full shrink-0 border-b text-left"
+                )}
+              >
+                <Route
+                  aria-hidden="true"
+                  className={cn("h-3 w-3 shrink-0", autoActive ? "text-accent-text" : "text-muted")}
+                />
+                <span className="flex min-w-0 flex-1 items-baseline gap-1">
+                  <span className={cn("min-w-0 truncate", autoActive && "text-accent-text")}>
+                    Auto
+                  </span>
+                  <span className="text-muted shrink-0 text-[10px]">Route by difficulty</span>
+                </span>
+              </button>
+            )}
 
             {/* Scrollable list */}
             <div ref={listRef} className="max-h-[280px] min-h-0 overflow-y-auto py-1">
@@ -442,24 +576,29 @@ export const ModelSelector = forwardRef<ModelSelectorRef, ModelSelectorProps>(
                       className={composerPickerOptionClass(
                         {
                           isHighlighted: index === highlightedIndex,
-                          isSelected: value === model,
+                          isSelected: isModelSelected(model),
                         },
                         "py-1",
                         hiddenSet.has(model) && "opacity-50"
                       )}
                       onClick={() => handleSelectModel(model)}
                       role="option"
-                      aria-selected={value === model}
+                      aria-selected={isModelSelected(model)}
                     >
                       <ProviderIcon
                         provider={modelProvider}
                         className={cn(
                           "h-3 w-3 shrink-0",
-                          value === model ? "text-accent" : "text-muted"
+                          isModelSelected(model) ? "text-accent-text" : "text-muted"
                         )}
                       />
                       <span className="flex min-w-0 flex-1 items-baseline gap-1">
-                        <span className={cn("min-w-0 truncate", value === model && "text-accent")}>
+                        <span
+                          className={cn(
+                            "min-w-0 truncate",
+                            isModelSelected(model) && "text-accent-text"
+                          )}
+                        >
                           {formatModelDisplayName(modelName)}
                         </span>
                         {showProviderLabel && (
@@ -583,13 +722,6 @@ export const ModelSelector = forwardRef<ModelSelectorRef, ModelSelectorProps>(
                   >
                     {showAllModels ? "Show fewer models" : "Show all models…"}
                   </button>
-                )}
-
-                {policyEnforced && (
-                  <div className="text-muted flex items-center gap-1 px-2.5 text-[10px]">
-                    <ShieldCheck className="h-3 w-3" aria-hidden />
-                    <span>Your settings are controlled by a policy.</span>
-                  </div>
                 )}
 
                 {onOpenSettings && (

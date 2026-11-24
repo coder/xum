@@ -11,6 +11,7 @@ import {
   withLegacyMuxEnvironmentAliases,
 } from "@/common/compat/legacyMux";
 import { flattenToolHookValueToEnv } from "@/common/utils/tools/toolHookEnv";
+import { shellQuote } from "@/common/utils/shell";
 import type { Runtime } from "@/node/runtime/Runtime";
 import { log } from "@/node/services/log";
 import { execBuffered, writeFileString } from "@/node/utils/runtime/helpers";
@@ -25,19 +26,18 @@ const FLATTENED_TOOL_ENV_MAX_VARS = 200;
 const FLATTENED_TOOL_ENV_MAX_ARRAY_LENGTH = 50;
 const DEFAULT_HOOK_PHASE_TIMEOUT_MS = 10_000; // 10 seconds
 const EXEC_MARKER_PREFIX = "MUX_EXEC_";
+const HOOK_PATH_ENV = "XUM_INTERNAL_HOOK_PATH";
 
-/** Shell-escape a string for safe use in bash -c commands */
-function shellEscape(str: string): string {
-  // Wrap in single quotes and escape any embedded single quotes
-  return `'${str.replace(/'/g, "'\\''")}'`;
+function buildHookCommand(): string {
+  return `hook_path="$${HOOK_PATH_ENV}"; unset ${HOOK_PATH_ENV}; "$hook_path"`;
 }
 
-/**
- * Hooks execute in the runtime's exec namespace, so the documented
- * XUM_PROJECT_DIR env value must be valid there (issue #3709).
- */
-function resolveExecProjectDir(runtime: Runtime, projectDir: string): string {
-  return runtime.mapPathForExec?.(projectDir) ?? projectDir;
+function getHookPathEnv(projectDir: string, hookPath: string): Record<string, string> {
+  return {
+    [HOOK_PATH_ENV]: hookPath,
+    XUM_PROJECT_DIR: projectDir,
+    MUX_PROJECT_DIR: projectDir,
+  };
 }
 
 function isAsyncIterable(value: unknown): value is AsyncIterable<unknown> {
@@ -85,8 +85,7 @@ async function getProjectOrGlobalConfigPath(
   for (const relativePath of listProjectMetadataRelativePaths(filename)) {
     const projectPath = joinPathLike(projectDir, relativePath);
     if (await isFile(runtime, projectPath)) {
-      // Hook and tool_env paths are embedded in exec scripts, so return them in that namespace.
-      return runtime.mapPathForExec?.(projectPath) ?? projectPath;
+      return projectPath;
     }
   }
   return getUserGlobalConfigPath(runtime, filename);
@@ -276,7 +275,6 @@ export async function runWithHook<T>(
     // Ensure the base JSON env var cannot be overwritten by flattened fields.
     XUM_TOOL_INPUT: toolInputEnv,
     XUM_WORKSPACE_ID: context.workspaceId,
-    XUM_PROJECT_DIR: resolveExecProjectDir(runtime, context.projectDir),
     XUM_EXEC: execMarker,
   };
   if (toolInputPath) {
@@ -315,11 +313,11 @@ export async function runWithHook<T>(
 
   let stream;
   try {
-    // Shell-escape the hook path to handle spaces and special characters
-    // runtime.exec() uses bash -c, so unquoted paths would break
-    stream = await runtime.exec(shellEscape(hookPath), {
+    stream = await runtime.exec(buildHookCommand(), {
       cwd: context.projectDir,
       env: hookEnv,
+      pathEnv: getHookPathEnv(context.projectDir, hookPath),
+      sandboxReadPaths: payloadReadPaths(toolInputPath),
       abortSignal: abortController.signal,
     });
   } catch (err) {
@@ -327,10 +325,12 @@ export async function runWithHook<T>(
       clearTimeout(preTimeoutHandle);
       preTimeoutHandle = undefined;
     }
-    log.error("[hooks] Failed to spawn hook", { hookPath, error: err });
+    // context.abortSignal is the caller's cancel. The internal controller also aborts on the
+    // pre-hook timeout, which must stay an error.
+    logHookFailure("Tool hook", hookPath, err, context.abortSignal);
     if (toolInputPath) {
       try {
-        await execBuffered(runtime, `rm -f ${shellEscape(toolInputPath)}`, {
+        await execBuffered(runtime, `rm -f ${shellQuote(toolInputPath)}`, {
           cwd: context.projectDir,
           timeout: 5,
         });
@@ -510,7 +510,7 @@ export async function runWithHook<T>(
 
   if (toolInputPath) {
     try {
-      await execBuffered(runtime, `rm -f ${shellEscape(toolInputPath)}`, {
+      await execBuffered(runtime, `rm -f ${shellQuote(toolInputPath)}`, {
         cwd: context.projectDir,
         timeout: 5,
       });
@@ -623,7 +623,6 @@ export async function runPreHook(
     // Ensure the base JSON env var cannot be overwritten by flattened fields.
     XUM_TOOL_INPUT: toolInputEnv,
     XUM_WORKSPACE_ID: context.workspaceId,
-    XUM_PROJECT_DIR: resolveExecProjectDir(runtime, context.projectDir),
   };
   if (toolInputPath) {
     canonicalHookEnv.XUM_TOOL_INPUT_PATH = toolInputPath;
@@ -631,9 +630,11 @@ export async function runPreHook(
   const hookEnv = withLegacyMuxEnvironmentAliases(canonicalHookEnv);
 
   try {
-    const result = await execBuffered(runtime, shellEscape(hookPath), {
+    const result = await execBuffered(runtime, buildHookCommand(), {
       cwd: context.projectDir,
       env: hookEnv,
+      pathEnv: getHookPathEnv(context.projectDir, hookPath),
+      sandboxReadPaths: payloadReadPaths(toolInputPath),
       timeout: Math.ceil(timeoutMs / 1000),
       abortSignal: context.abortSignal,
     });
@@ -645,7 +646,7 @@ export async function runPreHook(
       exitCode: result.exitCode ?? -1,
     };
   } catch (err) {
-    log.error("[hooks] Pre-hook execution failed", { hookPath, error: err });
+    logHookFailure("Pre-hook", hookPath, err, context.abortSignal);
     return {
       allowed: false,
       output: `Pre-hook failed: ${getErrorMessage(err)}`,
@@ -719,7 +720,6 @@ export async function runPostHook(
     // Ensure base JSON env vars cannot be overwritten by flattened fields.
     XUM_TOOL_INPUT: toolInputEnv,
     XUM_WORKSPACE_ID: context.workspaceId,
-    XUM_PROJECT_DIR: resolveExecProjectDir(runtime, context.projectDir),
     XUM_TOOL_RESULT: resultEnv,
   };
   if (toolInputPath) {
@@ -735,7 +735,7 @@ export async function runPostHook(
     if (!resultPathForEnv) return;
 
     try {
-      await execBuffered(runtime, `rm -f ${shellEscape(resultPathForEnv)}`, {
+      await execBuffered(runtime, `rm -f ${shellQuote(resultPathForEnv)}`, {
         cwd: context.projectDir,
         timeout: 5,
       });
@@ -745,9 +745,11 @@ export async function runPostHook(
   };
 
   try {
-    const result = await execBuffered(runtime, shellEscape(hookPath), {
+    const result = await execBuffered(runtime, buildHookCommand(), {
       cwd: context.projectDir,
       env: hookEnv,
+      pathEnv: getHookPathEnv(context.projectDir, hookPath),
+      sandboxReadPaths: payloadReadPaths(toolInputPath, resultPathForEnv),
       timeout: Math.ceil(timeoutMs / 1000),
       abortSignal: context.abortSignal,
     });
@@ -759,7 +761,7 @@ export async function runPostHook(
       exitCode: result.exitCode ?? -1,
     };
   } catch (err) {
-    log.error("[hooks] Post-hook execution failed", { hookPath, error: err });
+    logHookFailure("Post-hook", hookPath, err, context.abortSignal);
     return {
       success: false,
       output: `Post-hook failed: ${getErrorMessage(err)}`,
@@ -767,6 +769,28 @@ export async function runPostHook(
     };
   } finally {
     await cleanup();
+  }
+}
+
+/**
+ * The payload files a hook gets in XUM_TOOL_INPUT_PATH and XUM_TOOL_RESULT_PATH. They are in the
+ * stream's temp folder in the home folder, which the agent sandbox keeps closed.
+ */
+function payloadReadPaths(...paths: Array<string | undefined>): string[] {
+  return paths.filter((payload): payload is string => payload !== undefined);
+}
+
+function logHookFailure(
+  phase: "Tool hook" | "Pre-hook" | "Post-hook",
+  hookPath: string,
+  err: unknown,
+  abortSignal: AbortSignal | undefined
+): void {
+  // A cancelled tool call (user interrupt) aborts its hook before or during exec. That is expected, so it is not an error.
+  if (abortSignal?.aborted) {
+    log.debug(`[hooks] ${phase} skipped: tool call aborted`, { hookPath, error: err });
+  } else {
+    log.error(`[hooks] ${phase} execution failed`, { hookPath, error: err });
   }
 }
 
@@ -803,7 +827,7 @@ async function prepareToolInput(
   const cleanup = async () => {
     if (toolInputPath) {
       try {
-        await execBuffered(runtime, `rm -f ${shellEscape(toolInputPath)}`, {
+        await execBuffered(runtime, `rm -f ${shellQuote(toolInputPath)}`, {
           cwd: projectDir,
           timeout: 5,
         });

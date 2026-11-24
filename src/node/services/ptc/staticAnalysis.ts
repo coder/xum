@@ -10,6 +10,7 @@
  */
 
 import ts from "typescript";
+import { MAX_MULTILINE_STRING_PARSE_CHARACTERS } from "@/constants/codeExecution";
 import {
   newQuickJSAsyncWASMModuleFromVariant,
   type QuickJSAsyncContext,
@@ -102,6 +103,58 @@ async function getValidationContext(): Promise<QuickJSAsyncContext> {
 // ============================================================================
 // Analysis Functions
 // ============================================================================
+
+/**
+ * LLMs often put literal newlines in quoted shell scripts/file contents. Accept
+ * that spelling instead of requiring a retry, without turning shell ${...} or
+ * backticks into JavaScript interpolation. All other JS escaping stays intact.
+ * The caller must analyze AND execute the returned source.
+ */
+export function normalizeMultilineStrings(code: string): string {
+  const findUnterminatedString = (node: ts.Node): ts.StringLiteral | undefined =>
+    ts.isStringLiteral(node) && node.isUnterminated
+      ? node
+      : ts.forEachChild(node, findUnterminatedString);
+
+  let remainingParseCharacters = MAX_MULTILINE_STRING_PARSE_CHARACTERS;
+  while (code.length <= remainingParseCharacters) {
+    remainingParseCharacters -= code.length;
+    // Let the parser distinguish strings from regexes, comments, and template
+    // text. Reparse after each repair: nodes after a broken string are unreliable.
+    const sourceFile = ts.createSourceFile(
+      "code.js",
+      code,
+      ts.ScriptTarget.Latest,
+      true,
+      ts.ScriptKind.JS
+    );
+    const node = findUnterminatedString(sourceFile);
+    if (!node) return code;
+
+    const start = node.getStart(sourceFile);
+    const quote = code[start];
+    let end = start + 1;
+    for (; end < code.length; end++) {
+      if (code[end] === "\\") {
+        end++; // An escaped quote cannot close the string.
+      } else if (code[end] === quote) {
+        break;
+      }
+    }
+    // Do not invent closing quotes or try to repair other syntax errors.
+    if (end >= code.length) return code;
+
+    const literal = code.slice(start, end + 1);
+    const normalized = literal.replace(/\\(?:\r\n|[\s\S])|\r\n|[\r\n]/g, (text) =>
+      // Preserve existing escapes (including line continuations). Encode only
+      // raw newlines, retaining a continuation so diagnostic lines do not move.
+      text.startsWith("\\") ? text : JSON.stringify(text).slice(1, -1) + "\\" + text
+    );
+    if (normalized === literal) return code;
+    code = code.slice(0, start) + normalized + code.slice(end + 1);
+  }
+  return code;
+}
 
 /**
  * Find lines containing AwaitExpression nodes in the TypeScript AST.
@@ -265,7 +318,6 @@ function detectUnavailableGlobals(code: string, sourceFile?: ts.SourceFile): Ana
       }
     }
 
-    // Only check identifier nodes
     if (!ts.isIdentifier(node)) {
       ts.forEachChild(node, visit);
       return;
@@ -388,12 +440,11 @@ export async function analyzeCode(code: string, xumTypes?: string): Promise<Anal
 }
 
 /**
- * Clean up the cached validation context.
- * Call this when shutting down to free resources.
- *
- * TODO: Wire into app/workspace shutdown to free QuickJS context (Phase 6)
+ * Test reset hook: dispose the cached QuickJS validation context. Production keeps the
+ * context for the process lifetime; tests dispose it so shared test processes do not
+ * accumulate QuickJS contexts.
  */
-export function disposeAnalysisContext(): void {
+export function disposeAnalysisContextForTests(): void {
   if (cachedContext) {
     cachedContext.dispose();
     cachedContext = null;

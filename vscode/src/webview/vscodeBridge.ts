@@ -18,6 +18,9 @@ function safeStringify(value: unknown): string {
   }
 }
 
+// VS Code injects this global into the webview.
+declare function acquireVsCodeApi(): { postMessage: (data: unknown) => void };
+
 let cachedBridge: VscodeBridge | null = null;
 
 export function getVscodeBridge(): VscodeBridge {
@@ -25,13 +28,11 @@ export function getVscodeBridge(): VscodeBridge {
     return cachedBridge;
   }
 
-  const traceId =
-    (document.body && document.body.dataset && document.body.dataset.muxTraceId) || "unknown";
+  // eslint-disable-next-line @typescript-eslint/prefer-nullish-coalescing -- an empty trace id also falls back to "unknown"
+  const traceId = document.body?.dataset?.muxTraceId || "unknown";
 
   let vscode: { postMessage: (data: unknown) => void };
   try {
-    // eslint-disable-next-line @typescript-eslint/ban-ts-comment
-    // @ts-ignore VS Code injects this in the webview
     vscode = acquireVsCodeApi();
   } catch (error) {
     throw new Error(`mux webview: acquireVsCodeApi failed: ${String(error)}`);
@@ -54,7 +55,6 @@ export function getVscodeBridge(): VscodeBridge {
       try {
         handler(event.data);
       } catch (error) {
-        // eslint-disable-next-line no-console
         console.error("mux webview: message handler crashed", error);
       }
     }
@@ -76,7 +76,6 @@ export function getVscodeBridge(): VscodeBridge {
 
   const debugLog = (message: string, data?: unknown): void => {
     // Mirror to DevTools console.
-    // eslint-disable-next-line no-console
     console.log(`[mux-webview ${traceId}] ${message}`, data);
 
     try {

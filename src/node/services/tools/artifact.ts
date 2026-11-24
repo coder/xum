@@ -1,0 +1,101 @@
+import { tool } from "ai";
+import * as path from "path";
+import { TOOL_DEFINITIONS, type ArtifactToolResult } from "@/common/utils/tools/toolDefinitions";
+import type { ToolFactory } from "@/common/utils/tools/tools";
+import { getErrorMessage } from "@/common/utils/errors";
+import { assert } from "@/common/utils/assert";
+import { ARTIFACTS_UNAVAILABLE_REASON } from "@/node/services/artifactsOperations";
+import { PROJECT_SHELF_MULTI_PROJECT_ERROR } from "@/node/services/artifactShelf";
+import { pinArtifactToShelf } from "@/node/services/artifactShelfOperations";
+import {
+  getToolArtifactsLocation,
+  publishArtifact,
+  resolveArtifactToolPath,
+} from "@/node/services/artifactPublishOperations";
+import { checkArtifactLayout } from "@/node/services/layoutAudit/checkArtifactLayout";
+
+/**
+ * `artifact` tool (Artifacts M4): publish a file from $XUM_SCRATCH_DIR/artifacts. The result
+ * stays tiny on purpose: the chat card renders from it alone (it must survive compaction and
+ * older-history paging), and the model gains nothing from content.
+ */
+export const createArtifactTool: ToolFactory = (config) =>
+  tool({
+    description: TOOL_DEFINITIONS.artifact.description,
+    inputSchema: TOOL_DEFINITIONS.artifact.schema,
+    execute: async (input, { abortSignal }): Promise<ArtifactToolResult> => {
+      const sessionDir = config.workspaceSessionDir;
+      assert(sessionDir, "artifact tool requires workspaceSessionDir");
+      const location = await getToolArtifactsLocation(config);
+      if (location == null) return { success: false, error: ARTIFACTS_UNAVAILABLE_REASON };
+      const relPath = resolveArtifactToolPath(location, input.path);
+      if (typeof relPath !== "string") return { success: false, error: relPath.error };
+      const title = input.title?.trim() ? input.title.trim() : path.posix.basename(relPath);
+      // Same identity rule as memory: a multi-project workspace has no project shelf. Refused
+      // before publishing so a failed pin request leaves no half-done state behind.
+      const projectIdentity =
+        (config.projects?.length ?? 0) > 1 ? "" : (config.workspaceProjectPath ?? "");
+      if (input.pin === "project" && projectIdentity === "") {
+        return { success: false, error: PROJECT_SHELF_MULTI_PROJECT_ERROR };
+      }
+      try {
+        const published = await publishArtifact({
+          sessionDir,
+          location,
+          relPath,
+          title,
+          kind: input.kind ?? undefined,
+          // Persisted for the shelf; an omitted pin keeps a previously requested one.
+          pin: input.pin ?? undefined,
+          abortSignal,
+        });
+        if (!published.success) return { success: false, error: published.error };
+        if (input.pin != null) {
+          // M5c: the pin copies the file's current bytes to the shelf (no user approval needed;
+          // the shelf labels it "pinned by agent" and the user can unpin it in one click).
+          const shelfRoot = config.artifactShelfRoot;
+          if (shelfRoot == null) {
+            return { success: false, error: "The artifact shelf is not available here" };
+          }
+          const pinned = await pinArtifactToShelf({
+            shelfRoot,
+            projectIdentity,
+            scope: input.pin,
+            sessionDir,
+            location,
+            workspaceId: config.workspaceId ?? "",
+            relPath,
+            pinnedBy: "agent",
+            abortSignal,
+          });
+          if (!pinned.success) {
+            return {
+              success: false,
+              error: `Published ${relPath}, but pinning failed: ${pinned.error}`,
+            };
+          }
+        }
+        return {
+          success: true,
+          path: relPath,
+          bytes: published.size,
+          kind: published.kind,
+          title: published.record.title,
+          pin: published.record.pin,
+          // HTML only (undefined for other kinds); never fails the publish.
+          layout: await checkArtifactLayout({
+            kind: published.kind,
+            runtime: config.runtime,
+            cwd: config.cwd,
+            trusted: config.trusted,
+            location,
+            relPath,
+            sessionDir,
+            abortSignal,
+          }),
+        };
+      } catch (error) {
+        return { success: false, error: `Publishing failed: ${getErrorMessage(error)}` };
+      }
+    },
+  });

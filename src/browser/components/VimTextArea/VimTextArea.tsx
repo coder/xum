@@ -1,10 +1,9 @@
-import React, { useEffect, useMemo, useRef, useState } from "react";
+import React, { useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { useAutoResizeTextarea } from "@/browser/hooks/useAutoResizeTextarea";
 import * as vim from "@/browser/utils/vim";
 import { stopKeyboardPropagation } from "@/browser/utils/events";
 import { cn } from "@/common/lib/utils";
-import { usePersistedState } from "@/browser/hooks/usePersistedState";
-import { VIM_ENABLED_KEY } from "@/common/constants/storage";
+import { useUserPreferences } from "@/browser/stores/AppConfigStore";
 
 /**
  * VimTextArea – minimal Vim-like editing for a textarea.
@@ -33,12 +32,29 @@ export interface VimTextAreaProps extends Omit<
   ghostHint?: string | null;
   /** Called when Escape is pressed in normal mode (vim) - useful for cancel edit */
   onEscapeInNormalMode?: () => void;
+  /**
+   * Called just before onChange when a key Vim handles (a normal-mode command such as `cc`, `dd`
+   * or `x`) changes the text. Those edits fire no `beforeinput`.
+   */
+  onKeyEdit?: (previous: string, next: string) => void;
 }
 
 type VimMode = vim.VimMode;
 
 export const VimTextArea = React.forwardRef<HTMLTextAreaElement, VimTextAreaProps>(
-  ({ value, onChange, suppressKeys, onKeyDown, ghostHint, onEscapeInNormalMode, ...rest }, ref) => {
+  (
+    {
+      value,
+      onChange,
+      suppressKeys,
+      onKeyDown,
+      ghostHint,
+      onEscapeInNormalMode,
+      onKeyEdit,
+      ...rest
+    },
+    ref
+  ) => {
     const textareaRef = useRef<HTMLTextAreaElement | null>(null);
     // Expose DOM ref to parent
     useEffect(() => {
@@ -46,7 +62,9 @@ export const VimTextArea = React.forwardRef<HTMLTextAreaElement, VimTextAreaProp
       if (typeof ref === "function") ref(textareaRef.current);
       else ref.current = textareaRef.current;
     }, [ref]);
-    const [vimEnabled] = usePersistedState(VIM_ENABLED_KEY, false, { listener: true });
+    const vimEnabled = useUserPreferences(
+      (preferences) => preferences.appearance?.vimEnabled === true
+    );
 
     const [vimMode, setVimMode] = useState<VimMode>("insert");
     useEffect(() => {
@@ -78,18 +96,24 @@ export const VimTextArea = React.forwardRef<HTMLTextAreaElement, VimTextAreaProp
     const insertStartSnapshotRef = useRef<vim.VimHistorySnapshot | null>(null);
     const lastEditRef = useRef<vim.LastEdit | null>(null);
     const cursorRef = useRef<number>(0);
+    // #6866: the DOM caret must reach the Vim cursor before the next key, which reads it. A key that
+    // changed the text moves it once the new value is rendered (the layout effect below); the
+    // value write puts the caret at the end. A timeout here let fast keys read a stale caret.
+    const pendingSelectionRef = useRef<{ text: string; state: vim.VimState } | null>(null);
 
     useAutoResizeTextarea(textareaRef, value, 50, rest.className);
 
     const suppressSet = useMemo(() => new Set(suppressKeys ?? []), [suppressKeys]);
 
     const withSelection = () => {
+      // eslint-disable-next-line @typescript-eslint/no-non-null-assertion -- legacy site from before the ban; remove when touching this line
       const el = textareaRef.current!;
       return { start: el.selectionStart, end: el.selectionEnd };
     };
 
     const applyDomSelection = (next: Pick<vim.VimState, "cursor" | "mode" | "visualAnchor">) => {
-      const el = textareaRef.current!;
+      const el = textareaRef.current;
+      if (!el) return;
       const domText = el.value;
       const clamp = (pos: number) => Math.max(0, Math.min(domText.length, pos));
 
@@ -141,9 +165,12 @@ export const VimTextArea = React.forwardRef<HTMLTextAreaElement, VimTextAreaProp
       if (suppressSet.has(e.key)) return;
 
       // Build current Vim state
-      const selection = withSelection();
-      const cursor =
-        vimMode === "visual" || vimMode === "visualLine" ? cursorRef.current : selection.start;
+      const cursor = vimCursorFor({
+        mode: vimMode,
+        text: value,
+        domCursor: withSelection().start,
+        vimCursor: cursorRef.current,
+      });
 
       // Keep the cursor ref in sync for mode transitions (normal -> visual, etc.).
       cursorRef.current = cursor;
@@ -152,7 +179,8 @@ export const VimTextArea = React.forwardRef<HTMLTextAreaElement, VimTextAreaProp
         text: value,
         cursor,
         mode: vimMode,
-        visualAnchor,
+        // #6944: like the cursor, the anchor can sit past a text that shrank between keys.
+        visualAnchor: visualAnchor === null ? null : clampVimPosition(visualAnchor, value, vimMode),
         yankBuffer: yankBufferRef.current,
         desiredColumn,
         lastFind: lastFindRef.current,
@@ -189,6 +217,7 @@ export const VimTextArea = React.forwardRef<HTMLTextAreaElement, VimTextAreaProp
       cursorRef.current = newState.cursor;
 
       if (newState.text !== value) {
+        onKeyEdit?.(value, newState.text);
         onChange(newState.text, newState.cursor);
       }
       if (newState.mode !== vimMode) {
@@ -225,13 +254,24 @@ export const VimTextArea = React.forwardRef<HTMLTextAreaElement, VimTextAreaProp
         setPending(newState.pending);
       }
 
-      // Apply DOM selection after React state updates (important for mode transitions)
-      setTimeout(() => applyDomSelection(newState), 0);
+      // Move the DOM caret now, or once the changed text is rendered (see pendingSelectionRef).
+      if (newState.text === value) applyDomSelection(newState);
+      else pendingSelectionRef.current = { text: newState.text, state: newState };
     };
+
+    // Runs after every commit, before the browser handles the next key. Only for the text the key
+    // produced: a parent that rewrote or refused it leaves the caret where the browser put it.
+    useLayoutEffect(() => {
+      const pendingSelection = pendingSelectionRef.current;
+      if (pendingSelection === null) return;
+      pendingSelectionRef.current = null;
+      if (pendingSelection.text === value) applyDomSelection(pendingSelection.state);
+    });
 
     const textareaStyle: React.CSSProperties = {
       // Mirror textarea defaults in inline styles so ghost hint overlay can reuse exact metrics.
       padding: "0.375rem 0.5rem",
+      // Phones keep this size too: iOS focus zoom is stopped by installIosFocusZoomGuard.
       fontSize: "13px",
       ...(rest.style ?? {}),
     };
@@ -312,3 +352,26 @@ export const VimTextArea = React.forwardRef<HTMLTextAreaElement, VimTextAreaProp
 );
 
 VimTextArea.displayName = "VimTextArea";
+
+/**
+ * The cursor a key starts from: the DOM caret, which the browser moves itself too (Home, arrows,
+ * a click), or the Vim cursor in visual modes, where the DOM shows a range. Clamped to the text
+ * (#6866): it can change between keys (a send took its draft, a value write put the caret at the
+ * end), and a normal-mode cursor never sits past the last character.
+ */
+function vimCursorFor(input: {
+  mode: vim.VimMode;
+  text: string;
+  domCursor: number;
+  vimCursor: number;
+}): number {
+  const usesVimCursor = input.mode === "visual" || input.mode === "visualLine";
+  const cursor = usesVimCursor ? input.vimCursor : input.domCursor;
+  return clampVimPosition(cursor, input.text, input.mode);
+}
+
+/** A position inside `text` for `mode`: outside insert mode it never sits past the last character. */
+function clampVimPosition(position: number, text: string, mode: vim.VimMode): number {
+  const max = mode === "insert" ? text.length : Math.max(0, text.length - 1);
+  return Math.max(0, Math.min(position, max));
+}

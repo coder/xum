@@ -1,6 +1,5 @@
 import { electronTest as test, electronExpect as expect } from "../electronTest";
 import { getXumE2EEnv } from "../env";
-import { REVIEW_SORT_ORDER_KEY, getReviewStateKey } from "../../../src/common/constants/storage";
 import { STORAGE_KEYS } from "../../../src/constants/workspaceDefaults";
 import {
   readReactProfileSnapshot,
@@ -8,7 +7,11 @@ import {
   withChromeProfiles,
   writePerfArtifacts,
 } from "../utils/perfProfile";
-import { LARGE_CHANGE_ROOT, seedLargeReviewDiff } from "../utils/reviewPerfFixture";
+import {
+  LARGE_CHANGE_ROOT,
+  seedLargeReviewDiff,
+  setReviewPreferences,
+} from "../utils/reviewPerfFixture";
 
 const shouldRunPerfScenarios = getXumE2EEnv("E2E_RUN_PERF") === "1";
 
@@ -27,21 +30,13 @@ test.describe("immersive review performance profiling", () => {
   }, testInfo) => {
     const diffSummary = seedLargeReviewDiff(workspace.demoProject.workspacePath);
     const reviewDiffBaseKey = STORAGE_KEYS.reviewDiffBase(workspace.demoProject.workspaceId);
-    const reviewStateKey = getReviewStateKey(workspace.demoProject.workspaceId);
 
     // The demo repo has no origin/main, so the perf scenario pins Review to HEAD before
     // the panel mounts. That keeps the scenario focused on a real local git diff.
-    await page.evaluate(
-      ({ diffBaseKey, sortOrderKey }) => {
-        window.localStorage.setItem(diffBaseKey, JSON.stringify("HEAD"));
-        window.localStorage.setItem("review-show-read", JSON.stringify(true));
-        window.localStorage.setItem(sortOrderKey, JSON.stringify("file-order"));
-      },
-      {
-        diffBaseKey: reviewDiffBaseKey,
-        sortOrderKey: REVIEW_SORT_ORDER_KEY,
-      }
-    );
+    await page.evaluate((diffBaseKey) => {
+      window.localStorage.setItem(diffBaseKey, JSON.stringify("HEAD"));
+    }, reviewDiffBaseKey);
+    await setReviewPreferences(page, { showRead: true, sortOrder: "file-order" });
 
     await ui.projects.openFirstWorkspace();
     await ui.metaSidebar.expectVisible();
@@ -82,22 +77,22 @@ test.describe("immersive review performance profiling", () => {
       await expect(immersiveReview.getByRole("button", { name: "Mark hunk as read" })).toBeVisible({
         timeout: 20_000,
       });
+      // Read state lives in the backend review-state store now; the completion bar reflects
+      // the composed store view the mark-read click updated.
       await expect
         .poll(
-          () =>
-            page.evaluate((key) => {
-              const raw = window.localStorage.getItem(key);
-              if (!raw) {
-                return 0;
-              }
-              const parsed = JSON.parse(raw) as {
-                readState?: Record<string, { isRead?: boolean }>;
-              };
-              return Object.values(parsed.readState ?? {}).filter((entry) => entry.isRead).length;
-            }, reviewStateKey),
+          async () => {
+            // aria-valuenow is a rounded percentage: one hunk out of this fixture's 1000 rounds
+            // to 0, so read the exact reviewed line count from aria-valuetext ("... (reviewed/total)").
+            const valueText = await immersiveReview
+              .getByRole("progressbar", { name: "Review completion by changed lines" })
+              .getAttribute("aria-valuetext");
+            const reviewedLines = /\((\d+)\/\d+\)$/.exec(valueText ?? "")?.[1];
+            return reviewedLines === undefined ? 0 : Number(reviewedLines);
+          },
           { timeout: 20_000 }
         )
-        .toBe(1);
+        .toBeGreaterThan(0);
     });
 
     const reactProfileSnapshot = await readReactProfileSnapshot(page);

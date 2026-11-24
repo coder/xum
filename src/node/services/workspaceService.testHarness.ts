@@ -1,0 +1,404 @@
+// Shared fixtures for the workspaceService.*.test.ts suites (split from workspaceService.test.ts).
+import { expect, mock } from "bun:test";
+import { Err, Ok } from "@/common/types/result";
+import { ContextManagementService } from "./contextManagement/contextManagementService";
+import { WorkspaceService } from "./workspaceService";
+import {
+  createAgentSessionAIServiceFake,
+  createStreamLifecycleMocks,
+  createTestStreamManager,
+  type AgentSessionAIServiceFake,
+  type StreamLifecycle,
+} from "./agentSession.testHarness";
+import type { StreamManager } from "./streamManager";
+import type { AgentSession } from "./agentSession";
+import type { WorkspaceChatMessage } from "@/common/orpc/types";
+import { defaultEffectRunner } from "./di/effectRunner";
+import { Exit, Scope } from "effect";
+import type { EventEmitter } from "events";
+import * as fsPromises from "fs/promises";
+import { tmpdir } from "os";
+import path from "path";
+import type { Config } from "@/node/config";
+import { HistoryService } from "./historyService";
+import type { AIService } from "./aiService";
+import { InitStateManager } from "./initStateManager";
+import { ExtensionMetadataService } from "./ExtensionMetadataService";
+import type { FrontendWorkspaceMetadata } from "@/common/types/workspace";
+import { BackgroundProcessManager } from "./backgroundProcessManager";
+import { createTestHistoryService } from "./testHistoryService";
+import { getPlanFilePath } from "@/common/utils/planStorage";
+import type { WorkspaceGoalService } from "./workspaceGoalService";
+import type { GoalRecordV1 } from "@/common/types/goal";
+
+// Policy fixtures do not run a session; runtime cancellation races use real session fixtures.
+export function createCompactionAdmissionMocks() {
+  return {
+    captureCompactionAdmission: mock(() => () => false),
+    beginResumeIntent: mock(() => ({
+      signal: new AbortController().signal,
+      [Symbol.dispose]: () => undefined,
+    })),
+  };
+}
+
+// Rename/archive gate tests hold these private in-progress sets open directly: a real rename or
+// archive would release the gate before the guarded call could observe it. Element access keeps
+// the member names and Set types checked by TypeScript (no `any`).
+export function addToRenamingWorkspaces(service: WorkspaceService, workspaceId: string): void {
+  // eslint-disable-next-line @typescript-eslint/dot-notation -- private member, typed access
+  service["renamingWorkspaces"].add(workspaceId);
+}
+
+export function addToArchivingWorkspaces(service: WorkspaceService, workspaceId: string): void {
+  // eslint-disable-next-line @typescript-eslint/dot-notation -- private member, typed access
+  service["archivingWorkspaces"].add(workspaceId);
+}
+
+export async function withTempMuxRoot<T>(fn: (root: string) => Promise<T>): Promise<T> {
+  const originalMuxRoot = process.env.MUX_ROOT;
+  const tempRoot = await fsPromises.mkdtemp(path.join(tmpdir(), "mux-plan-"));
+  process.env.MUX_ROOT = tempRoot;
+
+  try {
+    return await fn(tempRoot);
+  } finally {
+    if (originalMuxRoot === undefined) {
+      delete process.env.MUX_ROOT;
+    } else {
+      process.env.MUX_ROOT = originalMuxRoot;
+    }
+    await fsPromises.rm(tempRoot, { recursive: true, force: true });
+  }
+}
+
+export async function writePlanFile(
+  root: string,
+  projectName: string,
+  workspaceName: string
+): Promise<string> {
+  const planFile = getPlanFilePath(workspaceName, projectName, root);
+  await fsPromises.mkdir(path.dirname(planFile), { recursive: true });
+  await fsPromises.writeFile(planFile, "# Plan\n");
+  return planFile;
+}
+
+export function createDeferred<T>() {
+  let resolve!: (value: T | PromiseLike<T>) => void;
+  let reject!: (reason?: unknown) => void;
+  const promise = new Promise<T>((res, rej) => {
+    resolve = res;
+    reject = rej;
+  });
+  return { promise, resolve, reject };
+}
+
+/** Real manager with no processes; its output dir is only created if a test spawns one. */
+export function createTestBackgroundProcessManager(): BackgroundProcessManager {
+  return new BackgroundProcessManager(
+    path.join(tmpdir(), `xum-test-bg-${Date.now()}-${Math.random().toString(36).slice(2)}`)
+  );
+}
+
+export type WorkspaceServiceArgs = ConstructorParameters<typeof WorkspaceService>;
+
+/**
+ * AI-service fake with every member WorkspaceService and AgentSession call unconditionally:
+ * no provider config, no experiments, and no workspace metadata (the real service's answer
+ * for an unknown workspace). Tests override the members they drive.
+ */
+export function createMockAIService(overrides: Partial<AIService> = {}): AIService {
+  return {
+    on: mock(() => undefined),
+    off: mock(() => undefined),
+    ...createStreamLifecycleMocks(),
+    getProvidersConfig: mock(() => null),
+    isExperimentEnabled: mock(() => false),
+    getWorkspaceMetadata: mock((workspaceId: string) =>
+      Promise.resolve(Err(`Workspace metadata not found for ${workspaceId}`))
+    ),
+    ...overrides,
+  } as unknown as AIService;
+}
+
+export interface WorkspaceServiceForTestOptions {
+  config: Config;
+  historyService?: HistoryService;
+  aiService?: AIService;
+  initStateManager?: InitStateManager;
+  extensionMetadata?: ExtensionMetadataService;
+  backgroundProcessManager?: BackgroundProcessManager;
+  sessionUsageService?: WorkspaceServiceArgs[7];
+  telemetryService?: WorkspaceServiceArgs[8];
+  experimentsService?: WorkspaceServiceArgs[9];
+  sessionTimingService?: WorkspaceServiceArgs[10];
+  streamManager?: WorkspaceServiceArgs[11];
+  secretsStore?: WorkspaceServiceArgs[12];
+  effectRunner?: WorkspaceServiceArgs[15];
+  /** App fiber scope whose close runs the service's shutdown join. */
+  appFiberScope?: WorkspaceServiceArgs[16];
+  /** Pass it with `effectRunner` from one makeTestEffectRunner(), so both share one clock. */
+  hostClock?: WorkspaceServiceArgs[18];
+}
+
+/**
+ * Low-level constructor for tests that already own their Config. Omitted stores default to
+ * real instances rooted in that Config. Prefer createWorkspaceServiceHarness, which also
+ * owns the temp root and its cleanup.
+ */
+export function createWorkspaceServiceForTest(
+  options: WorkspaceServiceForTestOptions
+): WorkspaceService {
+  const config = options.config;
+  const historyService = options.historyService ?? new HistoryService(config);
+  const aiService = options.aiService ?? createMockAIService();
+  // The sessions' stream lifecycle answers from the AI fake (createMockAIService implements it),
+  // so tests drive streaming state through the fake they already hold.
+  const streamManager =
+    options.streamManager ??
+    (createTestStreamManager(
+      aiService as unknown as StreamLifecycle,
+      options.effectRunner,
+      options.hostClock
+    ) as unknown as StreamManager);
+  return new WorkspaceService(
+    config,
+    historyService,
+    aiService,
+    new ContextManagementService({
+      config,
+      historyService,
+      aiService,
+      sessionUsageService: options.sessionUsageService,
+      telemetryService: options.telemetryService,
+    }),
+    options.initStateManager ?? new InitStateManager(config),
+    options.extensionMetadata ??
+      new ExtensionMetadataService(path.join(config.rootDir, "extensionMetadata.json")),
+    options.backgroundProcessManager ?? createTestBackgroundProcessManager(),
+    options.sessionUsageService,
+    options.telemetryService,
+    options.experimentsService,
+    options.sessionTimingService,
+    streamManager,
+    options.secretsStore,
+    undefined,
+    undefined,
+    options.effectRunner,
+    options.appFiberScope,
+    undefined,
+    options.hostClock
+  );
+}
+
+export type WorkspaceServiceHarnessOptions = Omit<
+  WorkspaceServiceForTestOptions,
+  "config" | "historyService"
+> & {
+  /**
+   * Members layered over the default AI fake (ignored when `aiService` is passed). The
+   * default answers getWorkspaceMetadata from the harness's real Config, as AIService does.
+   */
+  aiServiceOverrides?: Partial<AIService>;
+};
+
+export interface WorkspaceServiceHarness extends AsyncDisposable {
+  service: WorkspaceService;
+  config: Config;
+  historyService: HistoryService;
+  aiService: AIService;
+  initStateManager: InitStateManager;
+  extensionMetadata: ExtensionMetadataService;
+  backgroundProcessManager: BackgroundProcessManager;
+  /** Temp root that owns config.json, sessions/, and the managers' files. */
+  rootDir: string;
+  cleanup: () => Promise<void>;
+}
+
+/**
+ * Default WorkspaceService fixture. Every dependency is a real instance rooted in one
+ * temp directory (Config, HistoryService, InitStateManager, ExtensionMetadataService,
+ * BackgroundProcessManager) except the AI service, which is a stream-lifecycle fake
+ * because a real one needs providers. Seed state through the real stores
+ * (`config.editConfig`/`config.addWorkspace`, `historyService.appendToHistory`) and
+ * assert against them instead of hand-written partial doubles.
+ */
+export async function createWorkspaceServiceHarness(
+  options: WorkspaceServiceHarnessOptions = {}
+): Promise<WorkspaceServiceHarness> {
+  const { config, historyService, tempDir, cleanup } = await createTestHistoryService();
+  const { aiServiceOverrides, ...serviceOptions } = options;
+  const aiService =
+    options.aiService ??
+    createMockAIService({
+      getWorkspaceMetadata: mock(async (workspaceId: string) => {
+        const metadata = await config.getWorkspaceMetadataById(workspaceId);
+        return metadata ? Ok(metadata) : Err(`Workspace metadata not found for ${workspaceId}`);
+      }),
+      ...aiServiceOverrides,
+    });
+  const initStateManager = options.initStateManager ?? new InitStateManager(config);
+  const extensionMetadata =
+    options.extensionMetadata ??
+    new ExtensionMetadataService(path.join(tempDir, "extensionMetadata.json"));
+  const ownedBackgroundProcessManager =
+    options.backgroundProcessManager == null
+      ? new BackgroundProcessManager(path.join(tempDir, "background-processes"))
+      : undefined;
+  const backgroundProcessManager =
+    options.backgroundProcessManager ?? ownedBackgroundProcessManager!;
+  const service = createWorkspaceServiceForTest({
+    ...serviceOptions,
+    config,
+    historyService,
+    aiService,
+    initStateManager,
+    extensionMetadata,
+    backgroundProcessManager,
+  });
+  // Stop processes a test spawned through the owned manager before deleting the root that
+  // holds their output files; a surviving child could outlive the test run.
+  const disposeHarness = async () => {
+    await ownedBackgroundProcessManager?.terminateAll();
+    await cleanup();
+  };
+  return {
+    service,
+    config,
+    historyService,
+    aiService,
+    initStateManager,
+    extensionMetadata,
+    backgroundProcessManager,
+    rootDir: tempDir,
+    cleanup: disposeHarness,
+    [Symbol.asyncDispose]: disposeHarness,
+  };
+}
+
+export type RealHostWorkspaceServiceOptions = Omit<
+  WorkspaceServiceForTestOptions,
+  "aiService" | "historyService" | "appFiberScope"
+> & {
+  /** The suite's real store: TaskService stacks built on the same root share it. */
+  historyService: HistoryService;
+  /** Event source of the AI fake; tests emit stream events on it. */
+  aiEmitter?: EventEmitter;
+  /** Members layered over the AI fake (getWorkspaceMetadata defaults to the real Config). */
+  aiServiceOverrides?: Partial<RealHostAIService>;
+  /** Set before any session exists: AgentSession captures the goal service when created. */
+  workspaceGoalService?: WorkspaceGoalService;
+};
+
+/** The AIService members a real-host WorkspaceService and its sessions call. */
+export type RealHostAIService = AgentSessionAIServiceFake &
+  Pick<AIService, "getAutomaticGoalTurnAgentRefusal">;
+
+export interface RealHostWorkspaceService extends AsyncDisposable {
+  service: WorkspaceService;
+  /** One AI fake for the service and every session, as the shared AIService is in production. */
+  aiService: AIService;
+  aiEmitter: EventEmitter;
+  /**
+   * The workspace's real session, created by `getOrCreateSession`: it carries the callbacks
+   * `createSession` installs (turn settlement events, stop latch, report acknowledgement).
+   */
+  session: (workspaceId: string) => AgentSession;
+  /** Chat events the service relayed from the workspace's session, in order. */
+  chatEvents: (workspaceId: string) => WorkspaceChatMessage[];
+  /**
+   * Closes the app fiber scope, which runs the service's production shutdown join: every
+   * session's shutdown and the tracked workspace cleanup. Idempotent.
+   */
+  dispose: () => Promise<void>;
+}
+
+/**
+ * Real-host WorkspaceService for tests that drive turns through a real AgentSession: only the
+ * AI stream is a fake. Sessions come from the service itself (never a write to its private
+ * session map), so they are wired exactly as in production.
+ */
+export function createRealHostWorkspaceService(
+  options: RealHostWorkspaceServiceOptions
+): RealHostWorkspaceService {
+  const {
+    aiEmitter: emitter,
+    aiServiceOverrides,
+    workspaceGoalService,
+    ...serviceOptions
+  } = options;
+  const config = options.config;
+  const aiFake = Object.assign(
+    createAgentSessionAIServiceFake({
+      emitter,
+      overrides: {
+        getWorkspaceMetadata: mock(async (workspaceId: string) => {
+          const metadata = await config.getWorkspaceMetadataById(workspaceId);
+          return metadata ? Ok(metadata) : Err(`Workspace metadata not found for ${workspaceId}`);
+        }),
+        ...aiServiceOverrides,
+      },
+    }),
+    {
+      // AIService answers null when the workspace's agent resolves for an automatic goal turn.
+      getAutomaticGoalTurnAgentRefusal:
+        aiServiceOverrides?.getAutomaticGoalTurnAgentRefusal ??
+        mock((_workspaceId: string, _options: unknown) => Promise.resolve(null)),
+    }
+  ) satisfies RealHostAIService;
+  // The fake implements every member WorkspaceService and its sessions call (RealHostAIService);
+  // the full class also has members only other services use.
+  const aiService = aiFake as unknown as AIService;
+  const appFiberScope = Scope.makeUnsafe("parallel");
+  const service = createWorkspaceServiceForTest({ ...serviceOptions, aiService, appFiberScope });
+  if (workspaceGoalService != null) service.setWorkspaceGoalService(workspaceGoalService);
+  const events = new Map<string, WorkspaceChatMessage[]>();
+  service.on("chat", (event: { workspaceId: string; message: WorkspaceChatMessage }) => {
+    const list = events.get(event.workspaceId) ?? [];
+    list.push(event.message);
+    events.set(event.workspaceId, list);
+  });
+  let closing: Promise<void> | undefined;
+  const dispose = () => {
+    closing ??= (options.effectRunner ?? defaultEffectRunner).runPromise(
+      Scope.close(appFiberScope, Exit.void)
+    );
+    return closing;
+  };
+  return {
+    service,
+    aiService,
+    aiEmitter: aiFake,
+    session: (workspaceId) => service.getOrCreateSession(workspaceId),
+    chatEvents: (workspaceId) => events.get(workspaceId) ?? [],
+    dispose,
+    [Symbol.asyncDispose]: dispose,
+  };
+}
+
+export async function setWorkspaceGoalOk(
+  goalService: WorkspaceGoalService,
+  input: Parameters<WorkspaceGoalService["setGoal"]>[0]
+): Promise<GoalRecordV1> {
+  const result = await goalService.setGoal(input);
+  expect(result.success).toBe(true);
+  if (!result.success) {
+    throw new Error(`Expected goal set to succeed, got ${JSON.stringify(result.error)}`);
+  }
+  return result.data;
+}
+
+export function createFrontendWorkspaceMetadata(
+  overrides: Partial<FrontendWorkspaceMetadata> & Pick<FrontendWorkspaceMetadata, "id" | "name">
+): FrontendWorkspaceMetadata {
+  return {
+    ...overrides,
+    id: overrides.id,
+    name: overrides.name,
+    projectName: overrides.projectName ?? "project",
+    projectPath: overrides.projectPath ?? "/tmp/project",
+    createdAt: overrides.createdAt ?? new Date().toISOString(),
+    runtimeConfig: overrides.runtimeConfig ?? { type: "local" },
+    namedWorkspacePath: overrides.namedWorkspacePath ?? `/tmp/${overrides.id}`,
+  };
+}

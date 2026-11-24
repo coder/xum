@@ -1,5 +1,8 @@
+import { useState } from "react";
 import type { Meta, StoryObj } from "@storybook/react-vite";
-import { lightweightMeta } from "@/browser/stories/meta.js";
+import { userEvent, waitFor, within } from "storybook/test";
+import { lightweightMeta, PIXEL_DISABLED } from "@/browser/stories/meta.js";
+import { isDialogOpen } from "@/browser/utils/ui/keybinds";
 import { Button } from "../Button/Button.js";
 import {
   Dialog,
@@ -8,6 +11,7 @@ import {
   DialogFooter,
   DialogHeader,
   DialogTitle,
+  DialogTrigger,
   WarningBox,
   WarningText,
   WarningTitle,
@@ -45,6 +49,105 @@ export const Default: Story = {
       </Dialog>
     </div>
   ),
+  // Portaled modal contract for global shortcut guards: Radix sets no aria-modal on the
+  // content, so isDialogOpen() must still see this open dialog (through its overlay).
+  play: async () => {
+    const dialog = await waitFor(() =>
+      within(document.body).getByRole("dialog", { name: "Rename workspace" })
+    );
+    if (dialog.getAttribute("data-state") !== "open") {
+      throw new Error("dialog content must be open for the guard contract to be meaningful");
+    }
+    if (!isDialogOpen()) {
+      throw new Error("isDialogOpen() must report the open modal Dialog");
+    }
+  },
+};
+
+function EscapeRightAfterOpenDemo(props: { uncontrolled: boolean }) {
+  const [open, setOpen] = useState(false);
+  const content = (
+    <DialogContent>
+      <DialogHeader>
+        <DialogTitle>Early Escape</DialogTitle>
+        <DialogDescription>Escape closes this dialog at once.</DialogDescription>
+      </DialogHeader>
+    </DialogContent>
+  );
+  return (
+    <div className="bg-background min-h-screen p-4">
+      {props.uncontrolled ? (
+        // Radix keeps no open state here: the Dialog wrapper holds it.
+        <Dialog>
+          <DialogTrigger asChild>
+            <Button>Open dialog</Button>
+          </DialogTrigger>
+          {content}
+        </Dialog>
+      ) : (
+        <>
+          <Button onClick={() => setOpen(true)}>Open dialog</Button>
+          <Dialog open={open} onOpenChange={setOpen}>
+            {content}
+          </Dialog>
+        </>
+      )}
+    </div>
+  );
+}
+
+/**
+ * An Escape pressed in the first moments after a dialog opens closes it (#7141). Radix's
+ * dismissable layer reads its stack index from a render that has not run yet, so it ignored that
+ * Escape and the dialog stayed open.
+ */
+async function checkEscapeRightAfterOpen(canvasElement: HTMLElement) {
+  const doc = canvasElement.ownerDocument;
+  // Press Escape the moment focus enters the dialog. Radix moves focus there in a mount effect,
+  // after its layer has registered and before the render that updates the layer's index: the
+  // window a fast key hits. A timer would land before or after it depending on host load.
+  const pressedEscape = new Promise<void>((resolve) => {
+    const onFocusIn = (event: FocusEvent) => {
+      const target = event.target;
+      if (!(target instanceof HTMLElement) || target.closest('[role="dialog"]') == null) return;
+      doc.removeEventListener("focusin", onFocusIn);
+      target.dispatchEvent(
+        new KeyboardEvent("keydown", {
+          key: "Escape",
+          code: "Escape",
+          bubbles: true,
+          cancelable: true,
+        })
+      );
+      resolve();
+    };
+    doc.addEventListener("focusin", onFocusIn);
+  });
+  await userEvent.click(within(canvasElement).getByRole("button", { name: "Open dialog" }));
+  await pressedEscape;
+  const body = within(doc.body);
+  await waitFor(
+    () => {
+      if (body.queryByRole("dialog", { name: "Early Escape" }) != null) {
+        throw new Error("the dialog is still open after Escape");
+      }
+    },
+    { timeout: 1000 }
+  );
+}
+
+export const EscapeRightAfterOpen: Story = {
+  // Play-only: a timing contract, nothing new to look at.
+  parameters: { pixel: PIXEL_DISABLED },
+  render: () => <EscapeRightAfterOpenDemo uncontrolled={false} />,
+  play: async ({ canvasElement }) => checkEscapeRightAfterOpen(canvasElement),
+};
+
+/** The same for a dialog opened by its DialogTrigger, without open or onOpenChange props. */
+export const EscapeRightAfterOpenUncontrolled: Story = {
+  parameters: { pixel: PIXEL_DISABLED },
+  render: () => <EscapeRightAfterOpenDemo uncontrolled />,
+  play: async ({ canvasElement }) => checkEscapeRightAfterOpen(canvasElement),
 };
 
 export const Destructive: Story = {

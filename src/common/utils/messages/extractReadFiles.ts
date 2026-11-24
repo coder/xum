@@ -20,7 +20,7 @@ interface NestedToolCallRecord {
  * exclusive posture file access happens as nested xum.file_read / xum.load
  * calls, so the outer part is named "code_execution" and the reads live in
  * its output's toolCalls records. Success = no error, and for kernel compact
- * records ok !== false (supplement-mode records carry no ok field).
+ * records ok !== false (non-RLM inline-results records carry no ok field).
  */
 function collectNestedReadPaths(output: unknown): string[] {
   if (typeof output !== "object" || output === null) return [];
@@ -40,12 +40,20 @@ function collectNestedReadPaths(output: unknown): string[] {
     // instead of throwing, so a missing error does not mean the read
     // succeeded. (Kernel-compacted records fold this into the ok bit.)
     const result = (record as { result?: unknown }).result;
-    if (
-      typeof result === "object" &&
-      result !== null &&
-      (result as { success?: unknown }).success === false
-    ) {
-      continue;
+    // Same positive-success rule as collectNestedEditRecords: a result-less
+    // record must carry an explicit ok === true (all kernel-compacted records
+    // do) — a malformed row with neither result nor ok must not advertise a
+    // never-read path.
+    if (result === undefined && record.ok !== true) continue;
+    // Records WITH a result must show the POSITIVE successful file_read shape
+    // (r33): a corrupted persisted row can carry null, a primitive, or a
+    // success-less object, and result presence alone must not tell the model
+    // an unread file was already inspected. Kernel `load` results are the
+    // exception — their retained {key, bytes, lines, preview} shape has no
+    // success field; load failures surface through error/ok above.
+    if (result !== undefined && record.toolName !== "load") {
+      if (typeof result !== "object" || result === null) continue;
+      if ((result as { success?: unknown }).success !== true) continue;
     }
     const filePath = extractToolFilePath(record.args);
     if (filePath) paths.push(filePath);

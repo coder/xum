@@ -30,6 +30,9 @@ coverage/
 # Documentation build
 docs/book/
 
+# uv's environment for the pyproject.toml tools.
+.venv/
+
 # Removed mobile/ Expo prototype: upgraded checkouts may keep untracked
 # leftovers (node_modules, .expo, ios, android); keep them out of the context.
 mobile/

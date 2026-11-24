@@ -1,6 +1,7 @@
 ---
 name: xum-docs
 description: Index + offline snapshot of xum documentation (progressive disclosure).
+when_to_use: When the user asks how xum works (workspaces, runtimes, agents, models, hooks, keybinds, etc.).
 ---
 
 # xum docs
@@ -52,17 +53,19 @@ Use this index to find a page's:
       - Models (`/config/models`) → `references/docs/config/models.mdx`: Select and configure AI models in Xum
       - Providers (`/config/providers`) → `references/docs/config/providers.mdx`: Configure API keys and settings for AI providers
     - Why Parallelize? (`/getting-started/why-parallelize`) → `references/docs/getting-started/why-parallelize.mdx`: Use cases for running multiple AI agents in parallel
-    - Xum Gateway (`/getting-started/mux-gateway`) → `references/docs/getting-started/mux-gateway.mdx`: Log in to Xum Gateway to get evaluation credits
     - CLI (`/reference/cli`) → `references/docs/reference/cli.mdx`: Run one-off agent tasks and durable workflows from the command line
   - **Workspaces**
     - Workspaces (`/workspaces`) → `references/docs/workspaces/index.mdx`: Isolated development environments for parallel agent work
     - Scratch chats (`/workspaces/scratch-chats`) → `references/docs/workspaces/scratch-chats.mdx`: Start a durable chat with an app-managed folder and no project or Git repository.
+    - Artifacts (`/workspaces/artifacts`) → `references/docs/workspaces/artifacts.mdx`: View the HTML, Markdown, JSON and other files an agent writes, in a tab beside the chat.
     - Forking Workspaces (`/workspaces/fork`) → `references/docs/workspaces/fork.mdx`: Clone workspaces with conversation history to explore alternatives
+    - Side Chats (`/workspaces/side-chats`) → `references/docs/workspaces/side-chats.mdx`: Ask a quick side question without derailing the main chat
     - .xumignore (`/workspaces/xumignore`) → `references/docs/workspaces/xumignore.mdx`: Sync gitignored files to worktree workspaces
     - **Compaction**
       - Compaction (`/workspaces/compaction`) → `references/docs/workspaces/compaction/index.mdx`: Managing conversation context size with compaction
       - Manual Compaction (`/workspaces/compaction/manual`) → `references/docs/workspaces/compaction/manual.mdx`: Commands for manually managing conversation context
       - Automatic Compaction (`/workspaces/compaction/automatic`) → `references/docs/workspaces/compaction/automatic.mdx`: Let Xum automatically compact your conversations based on usage or idle time
+      - Token-Budget Context Windows (`/workspaces/compaction/token-budget`) → `references/docs/workspaces/compaction/token-budget.md`: Start fresh context windows without automatic summaries and retrieve earlier work on demand
       - Customization (`/workspaces/compaction/customization`) → `references/docs/workspaces/compaction/customization.mdx`: Customize the compaction system prompt
     - **Runtimes**
       - Runtimes (`/runtime`) → `references/docs/runtime/index.mdx`: Configure where and how Xum executes agent workspaces
@@ -74,7 +77,9 @@ Use this index to find a page's:
       - Dev Container Runtime (`/runtime/devcontainer`) → `references/docs/runtime/devcontainer.mdx`: Run agents in containers defined by devcontainer.json
     - **Hooks**
       - Init Hooks (`/hooks/init`) → `references/docs/hooks/init.mdx`: Run setup commands automatically when creating new workspaces
+      - Archive and Delete Hooks (`/hooks/lifecycle`) → `references/docs/hooks/lifecycle.mdx`: Run project cleanup before archiving or deleting a workspace
       - Tool Hooks (`/hooks/tools`) → `references/docs/hooks/tools.mdx`: Block dangerous commands, lint after edits, and set up your environment
+      - Plugin hooks (`/hooks/plugins`) → `references/docs/hooks/plugins.mdx`: Hooks that Agent Plugins ship, how you trust them, and the contract Xum gives hook authors
       - Environment Variables (`/hooks/environment-variables`) → `references/docs/hooks/environment-variables.mdx`: Environment variables available in agent bash commands and hooks
   - **Agents**
     - Agents (`/agents`) → `references/docs/agents/index.mdx`: Define custom agents (modes + subagents) as Markdown files
@@ -84,10 +89,12 @@ Use this index to find a page's:
     - System Prompt (`/agents/system-prompt`) → `references/docs/agents/system-prompt.mdx`: How Xum constructs the system prompt for AI models
     - Prompting Tips (`/agents/prompting-tips`) → `references/docs/agents/prompting-tips.mdx`: Tips and tricks for getting the most out of your AI agents
     - Best of N (`/agents/best-of-n`) → `references/docs/agents/best-of-n.mdx`: Improve plans, analysis, and reviews by asking Xum to explore multiple candidate answers in parallel
+    - Computer Use (`/agents/computer-use`) → `references/docs/agents/computer-use.mdx`: Let agents see your screen and use the mouse and keyboard of the machine running Xum
   - **Configuration**
     - MCP Servers (`/config/mcp-servers`) → `references/docs/config/mcp-servers.mdx`: Extend agent capabilities with Model Context Protocol servers
-    - Policy File (`/config/policy-file`) → `references/docs/config/policy-file.mdx`: Admin-enforced restrictions for providers, models, MCP, and runtimes
     - Project Secrets (`/config/project-secrets`) → `references/docs/config/project-secrets.mdx`: Manage environment variables and API keys for your projects
+    - Agent Resource Limits (`/config/agent-resource-limits`) → `references/docs/config/agent-resource-limits.mdx`: Set a CPU and memory limit that all local agent commands share, and a limit for single projects inside it
+    - Agent Sandbox (`/config/agent-sandbox`) → `references/docs/config/agent-sandbox.mdx`: Run local agent commands in a macOS sandbox that keeps writes in the workspace and credentials out of reach
     - Agentic Git Identity (`/config/agentic-git-identity`) → `references/docs/config/agentic-git-identity.mdx`: Configure a separate Git identity for AI-generated commits
     - Keyboard Shortcuts (`/config/keybinds`) → `references/docs/config/keybinds.mdx`: Complete keyboard shortcut reference for Xum
     - Notifications (`/config/notifications`) → `references/docs/config/notifications.mdx`: Configure how agents notify you about important events
@@ -104,12 +111,16 @@ Use this index to find a page's:
   - **Reference**
     - Mux compatibility (`/reference/mux-compatibility`) → `references/docs/reference/mux-compatibility.mdx`: Upgrade, downgrade, storage, command, environment, and deep-link compatibility during the Xum rename
     - Debugging (`/reference/debugging`) → `references/docs/reference/debugging.mdx`: View live backend logs and diagnose issues
+    - Profiling Xum (`/reference/profiling`) → `references/docs/reference/profiling.mdx`: Record performance samples, CPU profiles and hang stacks to find out why Xum is slow
+    - Code benchmarks (`/reference/code-benchmarks`) → `references/docs/reference/code-benchmarks.mdx`: Measure TypeScript functions with mitata microbenchmarks and compare two revisions with confidence intervals
     - Telemetry (`/reference/telemetry`) → `references/docs/reference/telemetry.mdx`: What Xum collects, what it doesn’t, and how to disable it
     - Storybook (`/reference/storybook`) → `references/docs/reference/storybook.mdx`: Develop and test Xum UI states in isolation
     - Terminal Benchmarking (`/reference/benchmarking`) → `references/docs/reference/benchmarking.mdx`: Run Terminal-Bench benchmarks with the Xum adapter
     - Context Boundaries for Compaction and Reset (`/adr/0003-context-boundaries-for-compaction-and-reset`) → `references/docs/adr/0003-context-boundaries-for-compaction-and-reset.md`: Architecture decision for modeling provider context windows separately from transcript history
     - CLI Goal Runs are not strict /goal aliases (`/adr/0004-cli-goal-runs-are-not-strict-goal-aliases`) → `references/docs/adr/0004-cli-goal-runs-are-not-strict-goal-aliases.md`: Architecture decision for giving xum run --goal CLI-specific completion and limit semantics
-    - Research: Claude Code cross-session messaging vs. Mux (`/research/claude-code-cross-session-messaging-comparison`) → `references/docs/research/claude-code-cross-session-messaging-comparison.md`: Feature-by-feature comparison of Claude Code's cross-session messaging against Mux's existing inter-agent messaging, with code-level evidence and gap analysis
+    - Token-Budget Context Windows (`/adr/0005-token-budget-context-windows`) → `references/docs/adr/0005-token-budget-context-windows.md`: An opt-in automatic reset policy with bounded retrieval and a manual-reset privacy floor
+    - Agent-Led Context Handoff (`/adr/0006-agent-led-context-handoff`) → `references/docs/adr/0006-agent-led-context-handoff.md`: The token-budget slider is a handoff target for the agent; only the usable limit forces a rollover
+    - Session Memory Is the Rollover Checkpoint (`/adr/0007-session-memory-is-the-rollover-checkpoint`) → `references/docs/adr/0007-session-memory-is-the-rollover-checkpoint.md`: Each agent keeps its own rollover checkpoint in the /memories/session/ scope, a fresh window injects nothing from the old one, and a final prompt gives a last chance to save it
     - AGENTS.md (`/AGENTS`) → `references/docs/AGENTS.md`: Agent instructions for AI assistants working on the Xum codebase
 <!-- END DOCS_TREE -->
 
@@ -136,10 +147,6 @@ Notes:
 
 - Many pages are `.mdx`; some are `.../index.mdx`.
 - Images are not embedded; you may see `/img/...` references.
-
-## When to use
-
-Use this skill when the user asks how xum works (workspaces, runtimes, agents, models, hooks, keybinds, etc.).
 
 ## Links
 

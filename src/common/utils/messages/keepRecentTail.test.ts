@@ -8,6 +8,7 @@ import {
   getKeepRecentTailStartHistorySequence,
   selectKeepRecentTailStartIndex,
 } from "./keepRecentTail";
+import { renderPluginHookContextEntry } from "./pluginHookContext";
 
 function userMessage(id: string, text: string, historySequence: number): MuxMessage {
   return createMuxMessage(id, "user", text, { historySequence, timestamp: 1 });
@@ -122,6 +123,31 @@ describe("selectKeepRecentTailStartIndex", () => {
 
     // The safe boundary is u1 (index 3), but the tail must start at the
     // snapshot row (index 2) so the kept turn retains its content.
+    expect(selectKeepRecentTailStartIndex(messages, 1_000)).toBe(2);
+  });
+
+  it("treats plan-review record rows like snapshot rows: never a boundary, part of the cluster", () => {
+    // Hidden record rows are user-role synthetic UI state. They must neither become a safe
+    // boundary themselves nor split a real user row from the snapshot cluster above it.
+    const record = createMuxMessage("plan-review-1", "user", "<mux_plan_review>...", {
+      historySequence: 2,
+      synthetic: true,
+      muxMetadata: { type: "plan-review", kind: "resolve", recordId: "rec", threadId: "thr" },
+    });
+    const snapshot = createMuxMessage("snap-1", "user", "snapshot: file contents", {
+      historySequence: 3,
+      synthetic: true,
+      fileAtMentionSnapshot: ["src/foo.ts"],
+    });
+    const messages = [
+      userMessage("u0", "x".repeat(40_000), 0),
+      assistantMessage("a0", "big reply", 1),
+      record,
+      snapshot,
+      userMessage("u1", "@src/foo.ts what does this do?", 4),
+      assistantMessage("a1", "it does things", 5),
+    ];
+
     expect(selectKeepRecentTailStartIndex(messages, 1_000)).toBe(2);
   });
 
@@ -280,5 +306,19 @@ describe("excludeKeepRecentTailForCompactionRequest", () => {
     ];
 
     expect(excludeKeepRecentTailForCompactionRequest(messages)).toBe(messages);
+  });
+});
+
+describe("estimateMuxMessageTokens with prompt-hook context", () => {
+  it("counts the rendered hook context the request adds to a user row", () => {
+    // Codex P2 (PRRT_kwDOPxxmWM6rOv7f): compaction cuts and fits must see the provider-visible
+    // size, not only the typed parts.
+    const plain = createMuxMessage("u1", "user", "fix the bug");
+    const entry = { pluginId: "notes", text: "x".repeat(4_000) };
+    const hooked = createMuxMessage("u1", "user", "fix the bug", { pluginHookContext: [entry] });
+
+    expect(
+      estimateMuxMessageTokens(hooked) - estimateMuxMessageTokens(plain)
+    ).toBeGreaterThanOrEqual(Math.floor(renderPluginHookContextEntry(entry).length / 4));
   });
 });

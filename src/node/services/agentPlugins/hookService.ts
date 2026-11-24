@@ -1,5 +1,5 @@
 /**
- * Tier-1 sandboxed plugin hooks (agent-plugins experiment).
+ * Tier-1 sandboxed plugin hooks.
  *
  * Discovers `hooks.js` modules inside Agent Plugin roots (same containers and
  * Project Trust gating as plugin MCP config), loads each one into its own
@@ -32,7 +32,7 @@ import type { DurableEventJournal } from "@/node/utils/journal/durableEventJourn
 import {
   eventSpine,
   type EventSpine,
-  type RequestAssembleContext,
+  type RequestContextOnly,
   type ToolExecuteContext,
 } from "@/node/services/events/eventSpine";
 import { log } from "@/node/services/log";
@@ -44,15 +44,19 @@ import {
 } from "@/node/services/sandbox/sandboxHostService";
 import { QuickJSRuntimeFactory } from "@/node/services/ptc/quickjsRuntime";
 import type { IJSRuntimeFactory } from "@/node/services/ptc/runtime";
-import { ensurePathContained } from "@/node/services/tools/skillFileUtils";
+import type { HostFiles, HostPaths } from "@/node/services/hostFiles/hostFiles";
+import { nodeHostFiles, nodeHostPaths } from "@/node/services/hostFiles/nodeHostFiles";
 import {
   computeAgentPluginContainers,
-  discoverAgentPlugins,
+  discoverAgentPluginsOnHost,
+  hostPluginFs,
   MAX_PLUGIN_HOOK_SOURCE_BYTES,
-  readPluginFileWithinRootCapped,
+  nodePluginFs,
   type AgentPluginContainer,
   type AgentPluginInfo,
+  type PluginFs,
 } from "./discovery";
+import { buildPluginServerKey, resolvePluginInstanceId } from "./mcpConfig";
 import { readMutationEpochToken, STAGING_DIR_NAME } from "./journals";
 import {
   buildHookInvokeScript,
@@ -71,6 +75,12 @@ const HOOK_CONTEXT_INLINE_MAX_CHARS = 4_096;
 const HOOK_CONTEXT_MAX_CHARS = 64 * 1024;
 /** Tool results larger than this (as JSON) are omitted from tool.execute.after input. */
 const HOOK_RESULT_INPUT_MAX_CHARS = 256 * 1024;
+/**
+ * `settings` larger than this many UTF-8 bytes (as JSON) are omitted from hook input (#6186): one
+ * server can send about 400 KB, and each settings-capable server of the plugin adds more. Bytes,
+ * not UTF-16 units: non-ASCII settings would otherwise pass at up to three times the size.
+ */
+const HOOK_SETTINGS_INPUT_MAX_BYTES = 64 * 1024;
 
 function sha256Hex(text: string): string {
   return crypto.createHash("sha256").update(text, "utf-8").digest("hex");
@@ -82,14 +92,30 @@ export interface EnsureWorkspaceHooksArgs {
   sessionDir: string;
   /** Durable journal for this workspace session (hook-context rows). */
   journal: DurableEventJournal;
-  /** agent-plugins experiment gate; false tears down any registered hooks. */
-  enabled: boolean;
   /** `~/.mux` root anchoring the global plugin container. */
   xumHome: string;
   /** Host checkout root for project containers; omit for off-host workspaces. */
   projectRoot?: string;
+  /** Project identity for project-plugin instance IDs (same as the plugin MCP provider). */
+  projectKey?: string;
   projectTrusted: boolean;
+  /**
+   * The host's files and paths: discovery, containment and the hooks.js read go through them
+   * (phase 5: the turn passes the loop's). Absent: the Node layers.
+   */
+  hostFiles?: HostFiles;
+  hostPaths?: HostPaths;
 }
+
+/**
+ * Structured settings (`openai/settings`) of one plugin instance's MCP
+ * servers in a workspace, keyed by server name. Must never throw.
+ */
+export type PluginHookSettingsProvider = (
+  workspaceId: string,
+  serverKeyPrefix: string,
+  timeoutMs: number
+) => Promise<Record<string, Record<string, unknown>>>;
 
 /** One discovered plugin with a hooks.js, plus its pinned source snapshot. */
 interface DiscoveredHookPlugin {
@@ -102,6 +128,8 @@ interface DiscoveredHookPlugin {
 interface LoadedPluginHookState {
   pluginName: string;
   grants: CapabilityGrants;
+  /** `plugin:<instanceId>:`: this plugin's MCP server keys (hook `settings`). */
+  serverKeyPrefix: string;
   /** Pinned hooks.js source; re-evaluated when the mount is rebuilt. */
   source: string;
   mountOptions: AcquireMountOptions;
@@ -142,7 +170,12 @@ interface AgentPluginHookServiceDeps {
   runtimeFactoryLoader?: () => Promise<IJSRuntimeFactory>;
   /** Container computation seam (tests pin containers to temp dirs). */
   computeContainers?: typeof computeAgentPluginContainers;
+  /** Deadline for a hook-time settings read (cache miss only). */
+  settingsTimeoutMs?: number;
 }
+
+/** A cache-miss settings read is short: it runs inside a tool call's hook. */
+const HOOK_SETTINGS_TIMEOUT_MS = 1_000;
 
 function loadQuickJSRuntimeFactory(): Promise<IJSRuntimeFactory> {
   // The heavy QuickJS WASM stack loads at first runtime creation
@@ -158,6 +191,8 @@ export class AgentPluginHookService {
   private readonly hookTimeoutMs: number;
   private readonly runtimeFactoryLoader: () => Promise<IJSRuntimeFactory>;
   private readonly computeContainers: typeof computeAgentPluginContainers;
+  private readonly settingsTimeoutMs: number;
+  private settingsProvider: PluginHookSettingsProvider | undefined;
 
   private readonly registrations = new Map<string, WorkspaceHookRegistration>();
   /** Serializes ensure/dispose per workspace (concurrent sends must not race teardown). */
@@ -172,22 +207,32 @@ export class AgentPluginHookService {
     this.hookTimeoutMs = deps.hookTimeoutMs ?? HOOK_EVAL_TIMEOUT_MS;
     this.runtimeFactoryLoader = deps.runtimeFactoryLoader ?? loadQuickJSRuntimeFactory;
     this.computeContainers = deps.computeContainers ?? computeAgentPluginContainers;
+    this.settingsTimeoutMs = deps.settingsTimeoutMs ?? HOOK_SETTINGS_TIMEOUT_MS;
+  }
+
+  /** The MCP manager is built after this module-level singleton. */
+  setSettingsProvider(provider: PluginHookSettingsProvider): void {
+    this.settingsProvider = provider;
+  }
+
+  /** Normal and headless requests share the same broken-plugin isolation posture. */
+  async ensureWorkspaceHooksForRequest(args: EnsureWorkspaceHooksArgs): Promise<void> {
+    try {
+      await this.ensureWorkspaceHooks(args);
+    } catch (error) {
+      log.warn("Agent plugin hooks: ensure failed; continuing without plugin hooks", { error });
+    }
   }
 
   /**
    * Reconcile the workspace's registered plugin hooks with what discovery
    * finds on disk. Cheap when nothing changed (fingerprint over hooks.js
    * sources + grants); loads sandbox mounts and (re)registers spine middleware
-   * only on change. Callers wrap this in try/catch: a broken plugin system
-   * must never block a send.
+   * only on change. Request callers use ensureWorkspaceHooksForRequest to
+   * isolate discovery failures: a broken plugin system must never block a send.
    */
   async ensureWorkspaceHooks(args: EnsureWorkspaceHooksArgs): Promise<void> {
     await using _guard = await this.lockFor(args.workspaceId).acquire();
-
-    if (!args.enabled) {
-      await this.teardownLocked(args.workspaceId);
-      return;
-    }
 
     // Capture the epoch BEFORE discovery: a mutation landing between this
     // read and registration makes the stored token stale, so the dispatch
@@ -282,6 +327,14 @@ export class AgentPluginHookService {
     const state: LoadedPluginHookState = {
       pluginName: plugin.name,
       grants: candidate.grants,
+      // Same instance ID as the plugin's MCP servers (one hashing rule).
+      serverKeyPrefix: buildPluginServerKey(
+        resolvePluginInstanceId(plugin, {
+          projectRoot: args.projectRoot,
+          projectKey: args.projectKey,
+        }),
+        ""
+      ),
       source: candidate.source,
       mountOptions: {
         lifetime: "persistent",
@@ -335,8 +388,12 @@ export class AgentPluginHookService {
       xumHome: args.xumHome,
       projectRoot: args.projectRoot,
       projectTrusted: args.projectTrusted,
+      // mutation-equivalent: hostPaths is a HostPaths object or undefined, so ?? and || agree
+      userHome: (args.hostPaths ?? nodeHostPaths).userHome(),
     });
-    const { plugins } = await discoverAgentPlugins(containers);
+    // mutation-equivalent: hostFiles is a HostFiles object or undefined, so ?? and || agree
+    const fs = hostPluginFs(args.hostFiles ?? nodeHostFiles);
+    const { plugins } = await discoverAgentPluginsOnHost(fs, containers);
 
     const result: DiscoveredHookPlugin[] = [];
     for (const plugin of plugins) {
@@ -348,7 +405,7 @@ export class AgentPluginHookService {
         // itself must stay inside the trusted checkout.
         assert(args.projectRoot, "project-scope plugins require a projectRoot");
         try {
-          await ensurePathContained(args.projectRoot, plugin.rootPath);
+          await fs.ensureContained(args.projectRoot, plugin.rootPath);
         } catch (error) {
           log.warn(
             `Agent plugin hooks: skipping project plugin '${plugin.name}': plugin root escapes the project root: ${getErrorMessage(error)}`
@@ -358,7 +415,7 @@ export class AgentPluginHookService {
       }
       let source: string;
       try {
-        source = await readHookSourceCapped(plugin.hooksPath, plugin.rootPath);
+        source = await readHookSourceCapped(plugin.hooksPath, plugin.rootPath, fs);
       } catch (error) {
         log.warn(`Agent plugin hooks: failed to read ${plugin.hooksPath}; skipping`, { error });
         continue;
@@ -412,9 +469,9 @@ export class AgentPluginHookService {
           this.runToolExecuteAfter(ctx, state, args.workspaceId)
         );
       case "request.assemble":
-        return this.spine.useBefore("request.assemble", (ctx) =>
-          this.runRequestAssemble(ctx, state, args)
-        );
+        return this.spine.useRequestContext((ctx) => this.runRequestAssemble(ctx, state, args), {
+          workspaceId: args.workspaceId,
+        });
     }
   }
 
@@ -505,7 +562,7 @@ export class AgentPluginHookService {
   }
 
   private async runRequestAssemble(
-    ctx: RequestAssembleContext,
+    ctx: RequestContextOnly,
     state: LoadedPluginHookState,
     args: EnsureWorkspaceHooksArgs
   ): Promise<void> {
@@ -593,6 +650,33 @@ export class AgentPluginHookService {
   }
 
   /**
+   * This plugin's settings, after starting the reads of every sibling plugin that can run the
+   * same hook point (#6186): on a tool hook, only siblings that grant `toolName`. The spine runs plugin middleware serially, so plugins that each wait on their
+   * own unresponsive settings server would add one timeout each. The siblings' own calls later
+   * join the reads the MCP manager already has in flight, so the dispatch waits about one timeout.
+   */
+  private readHookSettings(
+    workspaceId: string,
+    state: LoadedPluginHookState,
+    hookName: PluginHookPoint,
+    toolName: string | undefined
+  ): Promise<Record<string, unknown>> {
+    const provider = this.settingsProvider;
+    if (provider === undefined) {
+      return Promise.resolve({});
+    }
+    for (const sibling of this.registrations.get(workspaceId)?.states ?? []) {
+      if (sibling !== state && canRunHook(sibling, hookName, toolName)) {
+        // Only starts the read: the result is discarded, and the provider never throws.
+        provider(workspaceId, sibling.serverKeyPrefix, this.settingsTimeoutMs).catch(
+          () => undefined
+        );
+      }
+    }
+    return provider(workspaceId, state.serverKeyPrefix, this.settingsTimeoutMs);
+  }
+
+  /**
    * Invoke one hook in the plugin's mount. Returns null on any failure
    * (crash, timeout, malformed output) — log, skip, continue.
    */
@@ -605,6 +689,18 @@ export class AgentPluginHookService {
     if (state.disposed) {
       return null;
     }
+    // Preflight: a plugin already revoked (here or by another backend's committed update or
+    // uninstall) must not even have its settings server contacted.
+    if (await this.retireIfEpochStale(workspaceId)) {
+      return null;
+    }
+    // Every hook point gets `settings` from the plugin's own MCP servers.
+    // Read BEFORE the revocation checks below: an uninstall or teardown that
+    // lands during this read must stop the call, or withPersistentMount would
+    // recreate the dropped mount and run the removed hook once more
+    // (the last review fix of #6040).
+    const toolName = typeof input.toolName === "string" ? input.toolName : undefined;
+    const settings = await this.readHookSettings(workspaceId, state, hookName, toolName);
     if (await this.retireIfEpochStale(workspaceId)) {
       return null;
     }
@@ -614,7 +710,7 @@ export class AgentPluginHookService {
       return null;
     }
     try {
-      const inputJson = JSON.stringify(input);
+      const inputJson = buildHookInputJson(input, settings, `'${state.pluginName}' ${hookName}`);
       assert(typeof inputJson === "string", "hook input must be JSON-serializable");
       const evalResult = await this.sandboxHost.withPersistentMount(
         state.mountOptions,
@@ -684,6 +780,46 @@ export class AgentPluginHookService {
 }
 
 /**
+ * Whether a plugin's hook would run for this hook point (and, on a tool hook, this tool). The
+ * sibling settings prefetch skips the rest: a read of a plugin that cannot run is not only
+ * wasted, a failed read is memoized per server instance, so a transient failure would cost that
+ * plugin its settings later.
+ */
+function canRunHook(
+  state: LoadedPluginHookState,
+  hookName: PluginHookPoint,
+  toolName: string | undefined
+): boolean {
+  return (
+    !state.disposed &&
+    state.hookNames.includes(hookName) &&
+    (toolName === undefined || isBridgeToolGranted(state.grants, toolName))
+  );
+}
+
+/**
+ * Hook input as JSON, with `settings` omitted above the size cap. `settingsOmitted` tells the
+ * hook why `settings` is empty, like `resultOmitted`. `label` names the hook in the warning.
+ */
+function buildHookInputJson(
+  input: Record<string, unknown>,
+  settings: Record<string, unknown>,
+  label: string
+): string {
+  const settingsJson: string | undefined = JSON.stringify(settings);
+  const settingsBytes = settingsJson === undefined ? 0 : Buffer.byteLength(settingsJson, "utf8");
+  const settingsOmitted = settingsBytes > HOOK_SETTINGS_INPUT_MAX_BYTES;
+  if (settingsOmitted) {
+    log.warn(
+      `Agent plugin hooks: ${label} settings exceed ${HOOK_SETTINGS_INPUT_MAX_BYTES} bytes; omitting them`
+    );
+  }
+  return JSON.stringify(
+    settingsOmitted ? { ...input, settings: {}, settingsOmitted } : { ...input, settings }
+  );
+}
+
+/**
  * Annotate a tool result with model-visible hook feedback, mirroring the
  * shell hook `hook_output` convention. v1 annotates plain object results
  * only; streaming iterables and primitives pass through untouched.
@@ -709,8 +845,13 @@ function annotateResult(result: unknown, annotation: string, pluginName: string)
  * fstat-reported byte count through the same handle also bounds the read if
  * the file grows mid-read. Exported for tests.
  */
-export async function readHookSourceCapped(hooksPath: string, pluginRoot: string): Promise<string> {
-  const result = await readPluginFileWithinRootCapped({
+export async function readHookSourceCapped(
+  hooksPath: string,
+  pluginRoot: string,
+  /** The host filesystem of the read (hostPluginFs). */
+  fs: PluginFs = nodePluginFs
+): Promise<string> {
+  const result = await fs.readFileCapped({
     filePath: hooksPath,
     pluginRoot,
     maxBytes: MAX_PLUGIN_HOOK_SOURCE_BYTES,

@@ -50,7 +50,7 @@ async function createFixture(): Promise<RollbackFixture> {
   return {
     muxHome,
     checkout,
-    sessionDir: config.getSessionDir(WORKSPACE_ID),
+    sessionDir: path.join(config.sessionsDir, WORKSPACE_ID),
     service,
     ctx: {
       runtime: new LocalRuntime(checkout),
@@ -408,8 +408,11 @@ describe("refinementRollback", () => {
 
     // Simulate another process's in-flight rollback: our own PID is live, so
     // the lock must never be broken and the call must fail with a clear error.
+    // Tokens use the `pid:nonce` shape; a bare pid is malformed (#4464) and
+    // would only be refused while young, not because its owner is live.
     const lockPath = path.join(fixture.sessionDir, "refinement-rollback.lock");
-    await fsPromises.writeFile(lockPath, String(process.pid), { encoding: "utf-8", flag: "wx" });
+    const liveToken = `${process.pid}:inflight`;
+    await fsPromises.writeFile(lockPath, liveToken, { encoding: "utf-8", flag: "wx" });
 
     const refused = await rollbackRefinement({
       sessionDir: fixture.sessionDir,
@@ -420,7 +423,7 @@ describe("refinementRollback", () => {
     if (refused.success) throw new Error("unreachable");
     expect(refused.error).toContain("Another rollback is in progress");
     // The live owner's lockfile survives the refusal.
-    expect(await fsPromises.readFile(lockPath, "utf-8")).toBe(String(process.pid));
+    expect(await fsPromises.readFile(lockPath, "utf-8")).toBe(liveToken);
 
     await fsPromises.unlink(lockPath);
     const retried = await rollbackRefinement({
@@ -442,7 +445,8 @@ describe("refinementRollback", () => {
     const child = spawnSync(process.execPath, ["--version"]);
     expect(child.pid).toBeGreaterThan(0);
     const lockPath = path.join(fixture.sessionDir, "refinement-rollback.lock");
-    await fsPromises.writeFile(lockPath, String(child.pid), { encoding: "utf-8", flag: "wx" });
+    // `pid:nonce` shape: a bare pid is malformed (#4464) and takes the lease path.
+    await fsPromises.writeFile(lockPath, `${child.pid}:crashed`, { encoding: "utf-8", flag: "wx" });
 
     const result = await rollbackRefinement({
       sessionDir: fixture.sessionDir,
@@ -464,8 +468,11 @@ describe("refinementRollback", () => {
     // recorded birth identity proves the reuse. A PID-only liveness check
     // treated this lock as live forever, refusing every rollback until
     // manual cleanup. Simulate with our own (alive) pid + a foreign birth.
+    // Only Linux starttimes are comparable birth evidence (#4415), so the
+    // foreign birth uses that format and the case is Linux-only.
+    if (process.platform !== "linux") return;
     const lockPath = path.join(fixture.sessionDir, "refinement-rollback.lock");
-    const bogusBirth = Buffer.from("crashed-xum-birth").toString("hex");
+    const bogusBirth = Buffer.from("linux-ticks:1").toString("hex");
     await fsPromises.writeFile(lockPath, `${process.pid}:cafe:${bogusBirth}`, {
       encoding: "utf-8",
       flag: "wx",
@@ -850,6 +857,57 @@ describe("refinementRollback", () => {
     expect(refused.success).toBe(false);
     if (refused.success) throw new Error("unreachable");
     expect(refused.error).toContain("global skills root");
+  });
+
+  it("refuses global memory and global skill rollbacks when global writes are refused", async () => {
+    using fixture = await createFixture();
+    await fixture.service.create(fixture.ctx, "/memories/global/g.md", "v1\n", "agent");
+    await fixture.service.strReplace(fixture.ctx, "/memories/global/g.md", "v1", "v2", "agent");
+    const globalMemoryRow = await lastRow(fixture.sessionDir);
+    const globalMemoryFile = path.join(fixture.muxHome, "memory", "global", "g.md");
+
+    const skillFile = path.join(fixture.muxHome, "skills", "my-skill", "SKILL.md");
+    await fsPromises.mkdir(path.dirname(skillFile), { recursive: true });
+    await fsPromises.writeFile(skillFile, "body\n", "utf-8");
+    await appendRefinementEvent({
+      sessionDir: fixture.sessionDir,
+      workspaceId: WORKSPACE_ID,
+      kind: "skill",
+      action: { op: "write", skillName: "my-skill", filePath: "SKILL.md" },
+      inverse: { op: "delete-files", paths: [skillFile] },
+      evidence: { toolName: "agent_skill_write" },
+    });
+    const globalSkillRow = await lastRow(fixture.sessionDir);
+
+    for (const row of [globalMemoryRow, globalSkillRow]) {
+      const refused = await rollbackRefinement({
+        sessionDir: fixture.sessionDir,
+        id: row.id,
+        force: true,
+        refuseGlobalWrites: true,
+        evidence: EVIDENCE,
+      });
+      expect(refused.success).toBe(false);
+      if (refused.success) throw new Error("unreachable");
+      expect(refused.error).toContain("agent sandbox blocks");
+    }
+    expect(await fsPromises.readFile(globalMemoryFile, "utf-8")).toBe("v2\n");
+    expect(await fsPromises.readFile(skillFile, "utf-8")).toBe("body\n");
+
+    // Workspace memory is not global: its rollback still runs.
+    await fixture.service.create(fixture.ctx, "/memories/workspace/w.md", "v1\n", "agent");
+    await fixture.service.strReplace(fixture.ctx, "/memories/workspace/w.md", "v1", "v2", "agent");
+    const workspaceRow = await lastRow(fixture.sessionDir);
+    const result = await rollbackRefinement({
+      sessionDir: fixture.sessionDir,
+      id: workspaceRow.id,
+      refuseGlobalWrites: true,
+      evidence: EVIDENCE,
+    });
+    expect(result.success).toBe(true);
+    expect(
+      await fsPromises.readFile(path.join(fixture.sessionDir, "memory", "w.md"), "utf-8")
+    ).toBe("v1\n");
   });
 
   it("undoes a memory rename via the mirrored rename inverse", async () => {

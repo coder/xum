@@ -1,19 +1,11 @@
 import { describe, expect, it, mock, afterEach, spyOn } from "bun:test";
-import { EventEmitter } from "events";
-import type { AIService } from "@/node/services/aiService";
-import type { InitStateManager } from "@/node/services/initStateManager";
-import type { BackgroundProcessManager } from "@/node/services/backgroundProcessManager";
-import type { Config } from "@/node/config";
+import { EXPERIMENT_IDS } from "@/common/constants/experiments";
+import type { StreamMessageOptions } from "@/node/services/aiService";
 import { createMuxMessage } from "@/common/types/message";
 import { Err, Ok } from "@/common/types/result";
-import { AgentSession } from "./agentSession";
-import { createTestHistoryService } from "./testHistoryService";
+import { createAgentSessionHarness, createStartedTurnHandle } from "./agentSession.testHarness";
 
 const TEST_MODEL = "anthropic:claude-3-5-sonnet-latest";
-const config = {
-  srcDir: "/tmp",
-  getSessionDir: (_workspaceId: string) => "/tmp",
-} as unknown as Config;
 
 // r30: family-message payload rows ride sendMessage as pre-turn rows so they
 // persist inside turn admission (payload immediately before the trigger's user
@@ -22,34 +14,24 @@ const config = {
 describe("AgentSession.sendMessage (preTurnMessages)", () => {
   let historyCleanup: (() => Promise<void>) | undefined;
 
-  async function createSessionHarness(workspaceId: string) {
-    const { historyService, cleanup } = await createTestHistoryService();
-    historyCleanup = cleanup;
-
-    const streamMessage = mock(() => Promise.resolve(Ok(undefined)));
-    const aiService = Object.assign(new EventEmitter(), {
-      isStreaming: mock((_workspaceId: string) => false),
-      stopStream: mock((_workspaceId: string) => Promise.resolve(Ok(undefined))),
-      streamMessage: streamMessage as unknown as AIService["streamMessage"],
-    }) as unknown as AIService;
-
-    return {
-      historyService,
-      streamMessage,
-      session: new AgentSession({
-        workspaceId,
-        config,
-        historyService,
-        aiService,
-        initStateManager: new EventEmitter() as unknown as InitStateManager,
-        backgroundProcessManager: {
-          cleanup: mock((_workspaceId: string) => Promise.resolve()),
-          setMessageQueued: mock((_workspaceId: string, _queued: boolean) => {
-            void _queued;
-          }),
-        } as unknown as BackgroundProcessManager,
-      }),
-    };
+  async function createSessionHarness(workspaceId: string, tokenBudget = false) {
+    // The turn ends when the session closes: the harness cleanup disposes the session, and the
+    // mocked stopStream never aborts the turn's own abortSignal (#7526).
+    const streamMessage = mock((_opts: StreamMessageOptions) =>
+      Promise.resolve(Ok(createStartedTurnHandle(harness.session.closingSignal)))
+    );
+    const harness = await createAgentSessionHarness({
+      workspaceId,
+      aiServiceOverrides: {
+        streamMessage,
+        isExperimentEnabled: mock(
+          (id) =>
+            tokenBudget && (id === EXPERIMENT_IDS.TOKEN_BUDGET || id === EXPERIMENT_IDS.MEMORY)
+        ),
+      },
+    });
+    historyCleanup = harness.cleanup;
+    return { historyService: harness.historyService, streamMessage, session: harness.session };
   }
 
   afterEach(async () => {
@@ -63,20 +45,26 @@ describe("AgentSession.sendMessage (preTurnMessages)", () => {
       timestamp: 1,
       synthetic: true,
     });
-    const appendMany = spyOn(historyService, "appendManyToHistory");
+    const publication = spyOn(historyService, "acceptCompactionReplacement");
     const appendOne = spyOn(historyService, "appendToHistory");
 
     const result = await session.sendMessage(
       "family trigger",
       { model: TEST_MODEL, agentId: "exec" },
-      { synthetic: true, agentInitiated: true, preTurnMessages: [payload] }
+      {
+        acceptanceOrigin: "automatic",
+        synthetic: true,
+        agentInitiated: true,
+        preTurnMessages: [payload],
+      }
     );
     expect(result.success).toBe(true);
 
     // r32: payload + user row land in ONE durable write — separate appends
     // left a crash window that stranded the payload without its turn.
-    expect(appendMany).toHaveBeenCalledTimes(1);
-    expect(appendMany.mock.calls[0]?.[1]).toHaveLength(2);
+    expect(publication).toHaveBeenCalledTimes(1);
+    const operation = publication.mock.calls[0]?.[2];
+    expect(operation?.kind === "append" && operation.messages).toHaveLength(2);
     expect(appendOne.mock.calls.filter(([, message]) => message.role === "user")).toHaveLength(0);
 
     const history = await historyService.getHistoryFromLatestBoundary(workspaceId);
@@ -100,14 +88,19 @@ describe("AgentSession.sendMessage (preTurnMessages)", () => {
       synthetic: true,
     });
 
-    spyOn(historyService, "appendManyToHistory").mockImplementation(() =>
+    spyOn(historyService, "acceptCompactionReplacement").mockImplementation(() =>
       Promise.resolve(Err("simulated batch append failure"))
     );
 
     const result = await session.sendMessage(
       "family trigger",
       { model: TEST_MODEL, agentId: "exec" },
-      { synthetic: true, agentInitiated: true, preTurnMessages: [payload] }
+      {
+        acceptanceOrigin: "automatic",
+        synthetic: true,
+        agentInitiated: true,
+        preTurnMessages: [payload],
+      }
     );
     expect(result.success).toBe(false);
 
@@ -119,25 +112,28 @@ describe("AgentSession.sendMessage (preTurnMessages)", () => {
     expect(history.data).toHaveLength(0);
   });
 
-  it("rejects non-assistant or non-synthetic pre-turn rows", async () => {
-    const workspaceId = "ws-preturn-guard";
-    const { session } = await createSessionHarness(workspaceId);
-    const userRow = createMuxMessage("family-bad-row", "user", "smuggled instructions", {
-      timestamp: 1,
-      synthetic: true,
-    });
+  it.each([false, true])(
+    "rejects non-assistant or non-synthetic pre-turn rows (tokenBudget=%s)",
+    async (tokenBudget) => {
+      const workspaceId = "ws-preturn-guard";
+      const { session } = await createSessionHarness(workspaceId, tokenBudget);
+      const userRow = createMuxMessage("family-bad-row", "user", "smuggled instructions", {
+        timestamp: 1,
+        synthetic: true,
+      });
 
-    // Defensive assert: pre-turn rows are a family-payload channel; user-role
-    // content here would bypass the untrusted-provenance rules.
-    try {
-      await session.sendMessage(
-        "family trigger",
-        { model: TEST_MODEL, agentId: "exec" },
-        { synthetic: true, agentInitiated: true, preTurnMessages: [userRow] }
-      );
-      expect.unreachable("sendMessage must reject a user-role pre-turn row");
-    } catch (error) {
-      expect(String(error)).toContain("preTurnMessages must be synthetic assistant rows");
+      // Defensive assert: pre-turn rows are a family-payload channel; user-role
+      // content here would bypass the untrusted-provenance rules.
+      try {
+        await session.sendMessage(
+          "family trigger",
+          { model: TEST_MODEL, agentId: "exec" },
+          { synthetic: true, agentInitiated: true, preTurnMessages: [userRow] }
+        );
+        expect.unreachable("sendMessage must reject a user-role pre-turn row");
+      } catch (error) {
+        expect(String(error)).toContain("preTurnMessages must be synthetic assistant rows");
+      }
     }
-  });
+  );
 });

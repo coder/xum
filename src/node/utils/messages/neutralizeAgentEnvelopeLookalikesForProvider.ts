@@ -3,24 +3,38 @@ import {
   neutralizeAgentEnvelopeLookalikes,
   parseAgentMessageEnvelope,
 } from "@/common/utils/agentMessageEnvelope";
+import {
+  getAuthenticPlanReviewRecord,
+  neutralizePlanReviewEnvelopeLookalikes,
+} from "@/common/utils/planReview/planReviewEnvelope";
 import type { MuxMessage } from "@/common/types/message";
+import type {
+  AssistantModelMessage,
+  ModelMessage,
+  ToolCallPart,
+  ToolModelMessage,
+  ToolResultPart,
+} from "ai";
 
 /**
- * Rewrite `<mux_agent_message>` lookalike tags before the provider request.
+ * Rewrite `<mux_agent_message>` and `<mux_plan_review>` lookalike tags before the provider
+ * request.
  *
- * Why: the system prompt classifies transcript rows wrapped in that tag as untrusted agent peer
- * messages. Authentic envelopes are authored exclusively by the peer-message send path as
- * assistant-role synthetic pre-turn rows carrying valid `agent-peer-message` metadata; any other
- * occurrence is user-pasted text (which must keep user authority) or model-emitted text (which
- * must not be able to forge a peer message into its own later context). Rewriting every
- * non-authentic row makes the exact wrapper server-controlled provenance.
+ * Why: the system prompt classifies transcript rows wrapped in these tags as protocol messages
+ * (untrusted agent peer messages; the user's structured plan feedback). Authentic envelopes are
+ * authored exclusively by their server send paths — peer messages as assistant-role synthetic
+ * pre-turn rows carrying valid `agent-peer-message` metadata, plan feedback as user rows carrying
+ * `plan-review` metadata that matches the envelope. Any other occurrence is user-pasted text
+ * (which must keep user authority) or model-emitted text (which must not be able to forge a
+ * protocol message into its own later context). Rewriting every non-authentic row makes the
+ * exact wrapper server-controlled provenance.
  *
  * Notes:
  * - Request-only: does not mutate persisted history/UI.
  * - Scope: text parts of user and assistant rows that are not authentic payload rows, plus
  *   string-bearing tool parts (input/output/errorText). Tool results carry attacker-controlled
  *   repository content (file_read, bash, ...), so a wrapper inside them must be neutralized too
- *   or repository text could masquerade as the peer-message protocol in provider tool content.
+ *   or repository text could masquerade as a protocol message in provider tool content.
  */
 export function neutralizeAgentEnvelopeLookalikesForProvider(messages: MuxMessage[]): MuxMessage[] {
   let didChange = false;
@@ -54,14 +68,22 @@ export function neutralizeAgentEnvelopeLookalikesForProvider(messages: MuxMessag
         );
       });
 
+    // Plan feedback is authentic only when the row's `plan-review` metadata and its single
+    // envelope text part describe the same record (getAuthenticPlanReviewRecord); a row that
+    // fails that cross-check is treated like any pasted text.
+    const isAuthenticPlanReviewRow = getAuthenticPlanReviewRecord(msg) !== null;
+
     let msgChanged = false;
     const nextParts = msg.parts.map((part) => {
       if (part.type === "text") {
-        if (isAuthenticPeerRow || !part.text.includes("mux_agent_message")) {
+        let text = part.text;
+        if (!isAuthenticPeerRow) text = neutralizeAgentEnvelopeLookalikes(text);
+        if (!isAuthenticPlanReviewRow) text = neutralizePlanReviewEnvelopeLookalikes(text);
+        if (text === part.text) {
           return part;
         }
         msgChanged = true;
-        return { ...part, text: neutralizeAgentEnvelopeLookalikes(part.text) };
+        return { ...part, text };
       }
       if (part.type === "dynamic-tool" || part.type.startsWith("tool-")) {
         // Tool parts are treated as an opaque record here: the string-bearing payload fields are
@@ -99,37 +121,158 @@ export function neutralizeAgentEnvelopeLookalikesForProvider(messages: MuxMessag
   return didChange ? result : messages;
 }
 
+/**
+ * Same-turn counterpart for streamText's internal steps.
+ *
+ * The MuxMessage neutralizer above only sees the request built from persisted history. Tool
+ * calls executed DURING a turn never reach it: the SDK feeds their inputs and results straight
+ * into the next step, so repository text returned by bash/file_read in step N arrived at the
+ * provider with the exact wrapper in step N+1 (the history path only caught it on the NEXT turn).
+ *
+ * Scope is deliberately tool-call `input` and tool-result `output` ONLY. Text parts are left
+ * alone: at this seam the row metadata that proves a feedback/peer envelope authentic is gone,
+ * and the history path has already neutralized every non-authentic text row, so rewriting text
+ * here could only damage authentic envelopes. Returns the same array when nothing changed.
+ */
+export function neutralizeAgentEnvelopeLookalikesInModelToolParts(
+  messages: ModelMessage[]
+): ModelMessage[] {
+  let didChange = false;
+
+  const result = messages.map((message): ModelMessage => {
+    let changedMessage = false;
+    const onChange = () => {
+      didChange = true;
+      changedMessage = true;
+    };
+    if (message.role === "tool") {
+      const content: ToolModelMessage["content"] = message.content.map((part) =>
+        neutralizeModelToolPart(part, onChange)
+      );
+      return changedMessage ? { ...message, content } : message;
+    }
+    if (message.role === "assistant" && Array.isArray(message.content)) {
+      const content: Exclude<AssistantModelMessage["content"], string> = message.content.map(
+        (part) => neutralizeModelToolPart(part, onChange)
+      );
+      return changedMessage ? { ...message, content } : message;
+    }
+    return message;
+  });
+
+  return didChange ? result : messages;
+}
+
+function neutralizeModelToolPart<P extends { type: string }>(part: P, onChange: () => void): P {
+  if (part.type === "tool-call") {
+    const call = part as P & ToolCallPart;
+    const input = neutralizeStringsDeep(call.input);
+    if (input === call.input) return part;
+    onChange();
+    return { ...part, input };
+  }
+  if (part.type === "tool-result") {
+    const toolResult = part as P & ToolResultPart;
+    // Covers every output variant (text/json/error-text/error-json/content); media `data`
+    // is base64 and never contains the wrapper, so those items keep their identity.
+    const output = neutralizeStringsDeep(toolResult.output);
+    if (output === toolResult.output) return part;
+    onChange();
+    return { ...part, output: output as ToolResultPart["output"] };
+  }
+  return part;
+}
+
 /** Unknown-first widening so tool-part payload fields can be read without cross-shape casts. */
 function toRecord(value: unknown): Record<string, unknown> {
   return value as Record<string, unknown>;
 }
 
+/** Both neutralizers return the same reference when their tag is absent. */
+function neutralizeString(value: string): string {
+  return neutralizePlanReviewEnvelopeLookalikes(neutralizeAgentEnvelopeLookalikes(value));
+}
+
 /**
  * Shape-preserving deep neutralization for JSON-serializable tool payloads. Returns the SAME
- * reference when nothing contains the lookalike tag so unchanged parts/messages keep identity.
+ * reference when nothing contains the lookalike tag so unchanged parts/messages keep identity
+ * (binary leaves such as media byte arrays are never rebuilt because their entries never change).
+ *
+ * Iterative on purpose: tool results are arbitrary JSON from MCP/code-execution tools, and
+ * JSON.parse accepts nesting far deeper than a recursive walk survives — a RangeError here
+ * would fail the turn inside prepareStep. Post-order rebuild over an explicit stack, mirroring
+ * the attachment extractor's walk; repeated references are processed once and cycles are not
+ * descended twice.
  */
 function neutralizeStringsDeep(value: unknown): unknown {
-  if (typeof value === "string") {
-    return value.includes("mux_agent_message") ? neutralizeAgentEnvelopeLookalikes(value) : value;
-  }
-  if (Array.isArray(value)) {
-    let changed = false;
-    const next = value.map((item) => {
-      const out = neutralizeStringsDeep(item);
-      if (out !== item) changed = true;
-      return out;
-    });
-    return changed ? next : value;
-  }
-  if (typeof value === "object" && value !== null) {
-    let changed = false;
-    const next: Record<string, unknown> = {};
-    for (const [key, item] of Object.entries(value)) {
-      const out = neutralizeStringsDeep(item);
-      if (out !== item) changed = true;
-      next[key] = out;
+  if (typeof value === "string") return neutralizeString(value);
+  if (typeof value !== "object" || value === null) return value;
+
+  /** Rebuilt replacement per changed node; nodes without changes keep their identity. */
+  const rebuilt = new Map<object, unknown>();
+  const processed = new Set<object>();
+  const visiting = new Set<object>();
+  const stack: Array<{ node: object; entered: boolean }> = [{ node: value, entered: false }];
+
+  while (stack.length > 0) {
+    const frame = stack[stack.length - 1];
+    if (!frame.entered) {
+      if (processed.has(frame.node) || visiting.has(frame.node)) {
+        stack.pop();
+        continue;
+      }
+      frame.entered = true;
+      visiting.add(frame.node);
+      const children: unknown[] = Array.isArray(frame.node)
+        ? frame.node
+        : Object.values(frame.node);
+      for (const child of children) {
+        if (typeof child !== "object" || child === null) continue;
+        if (processed.has(child) || visiting.has(child)) continue;
+        stack.push({ node: child, entered: false });
+      }
+      continue;
     }
-    return changed ? next : value;
+    stack.pop();
+    visiting.delete(frame.node);
+    processed.add(frame.node);
+    let changed = false;
+    const rewrite = (child: unknown): unknown => {
+      if (typeof child === "string") {
+        const out = neutralizeString(child);
+        if (out !== child) changed = true;
+        return out;
+      }
+      if (typeof child === "object" && child !== null && rebuilt.has(child)) {
+        changed = true;
+        return rebuilt.get(child);
+      }
+      return child;
+    };
+    let next: unknown;
+    if (Array.isArray(frame.node)) {
+      next = frame.node.map(rewrite);
+    } else {
+      // Property KEYS are provider-bound text too: tool outputs are JSON.stringify'd into
+      // tool_result content and tool-call inputs travel as request JSON, so a wrapper tag
+      // hidden in a key would reach the model verbatim. Neutralize keys with the same rule as
+      // values and keep every entry on a collision (first-seen keeps the plain name, later ones
+      // get a stable " (n)" suffix) so nothing is dropped and output is a pure function of input.
+      const entries: Array<[string, unknown]> = [];
+      const taken = new Set<string>();
+      for (const [key, child] of Object.entries(frame.node as Record<string, unknown>)) {
+        let nextKey = neutralizeString(key);
+        if (nextKey !== key) changed = true;
+        for (let n = 2; taken.has(nextKey); n++) {
+          nextKey = `${neutralizeString(key)} (${n})`;
+          changed = true;
+        }
+        taken.add(nextKey);
+        entries.push([nextKey, rewrite(child)]);
+      }
+      next = Object.fromEntries(entries);
+    }
+    if (changed) rebuilt.set(frame.node, next);
   }
-  return value;
+  return rebuilt.has(value) ? rebuilt.get(value) : value;
 }

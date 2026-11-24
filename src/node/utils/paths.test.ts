@@ -271,13 +271,6 @@ describe("toPosixPath", () => {
         expect(result).toMatch(/^\/c\/Users\/test$/i);
       }
     });
-
-    test("falls back to original path if cygpath unavailable", () => {
-      // If cygpath is not available (edge case), the function catches
-      // the error and returns the original path unchanged
-      // This prevents crashes if Git Bash is misconfigured
-      expect(true).toBe(true); // Cannot easily test without mocking execSync
-    });
   });
 });
 

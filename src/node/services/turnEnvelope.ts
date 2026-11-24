@@ -8,7 +8,8 @@
  */
 
 import crypto from "node:crypto";
-import { asSchema, type FlexibleSchema, type Tool } from "ai";
+import type { Tool } from "ai";
+import { extractToolJsonSchema } from "@/common/utils/tools/extractToolJsonSchema";
 import type { PostCompactionAttachment } from "@/common/types/attachment";
 import type { BlobRef } from "@/common/types/durableEvent";
 import type { MuxMessage } from "@/common/types/message";
@@ -59,54 +60,6 @@ export function isProviderDefinedToolRecord(
 }
 
 /**
- * Extract the JSON schema from a runtime tool entry without ever throwing.
- * Tool maps mix shapes that `asSchema` alone cannot normalize — passing a
- * plain object to `asSchema` makes it assume a lazy-schema function and call
- * it, throwing `TypeError: schema is not a function`:
- * - MCP/dynamic tools (and their sanitizeToolSchemaForOpenAI copies) carry
- *   `.inputSchema` wrappers exposing a `jsonSchema` getter that may lack the
- *   AI SDK schema symbol.
- * - sanitizeToolSchemaForOpenAI rewrites v3-style `.parameters` (and custom
- *   adapters declare `.parameters`/`.schema`) as plain JSON Schema objects.
- * A fingerprinting failure here would silently drop the whole turn-envelope
- * row and break "model-visible ⟹ logged", so every branch degrades to a
- * hashable value instead of propagating.
- */
-function extractJsonSchema(rawTool: unknown): unknown {
-  const record =
-    rawTool !== null && typeof rawTool === "object"
-      ? (rawTool as { inputSchema?: unknown; parameters?: unknown; schema?: unknown })
-      : undefined;
-  const rawSchema = record?.inputSchema ?? record?.parameters ?? record?.schema;
-  if (rawSchema == null) {
-    // Sparse/schema-less entries fingerprint as the AI SDK empty object schema.
-    return asSchema(undefined).jsonSchema;
-  }
-  if (typeof rawSchema === "object") {
-    // jsonSchema() wrappers and MCP inputSchema wrappers expose the actual
-    // JSON schema via a `jsonSchema` property/getter; unwrap it directly
-    // (identical to what asSchema returns for symbol-bearing wrappers).
-    const wrapped = (rawSchema as { jsonSchema?: unknown }).jsonSchema;
-    if (wrapped !== null && typeof wrapped === "object") {
-      return wrapped;
-    }
-    // Plain JSON Schema objects are already the schema. `~standard` excludes
-    // standard-schema instances (zod), which asSchema must convert instead.
-    if (typeof (rawSchema as { type?: unknown }).type === "string" && !("~standard" in rawSchema)) {
-      return rawSchema;
-    }
-  }
-  try {
-    // asSchema normalizes the remaining FlexibleSchema forms (zod v3/v4,
-    // symbol-bearing Schema instances, lazy schema functions).
-    return asSchema(rawSchema as FlexibleSchema<unknown>).jsonSchema;
-  } catch {
-    // Unknown shape: fingerprint the raw value rather than aborting emission.
-    return rawSchema;
-  }
-}
-
-/**
  * Fingerprint the toolset as {name, schemaHash} sorted by name. schemaHash is
  * bare sha256 hex (not a BlobRef — schemas are hashed, never blob-stored).
  */
@@ -125,7 +78,7 @@ export function buildToolsetManifest(
       }
       // stableStringify sorts keys so the hash is insensitive to property
       // insertion order.
-      const inputJsonSchema = extractJsonSchema(tool);
+      const inputJsonSchema = extractToolJsonSchema(tool);
       return { name, schemaHash: hashToolSchema(inputJsonSchema) };
     });
 }
@@ -140,6 +93,8 @@ export async function emitTurnEnvelope(params: {
   journal: DurableEventJournal;
   workspaceId: string;
   systemMessage: string;
+  /** Volatile tail length of systemMessage (see assemblePromptPayload); 0/absent = none. */
+  systemVolatileSuffixLength?: number;
   tools: Record<string, Tool>;
   modelString: string;
   thinkingLevel: string;
@@ -166,6 +121,11 @@ export async function emitTurnEnvelope(params: {
    * (model-visible but never persisted to chat.jsonl at this sequence).
    */
   partialContinuationMessage?: MuxMessage | null;
+  /**
+   * MCP Apps model context message inserted before the newest user row
+   * (model-visible, request-only: never persisted to chat.jsonl).
+   */
+  mcpAppModelContextMessage?: MuxMessage | null;
 }): Promise<void> {
   try {
     // Blob puts and the append referencing them run under the journal blob
@@ -213,6 +173,12 @@ export async function emitTurnEnvelope(params: {
             JSON.stringify(params.partialContinuationMessage)
           );
         }
+        let mcpAppModelContextHash: BlobRef | undefined;
+        if (params.mcpAppModelContextMessage != null) {
+          mcpAppModelContextHash = await putTracked(
+            JSON.stringify(params.mcpAppModelContextMessage)
+          );
+        }
 
         // Ownership re-check between put and append (publishWithBlob parity):
         // if this holder was wrongfully displaced, a reclaimer may have
@@ -242,6 +208,9 @@ export async function emitTurnEnvelope(params: {
             ...(params.anthropicCacheTtl != null
               ? { anthropicCacheTtl: params.anthropicCacheTtl }
               : {}),
+            ...(params.systemVolatileSuffixLength != null && params.systemVolatileSuffixLength > 0
+              ? { systemPromptVolatileSuffixLength: params.systemVolatileSuffixLength }
+              : {}),
             ...(planTransitionContentHash !== undefined
               ? {
                   planTransitionContentHash,
@@ -254,6 +223,7 @@ export async function emitTurnEnvelope(params: {
               ? { postCompactionAttachmentsHash }
               : {}),
             ...(partialContinuationHash !== undefined ? { partialContinuationHash } : {}),
+            ...(mcpAppModelContextHash !== undefined ? { mcpAppModelContextHash } : {}),
           },
         });
       } catch (error) {

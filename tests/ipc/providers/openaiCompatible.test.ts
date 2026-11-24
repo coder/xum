@@ -1,7 +1,7 @@
 import * as http from "node:http";
 import type { AddressInfo } from "node:net";
 
-import type { ProvidersConfig } from "@/common/config/schemas/providersConfig";
+import { ProvidersConfigStore, type ProvidersConfig } from "@/node/config";
 import type { WorkspaceChatMessage } from "@/common/orpc/types";
 import { OPENAI_RESPONSES_BASE_URL_HINT } from "@/node/services/utils/openAIResponsesBaseUrlHint";
 import { loadTokenizerModules } from "@/node/utils/main/tokenizer";
@@ -26,7 +26,7 @@ const describeOpenAICompatible = shouldRunIntegrationTests() ? describe : descri
 const MOCK_MODEL = "mock-model";
 
 type MockRequestBody = Record<string, unknown> & {
-  messages?: Array<{ role?: unknown; content?: unknown }>;
+  messages?: { role?: unknown; content?: unknown }[];
 };
 
 type MockHandler = (request: {
@@ -39,19 +39,16 @@ type MockHandler = (request: {
 interface MockServer {
   origin: string;
   baseUrl: string;
-  requests: Array<{
+  requests: {
     path: string;
     body: MockRequestBody;
     headers: http.IncomingHttpHeaders;
-  }>;
+  }[];
   errors: Error[];
   close: () => Promise<void>;
 }
 
-function writeCompletion(
-  response: http.ServerResponse,
-  chunks: Array<Record<string, unknown>>
-): void {
+function writeCompletion(response: http.ServerResponse, chunks: Record<string, unknown>[]): void {
   response.writeHead(200, {
     "Content-Type": "text/event-stream",
     "Cache-Control": "no-cache",
@@ -72,7 +69,7 @@ function writeResponsesCompletion(response: http.ServerResponse, text: string): 
   // Minimal Responses SSE lifecycle: the SDK only emits text-start when the
   // message output item is announced, so the delta must be preceded by
   // response.output_item.added or the stream errors with a missing text part.
-  const events: Array<Record<string, unknown>> = [
+  const events: Record<string, unknown>[] = [
     {
       type: "response.created",
       response: { id: "resp-mock", created_at: 0, model: MOCK_MODEL },
@@ -238,7 +235,7 @@ async function createConfiguredWorkspace(providersConfig: ProvidersConfig): Prom
 }> {
   const tempGitRepo = await createTempGitRepo();
   const env = await createTestEnvironment();
-  env.config.saveProvidersConfig(providersConfig);
+  new ProvidersConfigStore(env.config.rootDir).saveProvidersConfig(providersConfig);
 
   const created = await createWorkspace(env, tempGitRepo, generateBranchName("openai-compatible"));
   if (!created.success) {
@@ -449,7 +446,7 @@ describeOpenAICompatible("custom OpenAI-compatible providers", () => {
       expect(result.success).toBe(true);
 
       const errorEvent = await collector.waitForEvent("stream-error", 30000);
-      if (!errorEvent || errorEvent.type !== "stream-error") {
+      if (errorEvent?.type !== "stream-error") {
         throw new Error("Expected a stream-error event");
       }
       expect(errorEvent.error).toContain(OPENAI_RESPONSES_BASE_URL_HINT);
@@ -485,7 +482,7 @@ describeOpenAICompatible("custom OpenAI-compatible providers", () => {
       expect(result.success).toBe(true);
 
       const errorEvent = await collector.waitForEvent("stream-error", 30000);
-      if (!errorEvent || errorEvent.type !== "stream-error") {
+      if (errorEvent?.type !== "stream-error") {
         throw new Error("Expected a stream-error event");
       }
       expect(errorEvent.error).toContain(OPENAI_RESPONSES_BASE_URL_HINT);

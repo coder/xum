@@ -47,6 +47,7 @@ export function createAsyncMessageQueue<T>(): {
       // This ensures all messages from a batch are processed in the same
       // event loop tick, preventing premature renders
       while (queue.length > 0) {
+        // eslint-disable-next-line @typescript-eslint/no-non-null-assertion -- legacy site from before the ban; remove when touching this line
         yield queue.shift()!;
       }
       // Wait for more messages
@@ -56,6 +57,7 @@ export function createAsyncMessageQueue<T>(): {
     }
     // Yield any remaining messages after end() is called
     while (queue.length > 0) {
+      // eslint-disable-next-line @typescript-eslint/no-non-null-assertion -- legacy site from before the ban; remove when touching this line
       yield queue.shift()!;
     }
   }

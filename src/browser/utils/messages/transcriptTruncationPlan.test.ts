@@ -161,3 +161,48 @@ describe("buildTranscriptTruncationPlan", () => {
     expect(markerRows.map((row) => row.hiddenCount)).toEqual([16, 1, 1]);
   });
 });
+
+// Rows are memoized on prop identity (#4961 F20): a recompute that yields an equal marker must
+// return the same object, and a marker whose counts change must be a new one, so it re-renders.
+describe("buildTranscriptTruncationPlan marker reuse", () => {
+  const markers = (displayedMessages: DisplayedMessage[]) =>
+    buildTranscriptTruncationPlan({
+      displayedMessages,
+      maxDisplayedMessages: 2,
+      alwaysKeepMessageTypes: ALWAYS_KEEP_MESSAGE_TYPES,
+    }).rows.filter((row) => row.type === "history-hidden");
+
+  test("returns the same marker objects when a recompute yields equal markers", () => {
+    const rows = () => [user("u0", 0), assistant("a0", 1), user("u1", 2), assistant("a1", 3)];
+    const before = markers([...rows(), assistant("tail-1", 4), assistant("tail-2", 5)]);
+    const after = markers([...rows(), assistant("tail-1", 4), assistant("tail-2", 5)]);
+
+    expect(before).toHaveLength(2);
+    expect(after[0]).toBe(before[0]);
+    expect(after[1]).toBe(before[1]);
+  });
+
+  test("returns a new marker when any of its counts change", () => {
+    // Each pair differs in one field of the second marker: hiddenCount, tool, reasoning.
+    const pairs: Array<[DisplayedMessage[], DisplayedMessage[]]> = [
+      [[assistant("x1", 4)], [assistant("x1", 4), assistant("x2", 5)]],
+      [
+        [tool("x1", 4), assistant("x2", 5)],
+        [tool("x1", 4), tool("x2", 5)],
+      ],
+      [
+        [reasoning("x1", 4), assistant("x2", 5)],
+        [reasoning("x1", 4), reasoning("x2", 5)],
+      ],
+    ];
+    for (const [first, second] of pairs) {
+      const head = [user("u0", 0), assistant("a0", 1), user("u1", 2)];
+      const tail = [assistant("tail-1", 10), assistant("tail-2", 11)];
+      const before = markers([...head, ...first, ...tail]);
+      const after = markers([...head, ...second, ...tail]);
+      expect(after[0]).toBe(before[0]);
+      expect(after[1]).not.toBe(before[1]);
+      expect(after[1]).not.toEqual(before[1]);
+    }
+  });
+});

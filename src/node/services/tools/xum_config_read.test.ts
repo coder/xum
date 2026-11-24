@@ -274,7 +274,7 @@ describe("mux_config_read", () => {
     }
   });
 
-  it("redacts config token fields", async () => {
+  it("redacts a legacy Governor token left in config.json", async () => {
     using xumHome = new TestTempDir("mux-config-read");
 
     await fs.writeFile(

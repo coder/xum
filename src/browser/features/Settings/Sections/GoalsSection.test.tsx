@@ -2,54 +2,49 @@ import { cleanup, fireEvent, render, waitFor } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, mock, test } from "bun:test";
 
 import { ThemeProvider } from "@/browser/contexts/ThemeContext";
-import { DEFAULT_GOAL_DEFAULTS, type GoalDefaults } from "@/constants/goals";
+import { DEFAULT_GOAL_DEFAULTS, normalizeGoalDefaults, type GoalDefaults } from "@/constants/goals";
 import { installDom } from "../../../../../tests/ui/dom";
+import { APIProvider, type APIClient } from "@/browser/contexts/API";
+import {
+  createTestApiClient,
+  createTestConfig,
+  type TestApiOverrides,
+  type TestClientConfig,
+} from "@/browser/testUtils";
 
-interface MockAPIClient {
-  config: {
-    getConfig: () => Promise<{ goalDefaults?: GoalDefaults }>;
-    updateGoalDefaults: (input: { goalDefaults: GoalDefaults }) => Promise<void>;
-  };
-}
+type GoalDefaultsUpdate = Parameters<APIClient["config"]["updateGoalDefaults"]>[0];
 
-let mockApi: MockAPIClient;
+import { GoalDefaultsControls } from "./GoalsSection";
 
-void mock.module("@/browser/contexts/API", () => ({
-  useAPI: () => ({
-    api: mockApi,
-    status: "connected" as const,
-    error: null,
-    authenticate: () => undefined,
-    retry: () => undefined,
-  }),
-}));
-
-import { GoalsSection } from "./GoalsSection";
-
-function renderGoalsSection(config: { goalDefaults?: GoalDefaults } = {}) {
-  const current = { ...config };
-  const updateGoalDefaults = mock(({ goalDefaults }: { goalDefaults: GoalDefaults }) => {
-    current.goalDefaults = goalDefaults;
+function renderGoalDefaultsControls(config: { goalDefaults?: GoalDefaults } = {}) {
+  const current: Partial<TestClientConfig> = { ...config };
+  const updateGoalDefaults = mock(({ goalDefaults }: GoalDefaultsUpdate) => {
+    // The real input is partial; the backend stores it normalized, as getConfig returns it.
+    current.goalDefaults = normalizeGoalDefaults(goalDefaults);
     return Promise.resolve();
   });
 
-  mockApi = {
+  const mockApi = {
     config: {
-      getConfig: mock(() => Promise.resolve({ ...current })),
+      getConfig: mock(() => Promise.resolve(createTestConfig({ ...current }))),
       updateGoalDefaults,
     },
-  };
+  } satisfies TestApiOverrides<APIClient>;
 
+  // Inject the config-only client through the real provider; mocking the API module leaks
+  // into later files.
   const view = render(
-    <ThemeProvider forcedTheme="dark">
-      <GoalsSection />
-    </ThemeProvider>
+    <APIProvider client={createTestApiClient(mockApi)}>
+      <ThemeProvider forcedTheme="dark">
+        <GoalDefaultsControls />
+      </ThemeProvider>
+    </APIProvider>
   );
 
   return { view, updateGoalDefaults };
 }
 
-describe("GoalsSection", () => {
+describe("GoalDefaultsControls", () => {
   let cleanupDom: (() => void) | null = null;
 
   beforeEach(() => {
@@ -64,7 +59,7 @@ describe("GoalsSection", () => {
   });
 
   test("renders default goal settings", async () => {
-    const { view } = renderGoalsSection();
+    const { view } = renderGoalDefaultsControls();
 
     const budgetInput = (await waitFor(() =>
       view.getByLabelText("Default goal budget in dollars")
@@ -78,7 +73,7 @@ describe("GoalsSection", () => {
   });
 
   test("persists edited goal defaults", async () => {
-    const { view, updateGoalDefaults } = renderGoalsSection({
+    const { view, updateGoalDefaults } = renderGoalDefaultsControls({
       goalDefaults: { ...DEFAULT_GOAL_DEFAULTS, defaultBudgetCents: 300 },
     });
 

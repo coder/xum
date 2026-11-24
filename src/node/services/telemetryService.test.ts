@@ -23,6 +23,16 @@ describe("TelemetryService enablement", () => {
     expect(enabled).toBe(false);
   });
 
+  test("disables telemetry in session tape replay mode, even for a packaged app", () => {
+    const context = { isElectron: true, isPackaged: true };
+    expect(shouldEnableTelemetry(createContext({ ...context, env: {} }))).toBe(true);
+    expect(
+      shouldEnableTelemetry(
+        createContext({ ...context, env: { XUM_REPLAY_TAPES: '{"ws":"/tapes/ws.jsonl"}' } })
+      )
+    ).toBe(false);
+  });
+
   test("treats leftover MUX_DISABLE_TELEMETRY as an explicit opt-out", () => {
     const enabled = shouldEnableTelemetry(
       createContext({

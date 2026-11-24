@@ -7,7 +7,7 @@ import {
   TOOL_DEFINITIONS,
 } from "@/common/utils/tools/toolDefinitions";
 import { isWorkspaceTurnTaskId } from "@/node/services/taskHandleStore";
-import { parseToolResult, requireTaskService, requireWorkspaceId } from "./toolUtils";
+import { parseToolResult, requireWorkspaceId, requireWorkspaceTurnManager } from "./toolUtils";
 
 // Only the reversible verbs survive the #3825 restoration; task_remove is the
 // sole irreversible verb for child cleanup.
@@ -62,7 +62,7 @@ export const createTaskWorkspaceLifecycleTool: ToolFactory = (config: ToolConfig
       }
 
       const ownerWorkspaceId = requireWorkspaceId(config, "task_workspace_lifecycle");
-      const taskService = requireTaskService(config, "task_workspace_lifecycle");
+      const workspaceTurnManager = requireWorkspaceTurnManager(config, "task_workspace_lifecycle");
       const interruptActive = args.interrupt_active === true;
 
       const seen = new Set<string>();
@@ -97,20 +97,10 @@ export const createTaskWorkspaceLifecycleTool: ToolFactory = (config: ToolConfig
           async function runLifecycleAction() {
             switch (args.action) {
               case "archive": {
-                const result = await taskService.archiveOwnedWorkspaceTurnWorkspace(
+                const result = await workspaceTurnManager.archiveOwnedWorkspaceTurnWorkspace(
                   ownerWorkspaceId,
                   target,
-                  {
-                    interruptActive,
-                    acknowledgedUntrackedPaths:
-                      target.workspaceId != null
-                        ? (args.acknowledged_untracked_paths?.[target.workspaceId] ?? undefined)
-                        : undefined,
-                    // Targets addressed by taskId resolve to a workspaceId in the backend, so
-                    // forward the full by-workspaceId map for post-resolution lookup.
-                    acknowledgedUntrackedPathsByWorkspaceId:
-                      args.acknowledged_untracked_paths ?? undefined,
-                  }
+                  { interruptActive }
                 );
                 return result.success
                   ? result.data
@@ -122,7 +112,7 @@ export const createTaskWorkspaceLifecycleTool: ToolFactory = (config: ToolConfig
                     };
               }
               case "unarchive": {
-                const result = await taskService.unarchiveOwnedWorkspaceTurnWorkspace(
+                const result = await workspaceTurnManager.unarchiveOwnedWorkspaceTurnWorkspace(
                   ownerWorkspaceId,
                   target
                 );

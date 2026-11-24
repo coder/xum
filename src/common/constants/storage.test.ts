@@ -1,62 +1,16 @@
-import { afterEach, beforeEach, describe, expect, test } from "bun:test";
+import { describe, expect, test } from "bun:test";
 import {
   DEFAULT_TERMINAL_BADGE_CONFIG,
-  copyWorkspaceStorage,
-  deleteWorkspaceStorage,
+  PERSISTED_KEY_REGISTRY,
   getDraftScopeId,
   getInputAttachmentsKey,
+  getWorkspaceKeyPrefix,
   normalizeTerminalBadgeConfig,
   normalizeTranscriptDensity,
   type TerminalBadgeConfig,
 } from "@/common/constants/storage";
 
-class MemoryStorage implements Storage {
-  private readonly map = new Map<string, string>();
-
-  get length(): number {
-    return this.map.size;
-  }
-
-  clear(): void {
-    this.map.clear();
-  }
-
-  getItem(key: string): string | null {
-    return this.map.get(key) ?? null;
-  }
-
-  key(index: number): string | null {
-    const keys = Array.from(this.map.keys());
-    return keys[index] ?? null;
-  }
-
-  removeItem(key: string): void {
-    this.map.delete(key);
-  }
-
-  setItem(key: string, value: string): void {
-    this.map.set(key, value);
-  }
-}
-
 describe("storage workspace-scoped keys", () => {
-  let originalLocalStorage: Storage | undefined;
-
-  beforeEach(() => {
-    // The helpers in src/common/constants/storage.ts rely on global localStorage.
-    // In tests we install a minimal in-memory implementation.
-    originalLocalStorage = globalThis.localStorage;
-    globalThis.localStorage = new MemoryStorage();
-  });
-
-  afterEach(() => {
-    if (originalLocalStorage) {
-      globalThis.localStorage = originalLocalStorage;
-    } else {
-      delete (globalThis as { localStorage?: unknown }).localStorage;
-    }
-  });
-
   test("getDraftScopeId formats scope id", () => {
     expect(getDraftScopeId("/Users/me/repo", "draft-123")).toBe(
       "__draft__//Users/me/repo/draft-123"
@@ -73,58 +27,18 @@ describe("storage workspace-scoped keys", () => {
     expect(normalizeTranscriptDensity(null)).toBe("normal");
   });
 
-  test("copyWorkspaceStorage copies inputAttachments key", () => {
-    const source = "ws-source";
-    const dest = "ws-dest";
-
-    const sourceKey = getInputAttachmentsKey(source);
-    const destKey = getInputAttachmentsKey(dest);
-
-    const value = JSON.stringify([
-      { id: "img-1", url: "data:image/png;base64,AAA", mediaType: "image/png" },
-    ]);
-    localStorage.setItem(sourceKey, value);
-
-    copyWorkspaceStorage(source, dest);
-
-    expect(localStorage.getItem(destKey)).toBe(value);
-  });
-
-  test("copyWorkspaceStorage drops staged draft attachments", () => {
-    const source = "ws-source";
-    const dest = "ws-dest";
-
-    const sourceKey = getInputAttachmentsKey(source);
-    const destKey = getInputAttachmentsKey(dest);
-    const providerAttachment = {
-      kind: "provider",
-      id: "img-1",
-      url: "data:image/png;base64,AAA",
-      mediaType: "image/png",
-    };
-    const stagedAttachment = {
-      kind: "staged",
-      id: "zip-1",
-      filename: "archive.zip",
-      mediaType: "application/zip",
-      sizeBytes: 128,
-      stagedPath: ".mux/user-attachments/id/archive.zip",
-    };
-    localStorage.setItem(sourceKey, JSON.stringify([providerAttachment, stagedAttachment]));
-
-    copyWorkspaceStorage(source, dest);
-
-    expect(JSON.parse(localStorage.getItem(destKey) ?? "null")).toEqual([providerAttachment]);
-  });
-
-  test("deleteWorkspaceStorage removes inputAttachments key", () => {
-    const workspaceId = "ws-delete";
-    const key = getInputAttachmentsKey(workspaceId);
-
-    localStorage.setItem(key, "value");
-    deleteWorkspaceStorage(workspaceId);
-
-    expect(localStorage.getItem(key)).toBeNull();
+  // A prefix that is a prefix of another would give keys the wrong kind, so quota eviction could
+  // remove a draft or preference that merely shares a cache key's prefix.
+  test("registered key prefixes never shadow each other", () => {
+    const prefixes = PERSISTED_KEY_REGISTRY.map((entry) =>
+      entry.scope === "workspaceId" ? getWorkspaceKeyPrefix(entry.getKey) : entry.key
+    );
+    for (const [index, prefix] of prefixes.entries()) {
+      expect(prefix.length).toBeGreaterThan(0);
+      for (const [otherIndex, other] of prefixes.entries()) {
+        if (index !== otherIndex) expect(other.startsWith(prefix)).toBe(false);
+      }
+    }
   });
 });
 

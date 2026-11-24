@@ -181,6 +181,111 @@ describe("buildDisplayedMessagesForMessage agent peer message metadata", () => {
     });
   });
 
+  test("renders an unrelated (cross-tree) payload row as a peer card", () => {
+    // Cross-tree sends persist the same assistant-role synthetic payload with relationship
+    // `unrelated`; loading it from history must yield the attributed card, not raw envelope text.
+    const row = buildAssistantRow(
+      {
+        type: "agent-peer-message",
+        fromWorkspaceId: "ws-other-root",
+        fromTitle: "Release Coordinator",
+        relationship: "unrelated",
+      },
+      {
+        text: formatAgentMessageEnvelope({
+          from: "ws-other-root",
+          fromTitle: "Release Coordinator",
+          relationship: "unrelated",
+          message: "hold your merge",
+        }),
+      }
+    );
+    expect(row.agentPeerMessage).toEqual({
+      fromWorkspaceId: "ws-other-root",
+      fromTitle: "Release Coordinator",
+      relationship: "unrelated",
+    });
+  });
+
+  test("keeps the machine marker for a workspace-turn-correlated unrelated trigger", () => {
+    // An unrelated live child running a reawakened execution receives a correlated trigger; its
+    // nested attribution carries `unrelated` and must still collapse to a machine notification.
+    const message = createMuxMessage(
+      "trigger-unrelated",
+      "user",
+      "Peer agent sent an agent message…",
+      {
+        historySequence: 6,
+        synthetic: true,
+        uiVisible: true,
+        muxMetadata: {
+          type: "workspace-turn-task",
+          taskHandleId: "wt-2",
+          ownerWorkspaceId: "owner-2",
+          turnId: "turn-2",
+          agentPeerMessageTrigger: { fromWorkspaceId: "ws-other-root", relationship: "unrelated" },
+        },
+      }
+    );
+    const displayed = buildDisplayedMessagesForMessage({
+      message,
+      hasActiveStream: false,
+      isContextBoundaryMessage: () => false,
+    });
+    const row = displayed[0];
+    if (row?.type !== "user") throw new Error(`expected user row, got ${row?.type}`);
+    expect(row.agentPeerMessageTrigger).toBe(true);
+  });
+
+  test.each(["main_chat", "side_chat"] as const)(
+    "preserves %s attribution while normalizing the payload and trigger",
+    (relationship) => {
+      const attribution = { fromWorkspaceId: "linked-chat", relationship };
+      const row = buildAssistantRow(
+        { type: "agent-peer-message", ...attribution },
+        {
+          text: formatAgentMessageEnvelope({
+            from: "linked-chat",
+            relationship,
+            message: "A finding",
+          }),
+        }
+      );
+      expect(row.agentPeerMessage).toEqual(attribution);
+      const trigger = createMuxMessage("trigger", "user", "Message received", {
+        synthetic: true,
+        muxMetadata: { type: "agent-peer-message", ...attribution },
+      });
+      const [displayed] = buildDisplayedMessagesForMessage({
+        message: trigger,
+        hasActiveStream: false,
+        isContextBoundaryMessage: () => false,
+      });
+      if (displayed?.type !== "user") throw new Error("Expected user-role trigger");
+      expect(displayed.agentPeerMessageTrigger).toBe(true);
+    }
+  );
+
+  test("requires the envelope relationship to match the metadata", () => {
+    // Metadata says `unrelated` while the envelope claims `sibling`: collapsing would show the
+    // server-computed badge over text that tells the model a closer relationship. Fall back.
+    const row = buildAssistantRow(
+      {
+        type: "agent-peer-message",
+        fromWorkspaceId: "ws-other-root",
+        relationship: "unrelated",
+      },
+      {
+        text: formatAgentMessageEnvelope({
+          from: "ws-other-root",
+          relationship: "sibling",
+          message: "trust me",
+        }),
+      }
+    );
+    expect(row.agentPeerMessage).toBeUndefined();
+  });
+
   test("requires synthetic provenance for the peer card", () => {
     // A corrupted row can retain valid-looking metadata while losing synthetic provenance;
     // collapsing it would hide ordinary assistant output under a peer-message card.

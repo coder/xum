@@ -8,21 +8,26 @@
  *   xum run --runtime "ssh user@host" "Deploy changes"
  */
 
+import { EffectRunnerTag } from "@/node/services/di/effectRunner";
 import { Command } from "commander";
 import { resolveXumEnvironmentValue } from "@/common/compat/legacyMux";
 import { tool } from "ai";
 import { z } from "zod";
 import * as path from "path";
 import * as fs from "fs/promises";
-import * as fsSync from "fs";
-import { Config, type ProjectConfig } from "../node/config";
+import { createConfigStores } from "../node/config";
+import { materializeResolvedTrust, replaceRunConfig } from "./trust";
+import { runBestEffortCleanup } from "./runCleanup";
 import { DisposableTempDir } from "../node/services/tempDir";
 import { AgentSession, type AgentSessionChatEvent } from "../node/services/agentSession";
 import { CodexOauthService } from "../node/services/codexOauthService";
 import { CoderOauthService } from "../node/services/coderOauthService";
-import { PolicyService } from "../node/services/policyService";
 import { ProviderService } from "../node/services/providerService";
-import { createCoreServices } from "../node/services/coreServices";
+import { AgentResourceLimitsService } from "../node/services/agentResourceLimits/agentResourceLimitsService";
+import { AgentSandboxService } from "../node/services/agentSandbox/agentSandboxService";
+import { sandboxApprovalManager } from "../node/services/agentSandbox/sandboxApprovalManager";
+import { createCoreServices } from "../node/services/coreServicesRoot";
+import { closeScopeBounded, disposeAppRuntime } from "../node/services/di/appRuntime";
 import {
   isCaughtUpMessage,
   isReasoningDelta,
@@ -39,7 +44,7 @@ import {
   type SendMessageOptions,
   type WorkspaceChatMessage,
 } from "../common/orpc/types";
-import type { ServiceTier } from "../common/config/schemas/providersConfig";
+import { ServiceTierSchema, type ServiceTier } from "../common/config/schemas/providersConfig";
 import { createDisplayUsage } from "../common/utils/tokens/displayUsage";
 import {
   getTotalCost,
@@ -80,9 +85,20 @@ import { createRuntime, runFullInit } from "../node/runtime/runtimeFactory";
 import type { Runtime } from "../node/runtime/Runtime";
 import { execSync } from "child_process";
 import { getParseOptions } from "./argv";
-import { EXPERIMENT_IDS } from "../common/constants/experiments";
+import type { ExperimentId } from "../common/constants/experiments";
+import {
+  collectHeadlessExperiments,
+  createHeadlessExperimentsService,
+} from "./headlessExperiments";
 import { getErrorMessage } from "@/common/utils/errors";
+import {
+  createRunConfig,
+  prepareRunSessionRootOverride,
+  replacePrivateRunConfigFile,
+  type PreparedRunSessionRoot,
+} from "./runSessionRoot";
 import { describeCliGoalStop, driveCliGoalUntilTerminal } from "./goalRunDriver";
+import { CliStreamWaits } from "./runStreamWaits";
 import {
   parseGoalBudgetInputCents,
   parseGoalTurnCapInput,
@@ -264,35 +280,6 @@ function renderUnknown(value: unknown): string {
   }
 }
 
-const VALID_EXPERIMENT_IDS = new Set<string>(Object.values(EXPERIMENT_IDS));
-
-function collectExperiments(value: string, previous: string[]): string[] {
-  const experimentId = value.trim().toLowerCase();
-  if (!VALID_EXPERIMENT_IDS.has(experimentId)) {
-    throw new Error(
-      `Unknown experiment "${value}". Valid experiments: ${[...VALID_EXPERIMENT_IDS].join(", ")}`
-    );
-  }
-  if (previous.includes(experimentId)) {
-    return previous; // Dedupe
-  }
-  return [...previous, experimentId];
-}
-
-/**
- * Convert experiment ID array to the experiments object expected by SendMessageOptions.
- */
-function buildExperimentsObject(experimentIds: string[]): SendMessageOptions["experiments"] {
-  if (experimentIds.length === 0) return undefined;
-
-  return {
-    programmaticToolCalling: experimentIds.includes("programmatic-tool-calling"),
-    programmaticToolCallingExclusive: experimentIds.includes("programmatic-tool-calling-exclusive"),
-    dynamicWorkflows: experimentIds.includes("dynamic-workflows"),
-    workspaceHeartbeats: experimentIds.includes(EXPERIMENT_IDS.WORKSPACE_HEARTBEATS),
-  };
-}
-
 interface MCPServerEntry {
   name: string;
   command: string;
@@ -340,12 +327,21 @@ program
   .option("-q, --quiet", "only output final result")
   .option("--mcp <server>", "MCP server as name=command (can be repeated)", collectMcpServers, [])
   .option("--no-mcp-config", "ignore global + repo MCP config files (use only --mcp servers)")
-  .option("-e, --experiment <id>", "enable experiment (can be repeated)", collectExperiments, [])
+  .option(
+    "-e, --experiment <id>",
+    "enable experiment (can be repeated)",
+    collectHeadlessExperiments,
+    []
+  )
   .option("-b, --budget <usd>", "stop when session cost exceeds budget (USD)", parseFloat)
   .option("--goal <objective>", "drive an ephemeral CLI Goal Run until complete")
   .option("--goal-budget <budget>", "goal budget, e.g. $5, 5.00, or 500c")
   .option("--goal-turns <turns>", "maximum automatic goal continuation turns")
-  .option("--service-tier <tier>", "OpenAI service tier: auto, default, flex, priority")
+  .option(
+    "--service-tier <tier>",
+    // Derived from the schema so new tiers (e.g. ultrafast) cannot drift from the help text.
+    `OpenAI service tier: ${ServiceTierSchema.options.join(", ")}`
+  )
   .option("--use-1m", "enable 1M context window for supported Anthropic models")
   .option(
     "--keep-background-processes",
@@ -366,6 +362,8 @@ Examples:
   $ xum run --json "List all files" | jq '.type'
   $ xum run --mcp "memory=npx -y @modelcontextprotocol/server-memory" "Remember this"
   $ xum run --mcp "chrome=npx chrome-devtools-mcp" --mcp "fs=npx @anthropic/mcp-fs" "Take a screenshot"
+
+A goal the agent creates with set_goal is adopted and driven like --goal.
 `
   );
 
@@ -384,7 +382,7 @@ interface CLIOptions {
   quiet?: boolean;
   mcp: MCPServerEntry[];
   mcpConfig: boolean;
-  experiment: string[];
+  experiment: ExperimentId[];
   budget?: number;
   goal?: string;
   goalBudget?: string;
@@ -432,54 +430,62 @@ async function main(): Promise<number> {
     process.exit(1);
   }
 
-  // Create ephemeral temp dir for session data (auto-cleaned on exit)
+  // Create the private run config root and default session storage.
   using tempDir = new DisposableTempDir("mux-run");
 
-  // Use real config for providers, but ephemeral temp dir for session data
-  const realConfig = new Config();
-  const config = new Config(tempDir.path);
+  // Read credentials from the real config, then copy them into the private run config.
+  const realStores = createConfigStores();
+  const realConfig = realStores.config;
+
+  // Session telemetry uses the private root by default. Benchmark/CI harnesses can pin it
+  // to collect chat.jsonl and session-usage.json after the process exits.
+  let sessionRootOverride: PreparedRunSessionRoot | undefined;
+  try {
+    sessionRootOverride = await prepareRunSessionRootOverride(process.env, realConfig.rootDir);
+  } catch (error) {
+    console.error(`Error: ${getErrorMessage(error)}`);
+    return 1;
+  }
+  await using preparedSessionRoot = sessionRootOverride;
+  const preparedConfig = await createRunConfig(tempDir.path, preparedSessionRoot);
+  const runStores = createConfigStores(preparedConfig.rootDir);
+  const config = runStores.config;
 
   // Copy providers and secrets from real config to ephemeral config
-  const existingProviders = realConfig.loadProvidersConfig();
-  if (hasAnyConfiguredProvider(existingProviders)) {
-    // Write providers to temp config so services can find them
-    const providersFile = path.join(config.rootDir, "providers.jsonc");
-    fsSync.writeFileSync(providersFile, JSON.stringify(existingProviders, null, 2));
-  }
+  const realProvidersStore = realStores.providersConfigStore;
+  const runProvidersStore = runStores.providersConfigStore;
+  const existingProviders = realProvidersStore.loadProvidersConfig();
+  const providersFile = path.join(config.rootDir, "providers.jsonc");
+  await replacePrivateRunConfigFile(
+    providersFile,
+    hasAnyConfiguredProvider(existingProviders)
+      ? JSON.stringify(existingProviders, null, 2)
+      : undefined
+  );
 
   // Copy secrets so tools/MCP servers get project secrets (e.g., GH_TOKEN)
-  const existingSecrets = realConfig.loadSecretsConfig();
-  if (Object.keys(existingSecrets).length > 0) {
-    const secretsFile = path.join(config.rootDir, "secrets.json");
-    fsSync.writeFileSync(secretsFile, JSON.stringify(existingSecrets, null, 2));
-  }
+  const existingSecrets = realStores.secretsStore.loadSecretsConfig();
+  const secretsFile = path.join(config.rootDir, "secrets.json");
+  await replacePrivateRunConfigFile(
+    secretsFile,
+    Object.keys(existingSecrets).length > 0 ? JSON.stringify(existingSecrets, null, 2) : undefined
+  );
 
-  // Copy only project trust metadata so AIService can read trust flags.
+  // Copy only project trust metadata and the tool-search opt-out so AIService can read them.
   // Avoid importing workspace/task metadata into ephemeral CLI config because
   // stale queued/running records can incorrectly throttle sub-agent tasks.
-  const existingConfig = realConfig.loadConfigOrDefault();
-  if (existingConfig.projects.size > 0) {
-    const trustOnlyProjects = new Map<string, ProjectConfig>();
-    for (const [projectPath, projectConfig] of existingConfig.projects) {
-      if (projectConfig.trusted === undefined) {
-        continue;
-      }
-
-      trustOnlyProjects.set(projectPath, {
-        workspaces: [],
-        trusted: projectConfig.trusted,
-      });
-    }
-
-    if (trustOnlyProjects.size > 0) {
-      // Config.saveConfig is private (lost-update safety); route through the queue.
-      await config.editConfig((cfg) => ({ ...cfg, projects: trustOnlyProjects }));
-    }
-  }
+  // Replace the full map so a reused run root cannot retain trust removed from real config.
+  await replaceRunConfig(realConfig, config);
 
   const workspaceId = generateWorkspaceId();
   const projectDir = path.resolve(opts.dir);
   await ensureDirectory(projectDir);
+
+  // Trust for a linked worktree is recorded against the main repository, but
+  // TaskService's sub-agent gate looks up this exact checkout path in the
+  // ephemeral config. Materialize effective trust (direct or main-repo
+  // fallback) onto projectDir so trusted worktrees can spawn sub-agents.
+  const projectTrusted = await materializeResolvedTrust(realConfig, config, projectDir);
 
   // Shared normalization (alias resolution + gateway migration + format
   // validation); an unrecognized -m value fails up front instead of failing
@@ -536,6 +542,7 @@ async function main(): Promise<number> {
   const emitJsonLine = (payload: unknown) => {
     if (emitJson) process.stdout.write(`${JSON.stringify(payload)}\n`);
   };
+  fatalJsonMode = emitJson;
 
   // Log startup info (shown at info+ level, i.e., with --verbose)
   log.info(`Directory: ${projectDir}`);
@@ -549,21 +556,13 @@ async function main(): Promise<number> {
   if (!hasAnyConfiguredProvider(existingProviders)) {
     const providersFromEnv = buildProvidersFromEnv();
     if (hasAnyConfiguredProvider(providersFromEnv)) {
-      config.saveProvidersConfig(providersFromEnv);
+      runProvidersStore.saveProvidersConfig(providersFromEnv);
     } else {
       throw new Error(
         "No provider credentials found. Configure providers.jsonc or set ANTHROPIC_API_KEY / OPENAI_API_KEY / OPENROUTER_API_KEY / GOOGLE_GENERATIVE_AI_API_KEY / MOONSHOT_API_KEY."
       );
     }
   }
-
-  // Enforce managed policy (MUX_POLICY_FILE / Xum Governor) in headless runs
-  // too, matching the desktop wiring: without this, `xum run` would keep using
-  // providers/models/credentials that providerAccess now denies. Bind to the
-  // REAL config so governor enrollment settings (muxGovernorUrl/Token) are
-  // honored — the ephemeral tempDir config only receives project trust flags.
-  const policyService = new PolicyService(realConfig);
-  await policyService.initialize();
 
   // Initialize the core service graph (shared with ServiceContainer).
   // CLI overrides: ephemeral extension metadata, persistent MCP config via
@@ -574,6 +573,7 @@ async function main(): Promise<number> {
   }
   const {
     aiService,
+    contextManagement,
     historyService,
     initStateManager,
     backgroundProcessManager,
@@ -582,46 +582,61 @@ async function main(): Promise<number> {
     workspaceService,
     workspaceGoalService,
     idleDispatcher,
+    streamManager,
+    turnRequestBuilderBindings,
+    runtime: coreRuntime,
+    appFiberScope,
   } = createCoreServices({
-    config,
-    policyService,
+    ...runStores,
     extensionMetadataPath: path.join(tempDir.path, "extensionMetadata.json"),
     // Session config lives in tempDir (deleted on exit) — disable workspace.*
     // host actions so workflows can't create worktrees whose tags evaporate.
     mcpConfig: realConfig,
+    experimentsService: await createHeadlessExperimentsService(config.rootDir, opts.experiment),
     mcpServerManagerOptions: {
       inlineServers,
       ignoreConfigFile: !opts.mcpConfig,
     },
-    goalServiceOptions: hasGoal
-      ? {
-          continuationCooldownMs: 0,
-          allowUserOriginBudgetWrapup: true,
-          suppressKickoffContinuation: true,
-        }
-      : undefined,
+    // Plain runs drive a goal the agent creates with set_goal, like a chat session
+    // does (#5356): the goal's own budget and turn caps bound that spend.
+    goalServiceOptions: {
+      continuationCooldownMs: 0,
+      allowUserOriginBudgetWrapup: true,
+      suppressKickoffContinuation: true,
+    },
   });
 
   // `xum run` uses createCoreServices directly (without ServiceContainer), so wire
   // Codex OAuth explicitly to ensure Codex-routed OpenAI requests can load/refresh
   // OAuth tokens from providers.jsonc.
-  const codexOauthService = new CodexOauthService(config, providerService);
-  aiService.setCodexOauthService(codexOauthService);
+  const codexOauthService = new CodexOauthService(runProvidersStore, providerService);
+  turnRequestBuilderBindings.codexOauthService = codexOauthService;
   // Same for Coder OAuth: coder:* models need per-request token loading/refresh.
   // Bind it to the REAL config (not the ephemeral tempDir copy): Coder rotates
   // the refresh token on every use, so persisting rotations only to tempDir
   // would strand ~/.xum/providers.jsonc with a consumed (dead) refresh token
   // once this CLI session exits.
-  const realProviderService = new ProviderService(realConfig, policyService);
-  const coderOauthService = new CoderOauthService(
+  const realFileLeaseManager = realStores.fileLeaseManager;
+  const realProviderService = new ProviderService(
     realConfig,
-    realProviderService,
-    undefined,
-    // Policy-aware: an enforced forcedBaseUrl overrides the deployment URL for
-    // token refreshes/issuer checks, and denied providers fail closed.
-    policyService
+    realProvidersStore,
+    realFileLeaseManager
   );
-  aiService.setCoderOauthService(coderOauthService);
+  const coderOauthService = new CoderOauthService(
+    realProvidersStore,
+    realFileLeaseManager,
+    realProviderService
+  );
+  turnRequestBuilderBindings.coderOauthService = coderOauthService;
+
+  // The agent commands of this run start from this process, so it applies the limits that
+  // Settings saved in the real config, as the server does.
+  const agentResourceLimits = new AgentResourceLimitsService(realConfig);
+  await agentResourceLimits.start();
+  // Likewise the agent sandbox setting, so `xum run` commands get the sandbox Settings saved.
+  const agentSandbox = new AgentSandboxService(realConfig, { privateConfigRoot: config.rootDir });
+  await agentSandbox.start();
+  sandboxApprovalManager.denyAllRequests();
 
   // CLI-only exit code control: allows agent to set the process exit code
   // Useful for CI workflows where the agent should block merge on failure
@@ -646,17 +661,24 @@ async function main(): Promise<number> {
       return { success: true, exit_code };
     },
   });
-  aiService.setExtraTools({ set_exit_code: setExitCodeTool });
+  turnRequestBuilderBindings.extraTools = { set_exit_code: setExitCodeTool };
 
   const session = new AgentSession({
+    contextManagement,
+    effectRunner: coreRuntime.get(EffectRunnerTag),
+    appFiberScope,
     workspaceId,
     config,
     historyService,
     aiService,
+    streamManager,
     initStateManager,
     backgroundProcessManager,
     workspaceGoalService,
     keepBackgroundProcesses,
+    // sendAndAwait returns on each stream-end, and the run can exit after it: a turn.stop
+    // continuation queued after stream-end would run unseen (Codex PRRT_kwDOPxxmWM6rxPMC).
+    callerOwnsTurnEnd: true,
     // Direct CLI registration bypasses WorkspaceService.create, so a
     // preserved checkout could carry a stale `plugin:` MCP override into a
     // same-name reinstall on the first send; sanitize before announcing.
@@ -728,8 +750,9 @@ async function main(): Promise<number> {
       // Fallback to main
     }
 
-    // Read trust state from real config so trusted projects can run hooks
-    const trusted = realConfig.loadConfigOrDefault().projects.get(projectDir)?.trusted ?? false;
+    // Effective trust (including main-repo fallback for linked worktrees) was
+    // resolved and materialized into the ephemeral config above.
+    const trusted = projectTrusted;
 
     const createEnv = Object.fromEntries(
       Object.entries(process.env).filter(
@@ -765,6 +788,7 @@ async function main(): Promise<number> {
         projectPath: projectDir,
         branchName,
         trunkBranch,
+        // eslint-disable-next-line @typescript-eslint/no-non-null-assertion -- legacy site from before the ban; remove when touching this line
         workspacePath: createResult.workspacePath!,
         initLogger,
         env: createEnv,
@@ -790,6 +814,7 @@ async function main(): Promise<number> {
     }
 
     // Docker maps to /src in-container; SSH returns the remote checkout path.
+    // eslint-disable-next-line @typescript-eslint/no-non-null-assertion -- legacy site from before the ban; remove when touching this line
     workspacePath = createResult.workspacePath!;
   }
 
@@ -805,13 +830,10 @@ async function main(): Promise<number> {
   // Calling initialize() on a fresh config is a no-op, but skipping it makes the intent
   // clear and avoids any risk of cross-workspace side effects if config were ever shared.
 
-  const experiments = buildExperimentsObject(opts.experiment);
-
   const buildSendOptions = (cliMode: CLIMode): SendMessageOptions => ({
     model,
     thinkingLevel,
     agentId: cliMode,
-    experiments,
     providerOptions: {
       ...(opts.use1m && { anthropic: { use1MContext: true } }),
       ...(opts.serviceTier != null && { openai: { serviceTier: opts.serviceTier } }),
@@ -832,6 +854,10 @@ async function main(): Promise<number> {
   });
 
   let goalStopReason: string | null = null;
+  let cliGoalId: string | undefined;
+  // True once the run owns a goal: --goal from the start, or a plain run whose
+  // agent created one with set_goal during its first turn (adopted below).
+  let drivesGoal = hasGoal;
   if (hasGoal) {
     const setGoalResult = await workspaceGoalService.setGoal({
       workspaceId,
@@ -843,6 +869,7 @@ async function main(): Promise<number> {
     if (!setGoalResult.success) {
       throw new Error(`Failed to set CLI goal: ${setGoalResult.error.type}`);
     }
+    cliGoalId = setGoalResult.data.goalId;
     const warning =
       goalBudgetCents == null && goalTurnCap == null
         ? "CLI Goal Run has no --goal-budget or --goal-turns limit. It will continue until the goal is complete or another stop condition occurs."
@@ -864,6 +891,7 @@ async function main(): Promise<number> {
 
   const liveEvents: WorkspaceChatMessage[] = [];
   let readyForLive = false;
+  let historyReplayFailed = false;
 
   /**
    * Tracks whether stdout currently has an unfinished line (i.e. the last write was
@@ -875,7 +903,6 @@ async function main(): Promise<number> {
   let streamLineOpen = false;
   let activeMessageId: string | null = null;
   let planProposed = false;
-  let streamEnded = false;
 
   // Track usage for cost summary at end of run
   const usageHistory: ChatUsageDisplay[] = [];
@@ -906,6 +933,20 @@ async function main(): Promise<number> {
 
   // Budget tracking state
   let budgetExceeded = false;
+  let budgetStop: Promise<void> | null = null;
+  // The budget cap is the user's Stop: go through the retiring interrupt so owed background-process
+  // attention is dismissed, or the after-idle reconcile would start another billed turn before
+  // teardown. The Err case is a stop that did not persist, not a stop that failed. The stream abort
+  // settles the run before retirement is durable, so teardown awaits this promise first.
+  const stopForBudget = (): void => {
+    budgetStop ??= workspaceService
+      .interruptStream(workspaceId, { abandonPartial: false, retireBashMonitorAttention: true })
+      .then((result) => {
+        if (!result.success) {
+          log.warn("Budget stop was not recorded", { workspaceId, error: result.error });
+        }
+      });
+  };
 
   // Centralized output type tracking for spacing
   type OutputType = "none" | "text" | "thinking" | "tool";
@@ -935,87 +976,28 @@ async function main(): Promise<number> {
     lastOutputType = nextType;
   };
 
-  let resolveCompletion: ((value: void) => void) | null = null;
-  let rejectCompletion: ((reason?: unknown) => void) | null = null;
-  let completionPromise: Promise<void> = Promise.resolve();
-
-  let resolveStreamStarted: (() => void) | null = null;
-  let streamStartedPromise: Promise<void> = Promise.resolve();
-
-  const createCompletionPromise = (): Promise<void> => {
-    streamEnded = false;
-    streamStartedPromise = new Promise<void>((resolve) => {
-      resolveStreamStarted = resolve;
-    });
-    return new Promise<void>((resolve, reject) => {
-      resolveCompletion = resolve;
-      rejectCompletion = reject;
-    });
-  };
-
-  const waitForCompletion = async (): Promise<void> => {
-    await completionPromise;
-
-    if (!streamEnded) {
-      throw new Error("Stream completion promise resolved unexpectedly without stream end");
-    }
-  };
-
-  const waitForStreamStarted = async (timeoutMs?: number): Promise<void> => {
-    let timer: ReturnType<typeof setTimeout> | null = null;
-    const streamFailedOrEndedBeforeStart = completionPromise.then(() => {
-      throw new Error("Goal continuation stream ended before it started");
-    });
-    const waits: Array<Promise<void>> = [streamStartedPromise, streamFailedOrEndedBeforeStart];
-    if (timeoutMs != null) {
-      waits.push(
-        new Promise<never>((_, reject) => {
-          timer = setTimeout(() => {
-            reject(new Error("Timed out waiting for goal continuation stream to start"));
-          }, timeoutMs);
-          timer.unref?.();
-        })
-      );
-    }
-    try {
-      await Promise.race(waits);
-    } finally {
-      if (timer != null) {
-        clearTimeout(timer);
-      }
-    }
-  };
-
-  const resetCompletionHandlers = () => {
-    resolveCompletion = null;
-    rejectCompletion = null;
-    resolveStreamStarted = null;
-  };
+  const streamWaits = new CliStreamWaits();
 
   const rejectStream = (error: Error) => {
     // Keep terminal output readable (error messages should not start mid-line)
     closeHumanLine();
-    rejectCompletion?.(error);
-    resetCompletionHandlers();
+    streamWaits.onStreamFailed(error);
   };
 
   const resolveStream = () => {
     closeHumanLine();
-
-    streamEnded = true;
-    resolveCompletion?.();
-    resetCompletionHandlers();
+    streamWaits.onStreamEnd();
 
     activeMessageId = null;
     toolCallArgs.clear();
   };
 
   const sendAndAwait = async (msg: string, options: SendMessageOptions): Promise<void> => {
-    completionPromise = createCompletionPromise();
+    streamWaits.arm();
     const sendResult = await session.sendMessage(
       msg,
       options,
-      hasGoal
+      drivesGoal
         ? {
             // CLI goal runs suppress the desktop kickoff dispatcher and drive
             // their own user turns, so mark them as the durable goal
@@ -1023,6 +1005,7 @@ async function main(): Promise<number> {
             synthetic: true,
             agentInitiated: true,
             goalKind: GOAL_CONTINUATION_KIND,
+            goalId: cliGoalId,
             goalContinuation: true,
           }
         : undefined
@@ -1042,11 +1025,11 @@ async function main(): Promise<number> {
       }
       throw new Error(`Failed to send message: ${formattedError}`);
     }
-    await waitForCompletion();
+    await streamWaits.waitForCompletion();
   };
 
   const getGoal = async (): Promise<GoalRecordV1 | null> => {
-    if (!hasGoal) return null;
+    if (!drivesGoal) return null;
     return workspaceGoalService.getGoal(workspaceId);
   };
 
@@ -1114,6 +1097,12 @@ async function main(): Promise<number> {
 
     if (!readyForLive) {
       if (isCaughtUpMessage(payload)) {
+        // caught-up is emitted even when history could not be read (it closes the replay);
+        // only a complete replay means the session is ready for a history-mutating send.
+        if (payload.historyReplayStatus === "failed") {
+          historyReplayFailed = true;
+          return;
+        }
         readyForLive = true;
         emitJsonLine({ type: "caught-up", workspaceId });
       }
@@ -1136,7 +1125,7 @@ async function main(): Promise<number> {
         );
         return;
       }
-      resolveStreamStarted?.();
+      streamWaits.onStreamStart();
       activeMessageId = payload.messageId;
       return;
     }
@@ -1274,7 +1263,7 @@ async function main(): Promise<number> {
           const msg = `Budget exceeded ($${cost.toFixed(2)} of $${budget.toFixed(2)}) - stopping`;
           emitJsonLine({ type: "budget-exceeded", spent: cost, budget });
           writeHumanLineClosed(`\n${chalk.yellow(msg)}`);
-          void session.interruptStream({ abandonPartial: false });
+          stopForBudget();
         }
       }
       return;
@@ -1322,7 +1311,7 @@ async function main(): Promise<number> {
           const msg = `Budget exceeded ($${cost.toFixed(2)} of $${budget.toFixed(2)}) - stopping`;
           emitJsonLine({ type: "budget-exceeded", spent: cost, budget });
           writeHumanLineClosed(`\n${chalk.yellow(msg)}`);
-          void session.interruptStream({ abandonPartial: false });
+          stopForBudget();
         }
       }
       return;
@@ -1335,7 +1324,35 @@ async function main(): Promise<number> {
   const unsubscribe = await session.subscribeChat(chatListener);
 
   try {
+    if (historyReplayFailed) {
+      throw new Error(
+        `Workspace ${workspaceId} history could not be read; refusing to send into an unverified transcript`
+      );
+    }
+    // The workspace is fresh, so any goal it holds was created by the agent's set_goal.
+    // Adopt it after each turn the run sends itself (the initial turn and the plan
+    // auto-approval, where a plan run's agent first can call set_goal): from then on
+    // the run drives it and exits exactly like a --goal run.
+    const adoptAgentCreatedGoal = async (): Promise<void> => {
+      if (drivesGoal) return;
+      const createdGoal = await workspaceGoalService.getGoal(workspaceId);
+      if (createdGoal == null) return;
+      drivesGoal = true;
+      cliGoalId = createdGoal.goalId;
+      emitJsonLine({
+        type: "goal-adopted",
+        workspaceId,
+        goalId: createdGoal.goalId,
+        objective: createdGoal.objective,
+        status: createdGoal.status,
+        budgetCents: createdGoal.budgetCents,
+        turnCap: createdGoal.turnCap,
+      });
+      writeHumanLineClosed(`[goal] adopted: ${createdGoal.objective}`);
+    };
+
     await sendAndAwait(message, buildSendOptions(initialMode));
+    await adoptAgentCreatedGoal();
 
     // Stop if budget was exceeded during first message
     if (budgetExceeded) {
@@ -1345,7 +1362,7 @@ async function main(): Promise<number> {
       planProposed = false;
       if (initialMode === "plan" && !planWasProposed) {
         const goalAfterFirstTurn = await getGoal();
-        if (!hasGoal || goalAfterFirstTurn?.status !== "budget_limited") {
+        if (!drivesGoal || goalAfterFirstTurn?.status !== "budget_limited") {
           throw new Error("Plan mode was requested, but the assistant never proposed a plan.");
         }
       }
@@ -1354,8 +1371,9 @@ async function main(): Promise<number> {
           "\n[auto] Plan received. Approving and switching to execute mode...\n"
         );
         await sendAndAwait("Plan approved. Execute it.", buildSendOptions("exec"));
+        await adoptAgentCreatedGoal();
       }
-      if (hasGoal && !budgetExceeded) {
+      if (drivesGoal && !budgetExceeded) {
         try {
           await driveCliGoalUntilTerminal({
             workspaceId,
@@ -1370,11 +1388,9 @@ async function main(): Promise<number> {
               idleDispatcher.requestDispatch(workspaceId, GOAL_CONTINUATION_IDLE_CONSUMER_NAME),
             checkGoalContinuationEligibility: (nowMs) =>
               workspaceGoalService.checkGoalContinuationEligibility(workspaceId, nowMs),
-            prepareForContinuation: () => {
-              completionPromise = createCompletionPromise();
-            },
-            waitForStreamStarted,
-            waitForCompletion,
+            prepareForContinuation: () => streamWaits.prepareForContinuation(),
+            waitForStreamStarted: (timeoutMs) => streamWaits.waitForStreamStarted(timeoutMs),
+            waitForCompletion: () => streamWaits.waitForCompletion(),
             streamStartTimeoutMs: CLI_GOAL_STREAM_START_TIMEOUT_MS,
             isSessionBudgetExceeded: () => budgetExceeded,
             nowMs: Date.now,
@@ -1396,7 +1412,7 @@ async function main(): Promise<number> {
 
     if (
       budgetExceeded &&
-      hasGoal &&
+      drivesGoal &&
       goalStopReason == null &&
       finalGoalRecord?.status !== "complete"
     ) {
@@ -1470,23 +1486,58 @@ async function main(): Promise<number> {
       }
     }
   } finally {
-    unsubscribe();
-    // Suppress monitor:stopped before session.dispose() triggers cleanup() so persisted
-    // armed-monitor registry records survive shutdown (post-restart "monitor lost" wakes).
-    backgroundProcessManager.beginShutdown();
-    session.dispose();
-    mcpServerManager.dispose();
-    await codexOauthService.dispose();
-    await coderOauthService.dispose();
-    realProviderService.dispose();
-    policyService.dispose();
-    if (!keepBackgroundProcesses) {
-      await backgroundProcessManager.terminateAll();
-    }
+    // Teardown failures must not flip a finished run into exit 1: a rejection
+    // here would reach main().catch after run-complete was already emitted,
+    // and benchmark harnesses then discard the whole trial as an infra error.
+    // Contain each step, report it, and keep going.
+    await runBestEffortCleanup(
+      [
+        { name: "budgetStop", run: () => budgetStop ?? undefined },
+        { name: "unsubscribe", run: () => unsubscribe() },
+        // Suppress monitor:stopped before session.dispose() triggers cleanup() so persisted
+        // armed-monitor registry records survive shutdown (post-restart "monitor lost" wakes).
+        {
+          name: "backgroundProcessManager.beginShutdown",
+          run: () => backgroundProcessManager.beginShutdown(),
+        },
+        // Interrupt + await the runtime's supervised fibers while their
+        // dependencies are still alive (same slot as ServiceContainer.dispose).
+        { name: "appFiberScope.close", run: () => closeScopeBounded(appFiberScope) },
+        // The service guardian joins disposal inside closeScopeBounded. After a timeout,
+        // only initiate cleanup here: a second unbounded join would prevent CLI exit.
+        { name: "session.dispose", run: () => session.beginDispose() },
+        { name: "mcpServerManager.dispose", run: () => mcpServerManager.dispose() },
+        { name: "codexOauthService.dispose", run: () => codexOauthService.dispose() },
+        { name: "coderOauthService.dispose", run: () => coderOauthService.dispose() },
+        { name: "realProviderService.dispose", run: () => realProviderService.dispose() },
+        ...(keepBackgroundProcesses
+          ? []
+          : [
+              {
+                name: "backgroundProcessManager.terminateAll",
+                run: () => backgroundProcessManager.terminateAll(),
+              },
+            ]),
+        // Hygiene, as in ServiceContainer.dispose: the watches are non-persistent, so they
+        // never hold the process open, but no callback reaches torn-down services.
+        { name: "config.stopWatchingConfigFile", run: () => config.stopWatchingConfigFile() },
+        { name: "agentResourceLimits.dispose", run: () => agentResourceLimits.dispose() },
+        { name: "agentSandbox.dispose", run: () => agentSandbox.dispose() },
+        // Last: release the Effect runtime that owns the core graph.
+        { name: "appRuntime.dispose", run: () => disposeAppRuntime(coreRuntime.managed) },
+      ],
+      (stepName, error) => {
+        const message = getErrorMessage(error);
+        process.stderr.write(`[cleanup] ${stepName} failed: ${message}\n`);
+        emitJsonLine({ type: "run-cleanup-error", step: stepName, error: message });
+      }
+    );
   }
 
-  if (budgetExceeded) return 2;
-  if (hasGoal && (goalDriverError != null || finalGoalRecord?.status !== "complete")) {
+  let exitOutcome: number;
+  if (budgetExceeded) {
+    exitOutcome = 2;
+  } else if (drivesGoal && (goalDriverError != null || finalGoalRecord?.status !== "complete")) {
     const reason = goalStopReason ?? describeCliGoalStop(finalGoalRecord);
     writeHumanLineClosed(`[goal] stopped: ${reason}`);
     emitJsonLine({
@@ -1496,10 +1547,78 @@ async function main(): Promise<number> {
       status: finalGoalRecord?.status ?? null,
       stopReason: reason,
     });
-    return 3;
+    exitOutcome = 3;
+  } else {
+    exitOutcome = agentExitCode ?? 0;
   }
-  return agentExitCode ?? 0;
+  completedExitCode = exitOutcome;
+  return exitOutcome;
 }
+
+// Fatal diagnostics must survive benchmark transports: stderr is a pipe whose
+// buffered bytes process.exit() discards, so a late failure was previously an
+// invisible exit 1 that voided a completed run. Mirror fatal errors onto
+// stdout as JSON (when --json) and flush both streams before exiting.
+let fatalJsonMode = false;
+let completedExitCode: number | null = null;
+
+function reportFatalError(kind: string, prefix: string, error: unknown): void {
+  const message = getErrorMessage(error);
+  const stack = error instanceof Error ? error.stack : undefined;
+  try {
+    process.stderr.write(`${prefix}${message}\n${stack ? `${stack}\n` : ""}`);
+  } catch {
+    // stderr may already be gone; the JSON mirror below still records it.
+  }
+  if (fatalJsonMode) {
+    try {
+      process.stdout.write(`${JSON.stringify({ type: "run-fatal", kind, error: message })}\n`);
+    } catch {
+      // Nothing left to report to.
+    }
+  }
+}
+
+function exitAfterStreamFlush(exitCode: number): void {
+  const pending = [process.stdout, process.stderr].filter((stream) => stream.writableNeedDrain);
+  const exit = () => process.exit(exitCode);
+  if (pending.length === 0) {
+    exit();
+    return;
+  }
+  let remaining = pending.length;
+  for (const stream of pending) {
+    let settled = false;
+    const settleOne = () => {
+      if (settled) return;
+      settled = true;
+      remaining -= 1;
+      if (remaining <= 0) exit();
+    };
+    stream.once("drain", settleOne);
+    stream.once("error", settleOne);
+    stream.once("close", settleOne);
+  }
+  // Ref'd on purpose: keep the event loop alive until the flush window closes.
+  setTimeout(exit, 5000);
+}
+
+// Last-resort handlers: without them a stray rejection or throw (e.g. from a
+// fire-and-forget teardown promise) exits 1 with its report lost in an
+// unflushed pipe, and a completed benchmark trial gets discarded as an
+// infrastructure failure.
+process.on("uncaughtException", (error) => {
+  reportFatalError("uncaught-exception", "Uncaught exception: ", error);
+  exitAfterStreamFlush(completedExitCode ?? 1);
+});
+process.on("unhandledRejection", (reason) => {
+  reportFatalError("unhandled-rejection", "Unhandled rejection: ", reason);
+  // After the run outcome is final the normal exit path is already in
+  // flight; report only and let it exit with the real code.
+  if (completedExitCode == null) {
+    exitAfterStreamFlush(1);
+  }
+});
 
 // Keep process alive - Bun may exit when stdin closes even if async work is pending
 const keepAliveInterval = setInterval(() => {
@@ -1514,17 +1633,20 @@ main()
     if (process.stdout.writableNeedDrain) {
       const exit = () => process.exit(exitCode);
       process.stdout.once("drain", exit);
-      // Safety: if the downstream consumer closes (broken pipe) or backpressure
-      // never resolves, exit anyway after 1s to avoid hanging.
+      // Safety: if the downstream consumer closes (broken pipe), exit
+      // immediately. The backpressure timeout must be generous: the final
+      // --json stream-end + run-complete lines can be hundreds of KB, and a
+      // 1s cap was observed truncating them mid-line under pipe backpressure,
+      // silently losing cost telemetry in benchmark runs.
       process.stdout.once("error", exit);
       process.stdout.once("close", exit);
-      setTimeout(exit, 1000).unref();
+      setTimeout(exit, 30_000).unref();
     } else {
       process.exit(exitCode);
     }
   })
   .catch((error) => {
     clearInterval(keepAliveInterval);
-    console.error(`Error: ${getErrorMessage(error)}`);
-    process.exit(1);
+    reportFatalError("run-error", "Error: ", error);
+    exitAfterStreamFlush(1);
   });

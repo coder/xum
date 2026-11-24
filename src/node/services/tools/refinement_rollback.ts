@@ -3,6 +3,7 @@ import { tool, type Tool } from "ai";
 import type { RefinementRollbackToolResult } from "@/common/types/tools";
 import { TOOL_DEFINITIONS } from "@/common/utils/tools/toolDefinitions";
 import { rollbackRefinement } from "@/node/services/refinement/refinementRollback";
+import type { SessionLocks } from "@/node/services/sessionLocks/sessionLocks";
 
 interface RefinementRollbackToolArgs {
   id: string;
@@ -20,6 +21,10 @@ interface RefinementRollbackToolArgs {
 export function createRefinementRollbackTool(ctx: {
   workspaceId: string;
   sessionDir: string;
+  /** The rollback and target locks (phase 4: SessionLocks). Absent: the Node layer. */
+  locks?: SessionLocks;
+  /** Read at call time, like the memory tool: the agent sandbox covers this workspace. */
+  blocksGlobalWrites?: () => boolean;
 }): Tool {
   return tool({
     description: TOOL_DEFINITIONS.refinement_rollback.description,
@@ -30,6 +35,8 @@ export function createRefinementRollbackTool(ctx: {
     ): Promise<RefinementRollbackToolResult> => {
       const result = await rollbackRefinement({
         sessionDir: ctx.sessionDir,
+        locks: ctx.locks,
+        refuseGlobalWrites: ctx.blocksGlobalWrites?.() === true,
         id,
         reason,
         evidence: { toolName: "refinement_rollback", toolCallId, actor: "agent" },

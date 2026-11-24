@@ -3,14 +3,24 @@ import { CompactionHandler } from "./compactionHandler";
 import type { HistoryService } from "./historyService";
 import { createTestHistoryService } from "./testHistoryService";
 import * as fsPromises from "fs/promises";
+import * as syncFs from "node:fs";
 import * as os from "os";
 import * as path from "path";
 
 import type { EventEmitter } from "events";
 import { CONTEXT_BOUNDARY_KINDS } from "@/common/constants/contextBoundary";
 import { MAX_EDITED_FILES } from "@/common/constants/attachments";
-import { createMuxMessage, type MuxMessage } from "@/common/types/message";
+import {
+  createMuxMessage,
+  type CompactionFollowUpRequest,
+  type MuxMessage,
+} from "@/common/types/message";
 import type { CompactionCompletionMetadata } from "@/common/types/compaction";
+import { SESSION_HISTORY_MAX_LINE_BYTES } from "@/common/constants/contextBudget";
+import { CHAT_ARCHIVE_FILE_NAME, CHAT_FILE_NAME } from "@/common/constants/paths";
+import assert from "@/common/utils/assert";
+import { formatCompactionSummaryTruncationMarker } from "./historyRowBudget";
+import { countTokens } from "@/node/utils/main/tokenizer";
 import type { StreamEndEvent } from "@/common/types/stream";
 import type { TelemetryService } from "./telemetryService";
 import type { TelemetryEventPayload } from "@/common/telemetry/payload";
@@ -139,26 +149,41 @@ describe("CompactionHandler", () => {
   let telemetryCapture: ReturnType<typeof mock>;
   let telemetryService: TelemetryService;
   let sessionDir: string;
+  let historyPath: string;
   let emittedEvents: EmittedEvent[];
   const workspaceId = "test-workspace";
 
-  // Helper: seed messages into real history and return spies for tracking handler calls.
-  // Spies are created AFTER seeding so they only track handler-initiated calls.
+  async function historyRows() {
+    const result = await historyService.getLastMessages(workspaceId, 1000);
+    if (!result.success) throw new Error(result.error);
+    return result.data;
+  }
+
+  function failBoundaryCommit(message = "Boundary commit failed") {
+    const rename = syncFs.renameSync;
+    return spyOn(syncFs, "renameSync").mockImplementation((from, to) => {
+      if (to === historyPath) throw new Error(message);
+      rename(from, to);
+    });
+  }
+
+  // Assert the actual committed rows so the test does not depend on a particular write route.
   const seedHistory = async (...messages: MuxMessage[]) => {
     for (const msg of messages) {
       const result = await historyService.appendToHistory(workspaceId, msg);
       if (!result.success) throw new Error(`Seed failed: ${result.error}`);
     }
     return {
-      appendSpy: spyOn(historyService, "appendToHistory"),
+      appended: async () =>
+        (await historyRows()).filter((row) => !messages.some((seed) => seed.id === row.id)),
       clearSpy: spyOn(historyService, "clearHistory"),
-      updateSpy: spyOn(historyService, "updateHistory"),
     };
   };
 
   beforeEach(async () => {
     const testHistory = await createTestHistoryService();
     historyService = testHistory.historyService;
+    historyPath = path.join(testHistory.config.sessionsDir, workspaceId, "chat.jsonl");
     cleanup = testHistory.cleanup;
 
     const { emitter, events } = createMockEmitter();
@@ -182,7 +207,9 @@ describe("CompactionHandler", () => {
   });
 
   afterEach(async () => {
+    mock.restore();
     await cleanup();
+    await fsPromises.rm(sessionDir, { recursive: true, force: true });
   });
 
   describe("handleCompletion() - Normal Compaction Flow", () => {
@@ -530,6 +557,7 @@ describe("CompactionHandler", () => {
         persistedPath,
         JSON.stringify({
           version: 1,
+          boundaryMessageId: existingBoundary.id,
           createdAt: Date.now(),
           diffs: [
             {
@@ -579,6 +607,7 @@ describe("CompactionHandler", () => {
         persistedPath,
         JSON.stringify({
           version: 1,
+          boundaryMessageId: existingBoundary.id,
           createdAt: Date.now(),
           diffs: [
             {
@@ -658,6 +687,7 @@ describe("CompactionHandler", () => {
         persistedPath,
         JSON.stringify({
           version: 1,
+          boundaryMessageId: existingBoundary.id,
           createdAt: Date.now(),
           diffs: staleDiffs,
           loadedSkills: [],
@@ -895,7 +925,7 @@ describe("CompactionHandler", () => {
 
     it("should join multiple text parts from event.parts", async () => {
       const compactionReq = createCompactionRequest();
-      const { appendSpy } = await seedHistory(compactionReq);
+      const { appended } = await seedHistory(compactionReq);
 
       // Create event with multiple text parts
       const event: StreamEndEvent = {
@@ -915,7 +945,7 @@ describe("CompactionHandler", () => {
       };
       await handler.handleCompletion(event);
 
-      const appendedMsg = appendSpy.mock.calls[0][1];
+      const appendedMsg = (await appended())[0];
       expect((appendedMsg.parts[0] as { type: "text"; text: string }).text).toBe(
         "Part 1 Part 2 Part 3"
       );
@@ -923,44 +953,39 @@ describe("CompactionHandler", () => {
 
     it("should extract summary text from event.parts", async () => {
       const compactionReq = createCompactionRequest();
-      const { appendSpy } = await seedHistory(compactionReq);
+      const { appended } = await seedHistory(compactionReq);
 
       const event = createStreamEndEvent("This is the summary");
       await handler.handleCompletion(event);
 
-      const appendedMsg = appendSpy.mock.calls[0][1];
+      const appendedMsg = (await appended())[0];
       expect((appendedMsg.parts[0] as { type: "text"; text: string }).text).toBe(
         "This is the summary"
       );
     });
 
-    it("should delete partial.json before appending summary (race condition fix)", async () => {
-      const compactionReq = createCompactionRequest();
-      await seedHistory(compactionReq);
-      const deletePartialSpy = spyOn(historyService, "deletePartial");
-
-      const event = createStreamEndEvent("Summary");
-      await handler.handleCompletion(event);
-
-      // deletePartial should be called once before appendToHistory
-      expect(deletePartialSpy.mock.calls).toHaveLength(1);
-      expect(deletePartialSpy.mock.calls[0][0]).toBe(workspaceId);
-
-      // Verify deletePartial was called (we can't easily verify order without more complex mocking,
-      // but the important thing is that it IS called during compaction)
+    it("retires the completed partial before its summary can be replayed", async () => {
+      await seedHistory(createCompactionRequest());
+      const partial = createMuxMessage("msg-id", "assistant", "Old partial");
+      expect((await historyService.writePartial(workspaceId, partial)).success).toBe(true);
+      expect(await handler.handleCompletion(createStreamEndEvent("Summary"))).toBe(true);
+      expect(await historyService.readPartial(workspaceId)).toBeNull();
+      expect((await historyService.commitPartial(workspaceId)).success).toBe(true);
+      const summaries = (await historyRows()).filter((row) => row.metadata?.compactionBoundary);
+      expect(summaries).toHaveLength(1);
+      expect(summaries[0].parts).toMatchObject([{ type: "text", text: "Summary" }]);
     });
 
     it("should append summary without clearing history", async () => {
       const compactionReq = createCompactionRequest();
-      const { appendSpy, clearSpy } = await seedHistory(compactionReq);
+      const { appended, clearSpy } = await seedHistory(compactionReq);
 
       const event = createStreamEndEvent("Summary");
       await handler.handleCompletion(event);
 
       expect(clearSpy.mock.calls).toHaveLength(0);
-      expect(appendSpy.mock.calls).toHaveLength(1);
-      expect(appendSpy.mock.calls[0][0]).toBe(workspaceId);
-      const appendedMsg = appendSpy.mock.calls[0][1];
+      expect(await appended()).toHaveLength(1);
+      const appendedMsg = (await appended())[0];
       expect(appendedMsg.role).toBe("assistant");
       expect((appendedMsg.parts[0] as { type: "text"; text: string }).text).toBe("Summary");
     });
@@ -1082,12 +1107,12 @@ describe("CompactionHandler", () => {
         historySequence: 5,
         muxMetadata: { type: "compaction-request", rawCommand: "/compact", parsed: {} },
       });
-      const { appendSpy } = await seedHistory(priorMessage, compactionReq);
+      const { appended } = await seedHistory(priorMessage, compactionReq);
 
       const event = createStreamEndEvent("Summary");
       await handler.handleCompletion(event);
 
-      const appendedMsg = appendSpy.mock.calls[0][1];
+      const appendedMsg = (await appended())[0];
       expect(appendedMsg.metadata?.compacted).toBe("user");
       expect(appendedMsg.metadata?.compactionBoundary).toBe(true);
       expect(appendedMsg.metadata?.compactionEpoch).toBe(1);
@@ -1127,15 +1152,18 @@ describe("CompactionHandler", () => {
       spyOn(historyService, "getLastMessages").mockResolvedValueOnce(
         Ok([malformedNegativeSequence, malformedFractionalSequence, priorMessage, compactionReq])
       );
-      const appendSpy = spyOn(historyService, "appendToHistory");
+      const appended = async () =>
+        (await historyRows()).filter(
+          (row) => row.id !== priorMessage.id && row.id !== compactionReq.id
+        );
 
       const event = createStreamEndEvent("Summary");
       const result = await handler.handleCompletion(event);
 
       expect(result).toBe(true);
-      expect(appendSpy.mock.calls).toHaveLength(1);
+      expect(await appended()).toHaveLength(1);
 
-      const appendedMsg = appendSpy.mock.calls[0][1];
+      const appendedMsg = (await appended())[0];
       expect(appendedMsg.metadata?.historySequence).toBe(6);
       expect(appendedMsg.metadata?.compactionBoundary).toBe(true);
       expect(appendedMsg.metadata?.compactionEpoch).toBe(1);
@@ -1151,12 +1179,12 @@ describe("CompactionHandler", () => {
         muxMetadata: { type: "compaction-request", rawCommand: "/compact", parsed: {} },
       });
 
-      const { appendSpy } = await seedHistory(legacySummary, compactionReq);
+      const { appended } = await seedHistory(legacySummary, compactionReq);
 
       const event = createStreamEndEvent("Summary");
       await handler.handleCompletion(event);
 
-      const appendedMsg = appendSpy.mock.calls[0][1];
+      const appendedMsg = (await appended())[0];
       expect(appendedMsg.metadata?.compactionEpoch).toBe(2);
       expect(appendedMsg.metadata?.compactionBoundary).toBe(true);
       expect(appendedMsg.metadata?.historySequence).toBe(4);
@@ -1175,16 +1203,15 @@ describe("CompactionHandler", () => {
         contextProviderMetadata: { anthropic: { cacheReadInputTokens: 10_000 } },
       });
 
-      const { appendSpy, updateSpy } = await seedHistory(compactionReq, streamedSummary);
+      const { appended } = await seedHistory(compactionReq, streamedSummary);
 
       const event = createStreamEndEvent("Summary");
       const result = await handler.handleCompletion(event);
 
       expect(result).toBe(true);
-      expect(updateSpy.mock.calls).toHaveLength(1);
-      expect(appendSpy.mock.calls).toHaveLength(0);
+      expect(await appended()).toHaveLength(0);
 
-      const updatedSummary = updateSpy.mock.calls[0][1];
+      const updatedSummary = (await historyRows()).find((row) => row.id === streamedSummary.id)!;
       expect(updatedSummary.id).toBe("msg-id");
       expect(updatedSummary.metadata?.historySequence).toBe(6);
       expect(updatedSummary.metadata?.compactionBoundary).toBe(true);
@@ -1345,7 +1372,7 @@ describe("CompactionHandler", () => {
         muxMetadata: { type: "compaction-request", rawCommand: "/compact", parsed: {} },
       });
 
-      const { appendSpy } = await seedHistory(
+      const { appended } = await seedHistory(
         validBoundary,
         malformedBoundaryMissingEpoch,
         malformedBoundaryMissingCompacted,
@@ -1357,8 +1384,8 @@ describe("CompactionHandler", () => {
       const result = await handler.handleCompletion(createStreamEndEvent("Summary"));
 
       expect(result).toBe(true);
-      expect(appendSpy.mock.calls).toHaveLength(1);
-      const appendedMsg = appendSpy.mock.calls[0][1];
+      expect(await appended()).toHaveLength(1);
+      const appendedMsg = (await appended())[0];
       expect(appendedMsg.metadata?.compactionEpoch).toBe(4);
       expect(appendedMsg.metadata?.compactionBoundary).toBe(true);
     });
@@ -1367,18 +1394,18 @@ describe("CompactionHandler", () => {
   describe("handleCompletion() - Deduplication", () => {
     it("should track processed compaction-request IDs", async () => {
       const compactionReq = createCompactionRequest("req-unique");
-      const { appendSpy, clearSpy } = await seedHistory(compactionReq);
+      const { appended, clearSpy } = await seedHistory(compactionReq);
 
       const event = createStreamEndEvent("Summary");
       await handler.handleCompletion(event);
 
       expect(clearSpy.mock.calls).toHaveLength(0);
-      expect(appendSpy.mock.calls).toHaveLength(1);
+      expect(await appended()).toHaveLength(1);
     });
 
     it("should return true without re-processing when same request ID seen twice", async () => {
       const compactionReq = createCompactionRequest("req-dupe");
-      const { appendSpy, clearSpy } = await seedHistory(compactionReq);
+      const { appended, clearSpy } = await seedHistory(compactionReq);
 
       const event = createStreamEndEvent("Summary");
       const result1 = await handler.handleCompletion(event);
@@ -1387,7 +1414,7 @@ describe("CompactionHandler", () => {
       expect(result1).toBe(true);
       expect(result2).toBe(true);
       expect(clearSpy.mock.calls).toHaveLength(0);
-      expect(appendSpy.mock.calls).toHaveLength(1);
+      expect(await appended()).toHaveLength(1);
     });
 
     it("should not emit duplicate events", async () => {
@@ -1406,22 +1433,22 @@ describe("CompactionHandler", () => {
 
     it("should not append summary twice", async () => {
       const compactionReq = createCompactionRequest("req-dupe-3");
-      const { appendSpy, clearSpy } = await seedHistory(compactionReq);
+      const { appended, clearSpy } = await seedHistory(compactionReq);
 
       const event = createStreamEndEvent("Summary");
       await handler.handleCompletion(event);
       await handler.handleCompletion(event);
 
       expect(clearSpy.mock.calls).toHaveLength(0);
-      expect(appendSpy.mock.calls).toHaveLength(1);
+      expect(await appended()).toHaveLength(1);
     });
   });
 
   describe("Error Handling", () => {
-    it("should return false when appendToHistory() fails", async () => {
+    it("should return false when the boundary commit fails", async () => {
       const compactionReq = createCompactionRequest();
-      const { appendSpy } = await seedHistory(compactionReq);
-      appendSpy.mockResolvedValueOnce(Err("Append failed"));
+      await seedHistory(compactionReq);
+      failBoundaryCommit("Append failed");
 
       const event = createStreamEndEvent("Summary");
       const result = await handler.handleCompletion(event);
@@ -1441,8 +1468,8 @@ describe("CompactionHandler", () => {
 
     it("should log errors but not throw", async () => {
       const compactionReq = createCompactionRequest();
-      const { appendSpy } = await seedHistory(compactionReq);
-      appendSpy.mockResolvedValueOnce(Err("Database corruption"));
+      await seedHistory(compactionReq);
+      failBoundaryCommit("Database corruption");
 
       const event = createStreamEndEvent("Summary");
 
@@ -1453,8 +1480,8 @@ describe("CompactionHandler", () => {
 
     it("should not emit events when compaction fails mid-process", async () => {
       const compactionReq = createCompactionRequest();
-      const { appendSpy } = await seedHistory(compactionReq);
-      appendSpy.mockResolvedValueOnce(Err("Append failed"));
+      await seedHistory(compactionReq);
+      failBoundaryCommit("Append failed");
 
       const event = createStreamEndEvent("Summary");
       await handler.handleCompletion(event);
@@ -1476,19 +1503,6 @@ describe("CompactionHandler", () => {
       chatEvents.forEach((e) => {
         expect(e.data.workspaceId).toBe(workspaceId);
       });
-    });
-
-    it("should not emit DeleteMessage events during append-only compaction", async () => {
-      const compactionReq = createCompactionRequest();
-      await seedHistory(compactionReq);
-
-      const event = createStreamEndEvent("Summary");
-      await handler.handleCompletion(event);
-
-      const deleteEvent = emittedEvents.find(
-        (_e) => (_e.data.message as { type?: string })?.type === "delete"
-      );
-      expect(deleteEvent).toBeUndefined();
     });
 
     it("should emit summary message with proper MuxMessage structure", async () => {
@@ -1702,7 +1716,7 @@ describe("CompactionHandler", () => {
         timestamp: Date.now() - 1000,
         muxMetadata: { type: "compaction-request", rawCommand: "/compact", parsed: {} },
       });
-      const { appendSpy, clearSpy } = await seedHistory(compactionRequestMsg);
+      const { appended, clearSpy } = await seedHistory(compactionRequestMsg);
 
       // Empty parts array simulates stream crash before producing content
       const event = createStreamEndEvent("");
@@ -1712,7 +1726,7 @@ describe("CompactionHandler", () => {
       // Should return false and NOT perform compaction
       expect(result).toBe(false);
       expect(clearSpy).not.toHaveBeenCalled();
-      expect(appendSpy).not.toHaveBeenCalled();
+      expect(await appended()).toHaveLength(0);
     });
 
     it("should reject compaction when summary is only whitespace", async () => {
@@ -1740,7 +1754,7 @@ describe("CompactionHandler", () => {
         timestamp: Date.now() - 1000,
         muxMetadata: { type: "compaction-request", rawCommand: "/compact", parsed: {} },
       });
-      const { appendSpy, clearSpy } = await seedHistory(compactionRequestMsg);
+      const { appended, clearSpy } = await seedHistory(compactionRequestMsg);
 
       // Any JSON object should be rejected - this catches all tool call leaks
       const jsonObject = JSON.stringify({
@@ -1756,7 +1770,7 @@ describe("CompactionHandler", () => {
       // Should return false and NOT perform compaction
       expect(result).toBe(false);
       expect(clearSpy).not.toHaveBeenCalled();
-      expect(appendSpy).not.toHaveBeenCalled();
+      expect(await appended()).toHaveLength(0);
     });
 
     it("should reject any JSON object regardless of structure", async () => {
@@ -1784,7 +1798,7 @@ describe("CompactionHandler", () => {
         timestamp: Date.now() - 1000,
         muxMetadata: { type: "compaction-request", rawCommand: "/compact", parsed: {} },
       });
-      const { appendSpy, clearSpy } = await seedHistory(compactionRequestMsg);
+      const { appended, clearSpy } = await seedHistory(compactionRequestMsg);
 
       // Normal summary text
       const event = createStreamEndEvent(
@@ -1794,7 +1808,7 @@ describe("CompactionHandler", () => {
       const result = await handler.handleCompletion(event);
       expect(result).toBe(true);
       expect(clearSpy).not.toHaveBeenCalled();
-      expect(appendSpy).toHaveBeenCalled();
+      expect(await appended()).toHaveLength(1);
     });
 
     it("should accept summary with embedded JSON as part of prose", async () => {
@@ -1901,6 +1915,153 @@ describe("CompactionHandler", () => {
       expect(metadata?.preservedTailMessageCount).toBe(2);
     });
 
+    it("removes Anthropic replay data from tail copies and keeps other providers' reasoning", async () => {
+      // Preserved thinking: the tail's signed thinking is bound to the pre-summary
+      // prefix, so replaying it after the boundary would be rejected or dropped.
+      handler = new CompactionHandler({
+        workspaceId,
+        historyService,
+        sessionDir,
+        telemetryService,
+        emitter: mockEmitter,
+      });
+
+      const signed = (text: string) => ({
+        type: "reasoning" as const,
+        text,
+        providerOptions: { anthropic: { signature: `sig-${text}` } },
+      });
+      const anthropicAnswer = createMuxMessage("a1", "assistant", "", {
+        model: "anthropic:claude-x",
+        stepStartPartIndices: [0, 2],
+      });
+      anthropicAnswer.parts = [
+        signed("plan"),
+        {
+          type: "dynamic-tool",
+          toolCallId: "call-1",
+          toolName: "bash",
+          state: "output-available",
+          input: { script: "ls" },
+          output: { success: true },
+        },
+        signed("review"),
+        { type: "text", text: "tail answer" },
+      ];
+      const thinkingOnly = createMuxMessage("a2", "assistant", "", { partial: true });
+      thinkingOnly.parts = [signed("interrupted")];
+      const openaiAnswer = createMuxMessage("a3", "assistant", "openai answer", {
+        model: "openai:gpt-x",
+      });
+      openaiAnswer.parts.unshift({
+        type: "reasoning",
+        text: "openai thoughts",
+        providerOptions: { openai: { itemId: "rs_1", reasoningEncryptedContent: "enc" } },
+      });
+      await seedHistory(
+        createMuxMessage("u0", "user", "old head question"),
+        createMuxMessage("a0", "assistant", "old head answer"),
+        createMuxMessage("u1", "user", "tail question"),
+        anthropicAnswer,
+        thinkingOnly,
+        createMuxMessage("u2", "user", "follow-up"),
+        openaiAnswer,
+        createStampedCompactionRequest("compact-req", 2)
+      );
+
+      expect(await handler.handleCompletion(createStreamEndEvent("Summary"))).toBe(true);
+
+      const epochResult = await historyService.getHistoryFromLatestBoundary(workspaceId);
+      if (!epochResult.success) throw new Error(epochResult.error);
+      const copies = epochResult.data.slice(1);
+      // Every tail row gets a copy with all its parts, so step indices still match.
+      expect(copies.map((copy) => copy.parts.length)).toEqual([1, 4, 1, 1, 2]);
+      expect(copies[1].metadata?.stepStartPartIndices).toEqual([0, 2]);
+      expect(copies[1].parts[2]).toEqual({ type: "reasoning", text: "review" });
+      expect(copies[2].parts).toEqual([{ type: "reasoning", text: "interrupted" }]);
+      expect(JSON.stringify(copies)).not.toContain("sig-");
+      expect(copies[4].parts[0]).toMatchObject({
+        type: "reasoning",
+        providerOptions: { openai: { itemId: "rs_1", reasoningEncryptedContent: "enc" } },
+      });
+      // The originals above the boundary keep their signatures.
+      const full = await historyService.getLastMessages(workspaceId, 20);
+      if (!full.success) throw new Error(full.error);
+      const original = full.data.find((row) => row.id === "a1");
+      expect(original?.parts[0]).toMatchObject({
+        providerOptions: { anthropic: { signature: "sig-plan" } },
+      });
+    });
+
+    it("never copies model-hidden plan-review record rows into the preserved tail", async () => {
+      // Record rows are UI state that no provider request ever contains; a copy behind the
+      // boundary would only duplicate hidden state (and the projection ignores copies anyway).
+      handler = new CompactionHandler({
+        workspaceId,
+        historyService,
+        sessionDir,
+        telemetryService,
+        emitter: mockEmitter,
+      });
+
+      const record = createMuxMessage("plan-review-1", "user", "<mux_plan_review>…", {
+        synthetic: true,
+        muxMetadata: { type: "plan-review", kind: "resolve", recordId: "rec", threadId: "thr" },
+      });
+      await seedHistory(
+        createMuxMessage("u0", "user", "old head question"),
+        createMuxMessage("a0", "assistant", "old head answer"),
+        createMuxMessage("u1", "user", "tail question"),
+        createMuxMessage("a1", "assistant", "tail answer"),
+        record,
+        // seedHistory assigns sequences 0..5; the tail starts at u1 (seq 2).
+        createStampedCompactionRequest("compact-req", 2)
+      );
+
+      expect(await handler.handleCompletion(createStreamEndEvent("Summary"))).toBe(true);
+
+      const epochResult = await historyService.getHistoryFromLatestBoundary(workspaceId);
+      if (!epochResult.success) throw new Error(epochResult.error);
+      const copies = epochResult.data.filter((row) => row.metadata?.rlmPreservedTailCopy === true);
+      expect(copies.map((copy) => copy.role)).toEqual(["user", "assistant"]);
+      expect(copies.some((copy) => copy.metadata?.muxMetadata?.type === "plan-review")).toBe(false);
+    });
+
+    it("keeps a tail user row's prompt-hook context on its copy", async () => {
+      // Codex PRRT_kwDOPxxmWM6rPqxI: the copy is what later requests send, and the context
+      // renders from its metadata.
+      handler = new CompactionHandler({
+        workspaceId,
+        historyService,
+        sessionDir,
+        telemetryService,
+        emitter: mockEmitter,
+      });
+      const pluginHookContext = [{ pluginId: "guard", text: "Ask for a repro first." }];
+      const tailUser = createMuxMessage("u1", "user", "tail question", { pluginHookContext });
+      // chat.jsonl is untrusted: a corrupted extra entry is not copied (PRRT_kwDOPxxmWM6sTcvx).
+      Reflect.set(tailUser.metadata ?? {}, "pluginHookContext", [
+        ...pluginHookContext,
+        { pluginId: 1, text: "x" },
+      ]);
+      await seedHistory(
+        createMuxMessage("u0", "user", "old head question"),
+        createMuxMessage("a0", "assistant", "old head answer"),
+        tailUser,
+        createMuxMessage("a1", "assistant", "tail answer"),
+        createStampedCompactionRequest("compact-req", 2)
+      );
+
+      expect(await handler.handleCompletion(createStreamEndEvent("Summary"))).toBe(true);
+
+      const epochResult = await historyService.getHistoryFromLatestBoundary(workspaceId);
+      if (!epochResult.success) throw new Error(epochResult.error);
+      const userCopy = epochResult.data.find(
+        (row) => row.metadata?.rlmPreservedTailCopy === true && row.role === "user"
+      );
+      expect(userCopy?.metadata?.pluginHookContext).toEqual(pluginHookContext);
+    });
+
     it("rewrites MCP snapshot invoking IDs to the copy IDs of LATER tail rows", async () => {
       // MCP snapshot rows precede the user row they expand, so the invoking
       // row's copy ID must be preassigned before any copy is built — a
@@ -2002,9 +2163,7 @@ describe("CompactionHandler", () => {
         createStampedCompactionRequest("compact-req", 2)
       );
 
-      spyOn(historyService, "persistBoundaryWithTailCopies").mockResolvedValueOnce(
-        Err("injected commit failure")
-      );
+      failBoundaryCommit("injected commit failure");
 
       await handler.handleCompletion(createStreamEndEvent("Summary"));
 
@@ -2096,6 +2255,106 @@ describe("CompactionHandler", () => {
       });
       const pending = await reloaded.peekPendingState();
       expect(pending?.readFiles).toEqual(["/persisted.ts"]);
+    });
+  });
+
+  // #4551: history scanners skip rows over SESSION_HISTORY_MAX_LINE_BYTES, so an oversized
+  // boundary stops being a boundary and provider history falls back to the previous epoch.
+  describe("boundary row size", () => {
+    const olderBoundary = createMuxMessage("older-boundary", "assistant", "Older summary", {
+      compacted: "user",
+      compactionBoundary: true,
+      compactionEpoch: 1,
+    });
+    const requestWithFollowUp = (followUpContent: CompactionFollowUpRequest): MuxMessage =>
+      createMuxMessage("limit-request", "user", "Please summarize the conversation", {
+        muxMetadata: {
+          type: "compaction-request",
+          rawCommand: "/compact",
+          parsed: { followUpContent },
+        },
+      });
+
+    async function persistedRowBytes(): Promise<number[]> {
+      const rows: number[] = [];
+      for (const file of [CHAT_ARCHIVE_FILE_NAME, CHAT_FILE_NAME]) {
+        const contents = await fsPromises
+          .readFile(path.join(path.dirname(historyPath), file))
+          .catch(() => Buffer.alloc(0));
+        for (const row of contents.toString("utf8").split("\n")) {
+          if (row.length > 0) rows.push(Buffer.byteLength(row, "utf8"));
+        }
+      }
+      return rows;
+    }
+
+    async function compactWith(summary: string, followUpContent: CompactionFollowUpRequest) {
+      await seedHistory(
+        olderBoundary,
+        createMuxMessage("before-compaction", "user", "earlier turn"),
+        requestWithFollowUp(followUpContent)
+      );
+      const usage = { inputTokens: 100, outputTokens: 400_000, totalTokens: undefined };
+      expect(
+        await handler.handleCompletion(createStreamEndEvent(summary, { usage }), "limit-request")
+      ).toBe(true);
+      for (const bytes of await persistedRowBytes()) {
+        expect(bytes).toBeLessThanOrEqual(SESSION_HISTORY_MAX_LINE_BYTES);
+      }
+      const history = await historyService.getHistoryFromLatestBoundary(workspaceId);
+      if (!history.success) throw new Error(history.error);
+      // The new boundary alone starts the epoch: nothing from before it comes back.
+      expect(history.data).toHaveLength(1);
+      const boundary = history.data[0];
+      expect(boundary?.metadata?.compactionEpoch).toBe(2);
+      expect(boundary?.metadata?.muxMetadata).toEqual({
+        type: "compaction-summary",
+        pendingFollowUp: followUpContent,
+      });
+      const part = boundary?.parts[0];
+      assert(part?.type === "text", "boundary summary must be text");
+      return { boundary, text: part.text };
+    }
+
+    it("truncates a runaway summary with a marker so the boundary stays the epoch start", async () => {
+      const summary = "s".repeat(SESSION_HISTORY_MAX_LINE_BYTES + 64 * 1024);
+      const followUp = { text: "Continue with step 2", model: "openai:gpt-4o", agentId: "exec" };
+
+      const { boundary, text } = await compactWith(summary, followUp);
+
+      const kept = text.lastIndexOf("\n\n[");
+      expect(summary.startsWith(text.slice(0, kept))).toBe(true);
+      expect(text.slice(kept)).toBe(formatCompactionSummaryTruncationMarker(kept, summary.length));
+      const emitted = emittedEvents
+        .map((event) => event.data.message)
+        .find(
+          (message): message is MuxMessage =>
+            typeof message === "object" &&
+            message !== null &&
+            (message as { type?: unknown }).type === "message" &&
+            (message as { id?: unknown }).id === boundary?.id
+        );
+      expect(emitted?.parts[0]).toMatchObject({ type: "text", text });
+      // A renderer that missed stream-start rebuilds the message from the terminal event.
+      const streamEnd = getEmittedStreamEndEvent(emittedEvents);
+      expect(streamEnd?.parts.filter((part) => part.type === "text")).toEqual([
+        expect.objectContaining({ text }),
+      ]);
+      // Truncated tokens are not in the next request: the meter counts the kept text itself.
+      const keptTokens = await countTokens("claude-3-5-sonnet-20241022", text);
+      expect(keptTokens).toBeLessThan(400_000);
+      expect(boundary?.metadata?.contextUsage?.inputTokens).toBe(keptTokens);
+      expect(streamEnd?.metadata.contextUsage?.inputTokens).toBe(keptTokens);
+    });
+
+    it("keeps a large follow-up byte-identical and shrinks only the summary", async () => {
+      const followUp = { text: "f".repeat(900 * 1024), model: "openai:gpt-4o", agentId: "exec" };
+      const summary = "s".repeat(300 * 1024);
+
+      const { text } = await compactWith(summary, followUp);
+
+      expect(text.length).toBeLessThan(summary.length);
+      expect(summary.startsWith(text.slice(0, text.lastIndexOf("\n\n[")))).toBe(true);
     });
   });
 });

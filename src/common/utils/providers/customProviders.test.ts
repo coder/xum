@@ -8,7 +8,6 @@ import {
   getShadowedCustomProviderIds,
   isBuiltInProvider,
   isCustomProviderConfig,
-  isValidCustomProviderId,
   validateCustomProviderBaseUrl,
   validateCustomProviderId,
 } from "./customProviders";
@@ -16,7 +15,6 @@ import {
 describe("custom provider id validation", () => {
   test("accepts valid custom provider ids", () => {
     for (const id of ["local-vllm", "llama_cpp", "lm-studio", "proxy1", "123"]) {
-      expect(isValidCustomProviderId(id)).toBe(true);
       expect(validateCustomProviderId(id)).toEqual({ ok: true });
     }
   });
@@ -34,11 +32,11 @@ describe("custom provider id validation", () => {
       "prototype",
       "constructor",
       "hasOwnProperty",
+      // Reserved for the auto-model-routing classifier key.
+      "typesafe",
     ];
 
     for (const id of invalidIds) {
-      expect(isValidCustomProviderId(id)).toBe(false);
-
       const validation = validateCustomProviderId(id);
       expect(validation.ok).toBe(false);
       if (!validation.ok) {
@@ -49,7 +47,6 @@ describe("custom provider id validation", () => {
 
   test("rejects built-in provider ids", () => {
     for (const provider of SUPPORTED_PROVIDERS) {
-      expect(isValidCustomProviderId(provider)).toBe(false);
       expect(validateCustomProviderId(provider).ok).toBe(false);
       expect(isBuiltInProvider(provider)).toBe(true);
     }

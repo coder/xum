@@ -1,37 +1,87 @@
+import { isNonWorkspaceScopeId } from "@/common/constants/storage";
+import { markAiSelectionIntent } from "@/browser/utils/aiSelectionIntent";
 import type { APIClient } from "@/browser/contexts/API";
-import type {
-  FastModePreviousServiceTier,
-  ServiceTier,
-} from "@/common/config/schemas/providersConfig";
+import type { ServiceTier } from "@/common/config/schemas/providersConfig";
 import { PROVIDER_DEFINITIONS } from "@/common/constants/providers";
 import type { ProvidersConfigMap } from "@/common/orpc/types";
 import { isGrokFrontierModel } from "@/common/types/thinking";
+import { anthropicFastModeAvailable } from "@/common/utils/ai/anthropicFastMode";
 import { getExplicitGatewayPrefix, normalizeToCanonical } from "@/common/utils/ai/models";
-import { openaiDirectProviderOptionsAvailable } from "@/common/utils/ai/openaiProviderOptionsAvailability";
+import {
+  openaiModelSupportsServiceTier,
+  openaiServiceTierAvailable,
+} from "@/common/utils/ai/openaiProviderOptionsAvailability";
+import {
+  customProviderWireOrigin,
+  isCustomProviderConfig,
+} from "@/common/utils/providers/customProviders";
 import { resolveModelForMetadata } from "@/common/utils/providers/modelEntries";
 
-export type FastModeProvider = "openai" | "xai";
-
-export interface FastModeServiceTierChange {
-  apiValue: ServiceTier | "";
-  serviceTier: ServiceTier | undefined;
-  previousServiceTier: FastModePreviousServiceTier | undefined;
-}
+export type FastModeProvider = "openai" | "xai" | "anthropic";
+/**
+ * The premium service tiers the selector toggles: Fast (priority) and OpenAI's
+ * Ultrafast. They are mutually exclusive.
+ */
+export type PremiumServiceTier = "priority" | "ultrafast";
 
 export interface FastModeAvailabilityOptions {
   resolvedRouteProvider?: string | null;
   providersConfig?: ProvidersConfigMap | null;
 }
 
-type ProviderConfigWriter = Pick<APIClient["providers"], "setProviderConfig">;
+/**
+ * Speed belongs to this chat, just like reasoning. Keep the pending pick for
+ * the next send and nudge an active turn without changing any other chat's default.
+ * Creation scopes have no active turn yet; their first send carries the same choice.
+ */
+export function setWorkspaceServiceTier(
+  api: APIClient | null | undefined,
+  scopeId: string,
+  serviceTier: ServiceTier
+): void {
+  markAiSelectionIntent(scopeId, "serviceTier", serviceTier);
+  if (api != null && !isNonWorkspaceScopeId(scopeId)) {
+    api.workspace.setActiveTurnServiceTier({ workspaceId: scopeId, serviceTier }).catch(() => {
+      // Best-effort: a transient IPC failure must not discard the next-send pick.
+    });
+  }
+}
 
-/** Return the direct provider whose priority tier powers Fast mode for this model. */
+/**
+ * Speed belongs to the chat, like its reasoning level: the chat's own pick drives Fast mode
+ * for every provider, so switching the chat's model keeps its speed instead of adopting the
+ * new provider's setting. Only a chat without a pick inherits that provider's default.
+ * "priority" is the provider-agnostic Fast choice; the backend maps it to Anthropic `speed`.
+ */
+export function resolveChatServiceTier(
+  provider: FastModeProvider,
+  chatServiceTier: ServiceTier | undefined,
+  providersConfig: ProvidersConfigMap | null | undefined
+): ServiceTier | undefined {
+  if (chatServiceTier != null) return chatServiceTier;
+  const providerConfig = providersConfig?.[provider];
+  if (provider === "anthropic") return providerConfig?.speed === "fast" ? "priority" : undefined;
+  return providerConfig?.serviceTier;
+}
+
+/** Turning a premium tier off must not re-inherit a premium provider default. */
+export function toggleServiceTier(
+  current: ServiceTier | undefined,
+  target: PremiumServiceTier
+): ServiceTier {
+  return current === target ? "default" : target;
+}
+
+/** Return the provider preference whose priority tier powers Fast mode on this route. */
 export function getFastModeProvider(
   modelString: string,
   options?: FastModeAvailabilityOptions
 ): FastModeProvider | null {
-  if (openaiDirectProviderOptionsAvailable(modelString, options)) {
+  if (openaiServiceTierAvailable(modelString, options)) {
     return "openai";
+  }
+  if (anthropicFastModeAvailable(modelString, options)) {
+    return "anthropic";
   }
 
   const normalized = normalizeToCanonical(modelString);
@@ -59,65 +109,49 @@ export function getFastModeProvider(
 }
 
 /**
- * Fast mode is a temporary priority-tier override. The restore target lives in
- * providers.jsonc so every browser origin and desktop client observes the same state.
+ * Ultrafast is offered like Fast mode (users expect it next to the Fast toggle), but
+ * only where the request path would actually send it: the shared OpenAI tier
+ * preference must reach the route, and the model and wire format must accept it.
  */
-export function getFastModeServiceTierChange(
-  provider: FastModeProvider,
-  currentServiceTier: ServiceTier | undefined,
-  previousServiceTier?: FastModePreviousServiceTier
-): FastModeServiceTierChange {
-  if (currentServiceTier !== "priority") {
-    return {
-      apiValue: "priority",
-      serviceTier: "priority",
-      previousServiceTier: currentServiceTier ?? "unset",
-    };
-  }
-
-  // Legacy OpenAI priority configs predate the restore field. xAI's only standard
-  // tier is default, so its equivalent fallback must not emit unsupported "auto".
-  const restoreServiceTier = previousServiceTier ?? (provider === "openai" ? "auto" : "default");
-  return {
-    apiValue: restoreServiceTier === "unset" ? "" : restoreServiceTier,
-    serviceTier: restoreServiceTier === "unset" ? undefined : restoreServiceTier,
-    previousServiceTier: undefined,
-  };
+export function ultrafastModeAvailable(
+  modelString: string,
+  options?: FastModeAvailabilityOptions
+): boolean {
+  return (
+    getFastModeProvider(modelString, options) === "openai" &&
+    openaiModelSupportsServiceTier(modelString, "ultrafast", options)
+  );
 }
 
-/** Persist the provider-specific restore target and service-tier override in a safe order. */
-export async function applyFastModeServiceTierChange(
-  providers: ProviderConfigWriter,
-  provider: FastModeProvider,
-  currentServiceTier: ServiceTier | undefined,
-  previousServiceTier?: FastModePreviousServiceTier
-): Promise<FastModeServiceTierChange | null> {
-  const change = getFastModeServiceTierChange(provider, currentServiceTier, previousServiceTier);
-
-  if (currentServiceTier !== "priority") {
-    const rememberResult = await providers.setProviderConfig({
-      provider,
-      keyPath: ["fastModePreviousServiceTier"],
-      value: change.previousServiceTier ?? "unset",
-    });
-    if (!rememberResult.success) return null;
+/**
+ * Why getFastModeProvider returned null: "model" when the model has no Fast mode on any route,
+ * "route" when the model has one but this route (gateway, custom provider, custom base URL, ...)
+ * cannot send it. The shortcut's toast used to blame the route for every model, Gemini included
+ * (#5753).
+ */
+export function getFastModeUnavailableReason(
+  modelString: string,
+  providersConfig: ProvidersConfigMap | null
+): "model" | "route" {
+  // The model's capability identity comes from the provider config, not from the route: an
+  // explicit mapping ("Treat as") or a Coder instance's upstream, then a custom provider's
+  // wire dialect (an anthropic-messages provider serving claude-opus-5-5 is an Opus model).
+  let capabilityModel = normalizeToCanonical(resolveModelForMetadata(modelString, providersConfig));
+  const separator = modelString.indexOf(":");
+  const custom = separator > 0 ? providersConfig?.[modelString.slice(0, separator)] : undefined;
+  if (isCustomProviderConfig(custom) && capabilityModel === normalizeToCanonical(modelString)) {
+    const wireOrigin = customProviderWireOrigin(custom.providerType);
+    if (wireOrigin != null) capabilityModel = `${wireOrigin}:${modelString.slice(separator + 1)}`;
   }
-
-  const tierResult = await providers.setProviderConfig({
-    provider,
-    keyPath: ["serviceTier"],
-    value: change.apiValue,
-  });
-  if (!tierResult.success) return null;
-
-  if (currentServiceTier === "priority") {
-    const clearResult = await providers.setProviderConfig({
-      provider,
-      keyPath: ["fastModePreviousServiceTier"],
-      value: "",
-    });
-    if (!clearResult.success) return null;
-  }
-
-  return change;
+  // A gateway or unknown identity (a generic OpenAI-compatible provider, a Copilot model, a Coder
+  // model of unknown upstream) cannot rule Fast mode out, and the route text is true for every
+  // route without it (#5764). A local model (Ollama) has no Fast mode anywhere: the model reason.
+  const origin = capabilityModel.slice(0, capabilityModel.indexOf(":"));
+  const definition = (PROVIDER_DEFINITIONS as Record<string, { kind: string } | undefined>)[origin];
+  if (definition == null || definition.kind === "gateway") return "route";
+  // That model's own provider, called directly, is the route where Fast mode works if the model
+  // has it at all. No config here: config gates (missing provider, ZDR) are route reasons too.
+  return getFastModeProvider(capabilityModel, { resolvedRouteProvider: "direct" })
+    ? "route"
+    : "model";
 }

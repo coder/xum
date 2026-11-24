@@ -6,6 +6,7 @@ import type {
   EditedFilesReferenceAttachment,
   CompletedReportsIndexAttachment,
   ReadFilesReferenceAttachment,
+  ArtifactsIndexAttachment,
 } from "@/common/types/attachment";
 import {
   AGENT_SKILL_BODY_TRUNCATION_NOTE,
@@ -22,31 +23,11 @@ function wrapSystemUpdate(content: string): string {
 }
 
 /**
- * Render a plan file reference attachment to content string.
- */
-function renderPlanFileReference(attachment: PlanFileReferenceAttachment): string {
-  return `A plan file exists from plan mode at: ${attachment.planFilePath}
-
-Plan contents:
-${attachment.planContent}
-
-If this plan is relevant to the current work and not already complete, continue working on it.`;
-}
-
-/**
  * Render a todo list attachment to a content string.
  */
 function renderTodoListAttachment(attachment: TodoListAttachment): string {
   const items = renderTodoItemsAsMarkdownList(attachment.todos);
   return `TODO list (persisted; \`todo_read\` will return this):\n${items || "- (empty)"}`;
-}
-
-function renderLoadedSkillsSnapshot(attachment: LoadedSkillsSnapshotAttachment): string {
-  const skillEntries = attachment.skills
-    .map((skill) => renderAgentSkillSnapshotText(skill))
-    .join("\n\n");
-
-  return `The following skills were loaded in this session:\n\n${skillEntries}`;
 }
 
 /**
@@ -77,17 +58,7 @@ function formatCompletedReportEntryLine(
 }
 
 /**
- * Render the completed-reports index. Lists re-fetchable handles only (no report
- * content): the full reports persist on disk and survive compaction, so the model
- * can recover them via task_await instead of re-running expensive work.
- */
-function renderCompletedReportsIndex(attachment: CompletedReportsIndexAttachment): string {
-  const lines = attachment.reports.map(formatCompletedReportEntryLine);
-  return `${COMPLETED_REPORTS_HEADER}${lines.join("\n")}${COMPLETED_REPORTS_FOOTER}`;
-}
-
-/**
- * Budget-aware variant: packs as many handles as fit (entries are newest-first, so
+ * Packs as many handles as fit (entries are newest-first, so
  * the oldest drop first) instead of omitting the whole block — losing every re-fetch
  * handle would defeat the recovery path this attachment exists for.
  */
@@ -146,42 +117,17 @@ function renderReadFilesReference(attachment: ReadFilesReferenceAttachment): str
 }
 
 /**
- * Render an edited files reference attachment to content string.
+ * SECURITY AUDIT: same channel as renderReadFilesReference above. Artifact paths are file names
+ * the agent (or repo content it copied) chose, and titles are model-written text, so neither is
+ * rendered here: only the count, derived from list length. artifact_list returns the names
+ * through a normal tool result when the model needs them.
  */
-function renderEditedFilesReference(attachment: EditedFilesReferenceAttachment): string {
-  const fileEntries = attachment.files
-    .map((file) => {
-      const truncationNote = file.truncated ? " (truncated)" : "";
-      return `File: ${file.path}${truncationNote}
-\`\`\`diff
-${file.diff}
-\`\`\``;
-    })
-    .join("\n\n");
-
-  return `The following files were edited in this session:
-
-${fileEntries}`;
-}
-
-/**
- * Render a single post-compaction attachment to its content string.
- */
-export function renderAttachmentToContent(attachment: PostCompactionAttachment): string {
-  switch (attachment.type) {
-    case "plan_file_reference":
-      return renderPlanFileReference(attachment);
-    case "todo_list":
-      return renderTodoListAttachment(attachment);
-    case "loaded_skills_snapshot":
-      return renderLoadedSkillsSnapshot(attachment);
-    case "edited_files_reference":
-      return renderEditedFilesReference(attachment);
-    case "completed_reports_index":
-      return renderCompletedReportsIndex(attachment);
-    case "read_files_reference":
-      return renderReadFilesReference(attachment);
-  }
+function renderArtifactsIndex(attachment: ArtifactsIndexAttachment): string {
+  const count = attachment.artifacts.length;
+  return (
+    `${count} artifact${count === 1 ? " has" : "s have"} been published in ` +
+    `$XUM_SCRATCH_DIR/artifacts; call artifact_list for names.`
+  );
 }
 
 const PLAN_TRUNCATION_NOTE = "\n\n...(truncated)\n";
@@ -345,8 +291,9 @@ function sortAttachmentsForInjection(
     // truncation cannot drop them.
     completed_reports_index: 2,
     read_files_reference: 3,
-    loaded_skills_snapshot: 4,
-    edited_files_reference: 5,
+    artifacts_index: 4,
+    loaded_skills_snapshot: 5,
+    edited_files_reference: 6,
   };
 
   return attachments
@@ -442,6 +389,15 @@ export function renderAttachmentsToContentWithBudget(
     if (attachment.type === "read_files_reference") {
       // Compact one-liner (paths only) — include whole or not at all.
       const content = renderReadFilesReference(attachment);
+      if (content.length <= remainingForContent) {
+        addBlock(wrapSystemUpdate(content));
+      }
+      continue;
+    }
+
+    if (attachment.type === "artifacts_index") {
+      // Bounded list of handles — include whole or not at all.
+      const content = renderArtifactsIndex(attachment);
       if (content.length <= remainingForContent) {
         addBlock(wrapSystemUpdate(content));
       }

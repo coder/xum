@@ -35,6 +35,7 @@ import {
   isElectronLaunchArg,
 } from "./argv";
 import { exitAfterStdoutFlush } from "./processExit";
+import { warnIfUnsupportedNode } from "./nodeVersion";
 
 import { cleanupObsoleteXumBinArtifacts } from "@/common/constants/paths";
 import { initializeXumHomeTransition } from "@/node/compat/xumTransition";
@@ -43,6 +44,9 @@ void bootstrapCli();
 
 async function bootstrapCli(): Promise<void> {
   try {
+    // One stderr line on a Node older than xum server supports (#6968) or affected by
+    // CVE-2026-111497. It never exits.
+    warnIfUnsupportedNode();
     const transition = await initializeXumHomeTransition();
     cleanupObsoleteXumBinArtifacts(transition.activePath);
   } catch {
@@ -169,7 +173,7 @@ function startCli(): void {
       program
         .command("workflow")
         .alias("wf")
-        .description("Run workflow scripts by explicit script path (experimental)");
+        .description("Run workflow scripts by explicit script path");
     }
     if (isCommandAvailable("trust", env)) {
       program.command("trust").description("Trust a project so repo-controlled automation can run");

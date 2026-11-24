@@ -1,6 +1,7 @@
 import { describe, expect, mock, test } from "bun:test";
 import { ProvidersConfigStore } from "./ProvidersConfigStore";
 import type { APIClient } from "@/browser/contexts/API";
+import { createTestApiClient } from "@/browser/testUtils";
 import type { ProvidersConfigMap } from "@/common/orpc/types";
 
 const SAMPLE_CONFIG: ProvidersConfigMap = {
@@ -12,18 +13,21 @@ const SAMPLE_CONFIG: ProvidersConfigMap = {
   },
 };
 
-function createClient(getConfig: () => Promise<ProvidersConfigMap>): Pick<APIClient, "providers"> {
-  return {
+function createClient(getConfig: () => Promise<ProvidersConfigMap>): APIClient {
+  return createTestApiClient({
     providers: {
       getConfig,
       // Keep the change subscription open without ever yielding so tests
       // exercise the fetch/optimistic paths deterministically.
-      onConfigChanged: async function* () {
-        yield* [];
-        await new Promise<void>(() => undefined);
-      },
+      onConfigChanged: () =>
+        Promise.resolve(
+          (async function* () {
+            yield* [];
+            await new Promise<void>(() => undefined);
+          })()
+        ),
     },
-  } as unknown as Pick<APIClient, "providers">;
+  });
 }
 
 async function waitUntil(predicate: () => boolean): Promise<void> {
@@ -40,7 +44,7 @@ describe("ProvidersConfigStore", () => {
     const store = new ProvidersConfigStore();
 
     expect(store.isLoaded()).toBe(false);
-    store.setClient(createClient(getConfig) as APIClient);
+    store.setClient(createClient(getConfig));
 
     const notified = mock(() => undefined);
     store.subscribe(notified);
@@ -55,7 +59,7 @@ describe("ProvidersConfigStore", () => {
 
   test("a failed fetch still marks the store loaded (self-heal, no stuck loading)", async () => {
     const store = new ProvidersConfigStore();
-    store.setClient(createClient(() => Promise.reject(new Error("backend down"))) as APIClient);
+    store.setClient(createClient(() => Promise.reject(new Error("backend down"))));
 
     await waitUntil(() => store.isLoaded());
     expect(store.getConfig()).toBeNull();
@@ -75,7 +79,7 @@ describe("ProvidersConfigStore", () => {
     };
 
     const store = new ProvidersConfigStore();
-    store.setClient(createClient(getConfig) as APIClient);
+    store.setClient(createClient(getConfig));
     await waitUntil(() => store.isLoaded());
 
     // Start a slow refresh, then land an optimistic update while it is in flight.

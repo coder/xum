@@ -1,11 +1,16 @@
+import {
+  buildPlanReviewMetadata,
+  formatPlanReviewEnvelope,
+} from "@/common/utils/planReview/planReviewEnvelope";
+import type { PlanReviewRecord } from "@/common/utils/planReview/planReviewRecord";
 import { describe, expect, spyOn, test } from "bun:test";
 
-import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { MockLanguageModelV3, simulateReadableStream } from "ai/test";
 import type { LanguageModelV3CallOptions, LanguageModelV3StreamPart } from "@ai-sdk/provider";
 
 import { EXPERIMENT_IDS, type ExperimentId } from "@/common/constants/experiments";
+import type { ProviderName } from "@/common/constants/providers";
 import { WORDS_TO_TOKENS_RATIO } from "@/common/constants/ui";
 import { createMuxMessage, type MuxMessage } from "@/common/types/message";
 import { Err, Ok } from "@/common/types/result";
@@ -15,6 +20,7 @@ import {
   BRANCH_SUMMARY_MAX_TRANSCRIPT_CHARS,
   BRANCH_SUMMARY_MIN_SEGMENT_TOKENS,
   BRANCH_SUMMARY_TARGET_WORDS,
+  BRANCH_SUMMARY_THINKING_HEADROOM_TOKENS,
   BRANCH_SUMMARY_TIMEOUT_MS,
 } from "@/constants/branchSummary";
 import { USAGE_WRITE_DRAIN_WINDOW_MS } from "@/constants/streamDrain";
@@ -37,6 +43,12 @@ import {
   type SideChannelMetadata,
 } from "./branchSummary";
 import { createTestHistoryService } from "./testHistoryService";
+import { Layer } from "effect";
+import type { SessionLocksTag } from "@/node/services/di/tags";
+import { HostClockTag } from "@/node/services/di/hostClockLive";
+import { createMemoryHost } from "@/node/services/hostFiles/memoryHostFiles.testHarness";
+import { SessionLocksMemory } from "@/node/services/sessionLocks/memorySessionLocks.testHarness";
+import { nodeClock } from "@/node/utils/hostClock";
 
 function finishChunk(unified: "stop" | "length" = "stop"): LanguageModelV3StreamPart {
   return {
@@ -84,6 +96,7 @@ function fakeAiService(
   model: MockLanguageModelV3 | null,
   opts?: {
     onCreateModel?: (modelString: string) => void;
+    routeProvider?: ProviderName;
     workspaceModel?: string | null;
     /** Full metadata override for getWorkspaceMetadata (wins over workspaceModel). */
     metadata?: SideChannelMetadata;
@@ -95,13 +108,24 @@ function fakeAiService(
   const workspaceModel =
     opts?.workspaceModel === undefined ? "anthropic:claude-haiku-4-5" : opts.workspaceModel;
   return {
-    createModelWithPinnedMetadata: ((modelString: string) => {
+    createModelWithPinnedOptions: ((modelString: string) => {
       opts?.onCreateModel?.(modelString);
       if (!model) {
         return Promise.resolve(Err({ type: "api_key_not_found" as const, provider: "anthropic" }));
       }
-      return Promise.resolve(Ok({ model, metadataModel: modelString }));
-    }) as BranchSummaryAiService["createModelWithPinnedMetadata"],
+      return Promise.resolve(
+        Ok({
+          model,
+          metadataModel: modelString,
+          effectiveModelString: modelString,
+          wireProviderName: opts?.routeProvider ?? modelString.split(":", 1)[0],
+          optionsModelString: modelString,
+          optionsProvidersConfig: {},
+          optionsMuxProviderOptions: {},
+          optionsRouteProvider: opts?.routeProvider,
+        })
+      );
+    }) as BranchSummaryAiService["createModelWithPinnedOptions"],
     getWorkspaceMetadata: (() =>
       Promise.resolve(
         opts?.metadata !== undefined
@@ -122,7 +146,7 @@ function unreachableAiService(): BranchSummaryAiService {
   });
 }
 
-const RLM_ON = { rlm: true, programmaticToolCalling: true };
+const RLM_ON = (_id: ExperimentId) => true;
 
 /** A user+assistant exchange large enough to clear the tiny-segment threshold. */
 function meatyExchange(idPrefix: string): MuxMessage[] {
@@ -136,62 +160,66 @@ function meatyExchange(idPrefix: string): MuxMessage[] {
 }
 
 describe("isRlmModeEnabled", () => {
-  test("send-option experiments gate on RLM plus a PTC parent flag", () => {
-    expect(isRlmModeEnabled({ rlm: true, programmaticToolCalling: true }, undefined)).toBe(true);
-    expect(isRlmModeEnabled({ rlm: true, programmaticToolCallingExclusive: true }, undefined)).toBe(
-      true
-    );
-    // RLM without a PTC parent stays inert; PTC without RLM stays off.
-    expect(isRlmModeEnabled({ rlm: true }, undefined)).toBe(false);
-    expect(isRlmModeEnabled({ programmaticToolCalling: true }, undefined)).toBe(false);
-  });
-
-  test("falls back to machine overrides when send options carry no experiments", () => {
+  test("gates on RLM plus the PTC parent flag", () => {
     const machineFlags = new Set<ExperimentId>([
       EXPERIMENT_IDS.RLM,
       EXPERIMENT_IDS.PROGRAMMATIC_TOOL_CALLING,
     ]);
-    expect(isRlmModeEnabled(undefined, (id) => machineFlags.has(id))).toBe(true);
-    expect(isRlmModeEnabled(undefined, (id) => id === EXPERIMENT_IDS.RLM)).toBe(false);
-    expect(isRlmModeEnabled(undefined, undefined)).toBe(false);
-  });
-
-  test("explicit send-option experiments win over machine overrides", () => {
-    // Explicit booleans are authoritative per-field: rlm: false must NOT
-    // fall through to machine overrides that have RLM enabled.
-    const allOn = () => true;
-    expect(isRlmModeEnabled({ rlm: false, programmaticToolCalling: true }, allOn)).toBe(false);
-    expect(isRlmModeEnabled({ rlm: true, programmaticToolCalling: true }, () => false)).toBe(true);
-    // Per-field fallback (matching resolveBackendGatedPtcExperiments): an
-    // explicit ptc: false does not silence a backend-enabled ptcExclusive —
-    // tool assembly would build the exclusive kernel in this scenario, and
-    // this predicate must agree with it.
-    expect(isRlmModeEnabled({ rlm: true, programmaticToolCalling: false }, allOn)).toBe(true);
-    expect(
-      isRlmModeEnabled(
-        { rlm: true, programmaticToolCalling: false, programmaticToolCallingExclusive: false },
-        allOn
-      )
-    ).toBe(false);
-  });
-
-  test("missing flags on a defined experiments object fall back to backend overrides", () => {
-    // A renderer with no origin-local override sends a defined experiments
-    // object WITHOUT these fields (useExperimentOverrideValue sends no
-    // explicit values). Treating that object as authoritative-false desynced
-    // this predicate from tool assembly: the workspace got the persistent
-    // RLM kernel while summaries/keep-recent/read-reinjection stayed off.
-    const machineFlags = new Set<ExperimentId>([
-      EXPERIMENT_IDS.RLM,
-      EXPERIMENT_IDS.PROGRAMMATIC_TOOL_CALLING,
-    ]);
-    expect(isRlmModeEnabled({}, (id) => machineFlags.has(id))).toBe(true);
-    expect(isRlmModeEnabled({}, (id) => id === EXPERIMENT_IDS.RLM)).toBe(false);
-    expect(isRlmModeEnabled({}, undefined)).toBe(false);
+    expect(isRlmModeEnabled((id) => machineFlags.has(id))).toBe(true);
+    expect(isRlmModeEnabled((id) => id === EXPERIMENT_IDS.RLM)).toBe(false);
+    expect(isRlmModeEnabled(undefined)).toBe(false);
   });
 });
 
 describe("buildAbandonedBranchTranscript", () => {
+  test("hidden review rows do not consume transcript space and authentic feedback survives", () => {
+    const feedback: PlanReviewRecord = {
+      v: 1,
+      kind: "feedback",
+      recordId: "feedback",
+      feedbackId: "feedback",
+      snapshotId: "snapshot",
+      contentHash: "a".repeat(64),
+      summary: "visible feedback",
+      comments: [],
+      replies: [],
+    };
+    const feedbackText = formatPlanReviewEnvelope(feedback);
+    const visible = [
+      createMuxMessage("visible", "user", "visible work"),
+      createMuxMessage("feedback", "user", feedbackText, {
+        muxMetadata: buildPlanReviewMetadata(feedback),
+      }),
+    ];
+    const hidden = (["snapshot", "resolve", "reopen"] as const).map((kind) =>
+      createMuxMessage(
+        kind,
+        "user",
+        "HIDDEN_REVIEW_SENTINEL".repeat(BRANCH_SUMMARY_MAX_TRANSCRIPT_CHARS),
+        {
+          muxMetadata: { type: "plan-review", kind, recordId: kind },
+        }
+      )
+    );
+    expect(buildAbandonedBranchTranscript([...visible, ...hidden])).toBe(
+      buildAbandonedBranchTranscript(visible)
+    );
+    expect(buildAbandonedBranchTranscript(visible)).toContain(feedbackText);
+  });
+
+  test("a user row's prompt-hook context is in the transcript, as in its token estimate", () => {
+    // Codex PRRT_kwDOPxxmWM6rPqxL: the estimate counts the provider-visible text.
+    const message: MuxMessage = {
+      id: "u1",
+      role: "user",
+      parts: [{ type: "text", text: "fix the tests" }],
+      metadata: { timestamp: 1, pluginHookContext: [{ pluginId: "guard", text: "Repro first." }] },
+    };
+    const transcript = buildAbandonedBranchTranscript([message]);
+    expect(transcript).toContain("fix the tests");
+    expect(transcript).toContain("Repro first.");
+  });
+
   test("keeps text and tool markers, strips reasoning parts", () => {
     const message: MuxMessage = {
       id: "a1",
@@ -313,7 +341,7 @@ describe("getSideChannelModelCandidates (r23: provider confinement)", () => {
         }),
         workspaceId: "ws-no-metadata",
         abandonedMessages: meatyExchange("no-metadata"),
-        experiments: RLM_ON,
+        isExperimentEnabled: RLM_ON,
       });
       expect(appended).toBeNull();
     } finally {
@@ -406,12 +434,43 @@ describe("maybeAppendAbandonedBranchSummary", () => {
         aiService: unreachableAiService(),
         workspaceId: "ws-off",
         abandonedMessages: meatyExchange("off"),
-        // No experiments and no machine overrides => RLM off.
       });
       expect(appended).toBeNull();
       const history = await historyService.getHistoryFromLatestBoundary("ws-off");
       expect(history.success).toBe(true);
       expect(history.success && history.data.length).toBe(0);
+    } finally {
+      await cleanup();
+    }
+  });
+
+  test("hidden review tokens cannot make a tiny abandoned segment eligible", async () => {
+    const { historyService, cleanup } = await createTestHistoryService();
+    let calls = 0;
+    try {
+      const result = await maybeAppendAbandonedBranchSummary({
+        historyService,
+        workspaceId: "hidden-review-budget",
+        isExperimentEnabled: RLM_ON,
+        aiService: fakeAiService(
+          summaryModel("summary", () => {
+            calls++;
+          })
+        ),
+        abandonedMessages: [
+          createMuxMessage("visible", "user", "tiny visible turn"),
+          createMuxMessage(
+            "hidden",
+            "user",
+            "hidden tokens ".repeat(BRANCH_SUMMARY_MIN_SEGMENT_TOKENS * 3),
+            {
+              muxMetadata: { type: "plan-review", kind: "snapshot", recordId: "hidden" },
+            }
+          ),
+        ],
+      });
+      expect(result).toBeNull();
+      expect(calls).toBe(0);
     } finally {
       await cleanup();
     }
@@ -426,7 +485,7 @@ describe("maybeAppendAbandonedBranchSummary", () => {
         aiService: unreachableAiService(),
         workspaceId: "ws-tiny",
         abandonedMessages: tiny,
-        experiments: RLM_ON,
+        isExperimentEnabled: RLM_ON,
       });
       expect(appended).toBeNull();
       const history = await historyService.getHistoryFromLatestBoundary("ws-tiny");
@@ -449,7 +508,7 @@ describe("maybeAppendAbandonedBranchSummary", () => {
         ),
         workspaceId: "ws-meaty",
         abandonedMessages: meatyExchange("meaty"),
-        experiments: RLM_ON,
+        isExperimentEnabled: RLM_ON,
       });
 
       expect(appended).not.toBeNull();
@@ -504,7 +563,7 @@ describe("maybeAppendAbandonedBranchSummary", () => {
         aiService: fakeAiService(model),
         workspaceId: "ws-roles",
         abandonedMessages: meatyExchange("roles"),
-        experiments: RLM_ON,
+        isExperimentEnabled: RLM_ON,
       });
       expect(appended).not.toBeNull();
       const system = capturedPrompt?.find((message) => message.role === "system");
@@ -527,6 +586,120 @@ describe("maybeAppendAbandonedBranchSummary", () => {
     }
   });
 
+  test("candidates that cannot disable thinking get headroom, and Haiku 5.5 gets disabled thinking", async () => {
+    const { historyService, cleanup } = await createTestHistoryService();
+    try {
+      const calls: Array<{ maxOutputTokens?: number; effort?: unknown; thinking?: unknown }> = [];
+      const model = new MockLanguageModelV3({
+        doStream: (options: LanguageModelV3CallOptions) => {
+          calls.push({
+            maxOutputTokens: options.maxOutputTokens,
+            effort: options.providerOptions?.anthropic?.effort,
+            thinking: options.providerOptions?.anthropic?.thinking,
+          });
+          return Promise.resolve({
+            stream: simulateReadableStream({
+              chunks: [
+                { type: "text-start", id: "t1" },
+                { type: "text-delta", id: "t1", delta: "Summarized the branch." },
+                { type: "text-end", id: "t1" },
+                finishChunk(),
+              ] satisfies LanguageModelV3StreamPart[],
+            }),
+          });
+        },
+      });
+      // Haiku 5.5 thinks unless told not to, so it gets explicit disabled thinking
+      // within the plain summary budget; Haiku 4.5 needs no options.
+      for (const workspaceModel of [
+        "anthropic:claude-opus-5-5",
+        "anthropic:claude-haiku-4-5",
+        "anthropic:claude-haiku-5-5",
+      ]) {
+        const appended = await maybeAppendAbandonedBranchSummary({
+          historyService,
+          aiService: fakeAiService(model, { workspaceModel }),
+          workspaceId: `ws-${workspaceModel}`,
+          abandonedMessages: meatyExchange(workspaceModel),
+          isExperimentEnabled: RLM_ON,
+        });
+        expect(appended).not.toBeNull();
+      }
+      expect(calls).toEqual([
+        {
+          maxOutputTokens:
+            BRANCH_SUMMARY_MAX_OUTPUT_TOKENS + BRANCH_SUMMARY_THINKING_HEADROOM_TOKENS,
+          effort: "low",
+          thinking: undefined,
+        },
+        {
+          maxOutputTokens: BRANCH_SUMMARY_MAX_OUTPUT_TOKENS,
+          effort: undefined,
+          thinking: undefined,
+        },
+        {
+          maxOutputTokens: BRANCH_SUMMARY_MAX_OUTPUT_TOKENS,
+          effort: "low",
+          thinking: { type: "disabled" },
+        },
+      ]);
+    } finally {
+      await cleanup();
+    }
+  });
+
+  // Bedrock and OpenRouter ignore the anthropic namespace, so disabled thinking must
+  // be serialized for the route the candidate was created on.
+  test.each([
+    [
+      "bedrock",
+      {
+        bedrock: {
+          additionalModelRequestFields: {
+            thinking: { type: "disabled" },
+            output_config: { effort: "low" },
+          },
+        },
+      },
+    ],
+    ["openrouter", { openrouter: { reasoning: { effort: "none" } } }],
+  ] as const)(
+    "Haiku 5.5 gets disabled thinking on the %s route",
+    async (routeProvider, expected) => {
+      const { historyService, cleanup } = await createTestHistoryService();
+      try {
+        const sentProviderOptions: unknown[] = [];
+        const model = new MockLanguageModelV3({
+          doStream: (options: LanguageModelV3CallOptions) => {
+            sentProviderOptions.push(options.providerOptions);
+            return Promise.resolve({
+              stream: simulateReadableStream({
+                chunks: [
+                  { type: "text-start", id: "t1" },
+                  { type: "text-delta", id: "t1", delta: "Summarized the branch." },
+                  { type: "text-end", id: "t1" },
+                  finishChunk(),
+                ] satisfies LanguageModelV3StreamPart[],
+              }),
+            });
+          },
+        });
+        const workspaceModel = "anthropic:claude-haiku-5-5";
+        const appended = await maybeAppendAbandonedBranchSummary({
+          historyService,
+          aiService: fakeAiService(model, { workspaceModel, routeProvider }),
+          workspaceId: `ws-${routeProvider}`,
+          abandonedMessages: meatyExchange(workspaceModel),
+          isExperimentEnabled: RLM_ON,
+        });
+        expect(appended).not.toBeNull();
+        expect(sentProviderOptions).toEqual([expected]);
+      } finally {
+        await cleanup();
+      }
+    }
+  );
+
   test("explicit caller-resolved candidates bypass the target workspace's empty metadata", async () => {
     const { historyService, cleanup } = await createTestHistoryService();
     try {
@@ -544,7 +717,7 @@ describe("maybeAppendAbandonedBranchSummary", () => {
         }),
         workspaceId: "ws-fork-snapshot",
         abandonedMessages: meatyExchange("fork-snapshot"),
-        experiments: RLM_ON,
+        isExperimentEnabled: RLM_ON,
         modelCandidates: ["ollama:source-model"],
       });
       expect(appended).not.toBeNull();
@@ -568,7 +741,7 @@ describe("maybeAppendAbandonedBranchSummary", () => {
         aiService: fakeAiService(summaryModel("Explored the race; found the fix.")),
         workspaceId: "ws-usage",
         abandonedMessages: meatyExchange("usage"),
-        experiments: RLM_ON,
+        isExperimentEnabled: RLM_ON,
         sessionUsageService: {
           recordHeadlessUsage: (workspaceId, modelString, usage, _metadata, options) => {
             usageCalls.push({
@@ -624,7 +797,7 @@ describe("maybeAppendAbandonedBranchSummary", () => {
         aiService: fakeAiService(stallingModel),
         workspaceId: "ws-usage-salvage",
         abandonedMessages: meatyExchange("usage-salvage"),
-        experiments: RLM_ON,
+        isExperimentEnabled: RLM_ON,
         timeoutMs: 150,
         sessionUsageService: {
           recordHeadlessUsage: () => {
@@ -654,7 +827,7 @@ describe("maybeAppendAbandonedBranchSummary", () => {
         aiService: fakeAiService(summaryModel("Usage sink wedged. Summary still lands.")),
         workspaceId: "ws-usage-wedged",
         abandonedMessages: meatyExchange("usage-wedged"),
-        experiments: RLM_ON,
+        isExperimentEnabled: RLM_ON,
         timeoutMs: 500,
         sessionUsageService: {
           recordHeadlessUsage: () => new Promise<undefined>(() => undefined),
@@ -688,7 +861,7 @@ describe("maybeAppendAbandonedBranchSummary", () => {
         aiService: fakeAiService(summaryModel("Summary lands; the usage write lags behind.")),
         workspaceId: "ws-usage-drain",
         abandonedMessages: meatyExchange("usage-drain"),
-        experiments: RLM_ON,
+        isExperimentEnabled: RLM_ON,
         timeoutMs: 500,
         sessionUsageService: {
           recordHeadlessUsage: async () => {
@@ -748,7 +921,7 @@ describe("maybeAppendAbandonedBranchSummary", () => {
         ),
         workspaceId: "ws-preserved-copies",
         abandonedMessages: [...originals, compactionRow, ...duplicates],
-        experiments: RLM_ON,
+        isExperimentEnabled: RLM_ON,
       });
       expect(appended).not.toBeNull();
       // The unique abandoned turns reached the summarizer...
@@ -770,7 +943,7 @@ describe("maybeAppendAbandonedBranchSummary", () => {
         aiService: fakeAiService(null),
         workspaceId: "ws-fail",
         abandonedMessages: meatyExchange("fail"),
-        experiments: RLM_ON,
+        isExperimentEnabled: RLM_ON,
       });
       expect(appended).toBeNull();
       const history = await historyService.getHistoryFromLatestBoundary("ws-fail");
@@ -798,7 +971,7 @@ describe("maybeAppendAbandonedBranchSummary", () => {
         aiService: fakeAiService(stalledModel),
         workspaceId: "ws-stall",
         abandonedMessages: meatyExchange("stall"),
-        experiments: RLM_ON,
+        isExperimentEnabled: RLM_ON,
         timeoutMs: 100,
       });
       expect(appended).toBeNull();
@@ -833,7 +1006,7 @@ describe("maybeAppendAbandonedBranchSummary", () => {
         aiService: fakeAiService(wedgedCancel),
         workspaceId: "ws-wedged-cancel",
         abandonedMessages: meatyExchange("wedged-cancel"),
-        experiments: RLM_ON,
+        isExperimentEnabled: RLM_ON,
         timeoutMs: 100,
       });
       expect(appended).toBeNull();
@@ -853,7 +1026,7 @@ describe("maybeAppendAbandonedBranchSummary", () => {
       // and workspace removal waits forever on the background drain.
       const base = fakeAiService(null);
       const wedgedCreation: BranchSummaryAiService = {
-        createModelWithPinnedMetadata: () => new Promise<never>(() => undefined),
+        createModelWithPinnedOptions: () => new Promise<never>(() => undefined),
         getWorkspaceMetadata: base.getWorkspaceMetadata,
       };
       const startedAt = Date.now();
@@ -862,7 +1035,7 @@ describe("maybeAppendAbandonedBranchSummary", () => {
         aiService: wedgedCreation,
         workspaceId: "ws-wedged-create",
         abandonedMessages: meatyExchange("wedged-create"),
-        experiments: RLM_ON,
+        isExperimentEnabled: RLM_ON,
         timeoutMs: 100,
       });
       expect(appended).toBeNull();
@@ -899,7 +1072,7 @@ describe("maybeAppendAbandonedBranchSummary", () => {
         aiService: fakeAiService(slowModel),
         workspaceId: "ws-salvage",
         abandonedMessages: meatyExchange("salvage"),
-        experiments: RLM_ON,
+        isExperimentEnabled: RLM_ON,
         timeoutMs: 200,
       });
       expect(appended).not.toBeNull();
@@ -915,6 +1088,7 @@ describe("maybeAppendAbandonedBranchSummary", () => {
     const { historyService, cleanup } = await createTestHistoryService();
     try {
       let pulls = 0;
+      let cancelled = false;
       // A runaway provider: streams one complete sentence, then keeps
       // yielding fragments forever, ignoring abortSignal entirely. Each pull
       // waits a real timer tick so the deadline can actually fire (a
@@ -935,10 +1109,17 @@ describe("maybeAppendAbandonedBranchSummary", () => {
                 new Promise((resolve) =>
                   setTimeout(() => {
                     pulls += 1;
-                    controller.enqueue({ type: "text-delta", id: "t1", delta: " overflow" });
+                    if (!cancelled) {
+                      controller.enqueue({ type: "text-delta", id: "t1", delta: " overflow" });
+                    }
                     resolve();
                   }, 1)
                 ),
+              // Since ai 6f6b9c0 the SDK cancels the provider stream on abort, so
+              // a pull already in flight must not enqueue into the closed stream.
+              cancel: () => {
+                cancelled = true;
+              },
             }),
           }),
       });
@@ -947,7 +1128,7 @@ describe("maybeAppendAbandonedBranchSummary", () => {
         aiService: fakeAiService(runawayModel),
         workspaceId: "ws-runaway",
         abandonedMessages: meatyExchange("runaway"),
-        experiments: RLM_ON,
+        isExperimentEnabled: RLM_ON,
         timeoutMs: 100,
       });
       // The salvaged row contains only the pre-deadline complete sentence.
@@ -1003,7 +1184,7 @@ describe("maybeAppendAbandonedBranchSummary", () => {
         aiService: fakeAiService(floodModel),
         workspaceId: "ws-flood",
         abandonedMessages: meatyExchange("flood"),
-        experiments: RLM_ON,
+        isExperimentEnabled: RLM_ON,
         timeoutMs: 300,
       });
       // The capped buffer still salvages whole sentences into a row.
@@ -1043,7 +1224,7 @@ describe("maybeAppendAbandonedBranchSummary", () => {
         aiService: fakeAiService(giantModel),
         workspaceId: "ws-giant-delta",
         abandonedMessages: meatyExchange("giant"),
-        experiments: RLM_ON,
+        isExperimentEnabled: RLM_ON,
         timeoutMs: 500,
       });
       expect(appended).not.toBeNull();
@@ -1071,7 +1252,7 @@ describe("maybeAppendAbandonedBranchSummary", () => {
         ),
         workspaceId: "ws-length",
         abandonedMessages: meatyExchange("length"),
-        experiments: RLM_ON,
+        isExperimentEnabled: RLM_ON,
       });
       expect(appended).not.toBeNull();
       const text = appended!.parts.find((part) => part.type === "text");
@@ -1096,7 +1277,7 @@ describe("maybeAppendAbandonedBranchSummary", () => {
         aiService: fakeAiService(summaryModel("Summary that must be dropped.")),
         workspaceId: ws,
         abandonedMessages: meatyExchange("guard"),
-        experiments: RLM_ON,
+        isExperimentEnabled: RLM_ON,
         guardTailMessageId: "bp-1",
       });
       expect(appended).toBeNull();
@@ -1147,7 +1328,7 @@ describe("branch summary placement on fork/truncate flows", () => {
         aiService: fakeAiService(summaryModel("The abandoned attempt explored a race condition.")),
         workspaceId: fork,
         abandonedMessages: truncateResult.data.removedMessages,
-        experiments: RLM_ON,
+        isExperimentEnabled: RLM_ON,
         guardTailMessageId: "m2",
       });
 
@@ -1179,7 +1360,9 @@ describe("branch summary placement on fork/truncate flows", () => {
     }
   });
 
-  test("a send in another process waits on the pending marker before proceeding (r48)", async () => {
+  // The Node layer and the memory layer: the reader must find the writer's marker through the
+  // same SessionLocks, since a memory lock leaves no lock file on the disk.
+  const crossProcessMarkerWait = async (locks?: Layer.Layer<SessionLocksTag>) => {
     // The registration map is process-local: with XUM_ALLOW_MULTIPLE_INSTANCES=1
     // a fork created by backend A is invisible to backend B, whose first send
     // would append its user row immediately and advance the guarded tail —
@@ -1188,12 +1371,12 @@ describe("branch summary placement on fork/truncate flows", () => {
     // send that finds NO local registration must wait on that marker.
     // Simulated here with a foreign workspace id (no local map entry)
     // sharing the session dir.
-    const { historyService, config, cleanup } = await createTestHistoryService();
+    const { historyService, config, cleanup } = await createTestHistoryService({ locks });
     try {
       const ws = "ws-cross-process-marker";
       const branchPoint = createMuxMessage("xp-1", "assistant", "branch point", { timestamp: 1 });
       expect((await historyService.appendToHistory(ws, branchPoint)).success).toBe(true);
-      const sessionDir = config.getSessionDir(ws);
+      const sessionDir = path.join(config.sessionsDir, ws);
 
       // Gate the model so generation is provably in flight while the foreign
       // send checks the marker.
@@ -1220,14 +1403,14 @@ describe("branch summary placement on fork/truncate flows", () => {
         historyService,
         aiService: fakeAiService(gatedModel),
         workspaceId: ws,
-        sessionDir,
+        marker: { sessionDir, locks: historyService.locks },
         abandonedMessages: [
           createMuxMessage("xp-abandoned-user", "user", `Fix this: ${filler}`, { timestamp: 2 }),
           createMuxMessage("xp-abandoned-assistant", "assistant", `Findings: ${filler}`, {
             timestamp: 3,
           }),
         ],
-        experiments: RLM_ON,
+        isExperimentEnabled: RLM_ON,
         guardTailMessageId: "xp-1",
       });
 
@@ -1236,16 +1419,14 @@ describe("branch summary placement on fork/truncate flows", () => {
       // first send could observe it. No polling: a regression to detached
       // acquisition fails this assertion outright.
       const lockPath = path.join(sessionDir, "branch-summary.lock");
-      expect(
-        await fs.stat(lockPath).then(
-          () => true,
-          () => false
-        )
-      ).toBe(true);
+      expect(await historyService.locks.processFileLockExists(lockPath)).toBe(true);
 
       // Foreign send: no local registration under this id, marker exists —
       // it must BLOCK until the writer settles, not return immediately.
-      const foreignWait = awaitPendingBranchSummary("ws-foreign-process", sessionDir);
+      const foreignWait = awaitPendingBranchSummary("ws-foreign-process", {
+        sessionDir,
+        locks: historyService.locks,
+      });
       const sentinel = Symbol("still-pending");
       expect(
         await Promise.race([
@@ -1270,7 +1451,18 @@ describe("branch summary placement on fork/truncate flows", () => {
     } finally {
       await cleanup();
     }
-  });
+  };
+
+  test("a send in another process waits on the pending marker before proceeding (r48)", () =>
+    crossProcessMarkerWait());
+
+  test("a send in another process sees a marker that the memory locks hold (r48)", () =>
+    crossProcessMarkerWait(
+      SessionLocksMemory.pipe(
+        Layer.provide(Layer.succeed(HostClockTag)(nodeClock)),
+        Layer.provide(createMemoryHost().layer)
+      )
+    ));
 
   test("removal cancels an inline edit-resend summary through clearPendingBranchSummary (r57 P1)", async () => {
     // The edit-resend path awaits its summary synchronously — no first-send
@@ -1306,7 +1498,7 @@ describe("branch summary placement on fork/truncate flows", () => {
         aiService: fakeAiService(gatedModel),
         workspaceId: ws,
         abandonedMessages: meatyExchange("inline-cancel"),
-        experiments: RLM_ON,
+        isExperimentEnabled: RLM_ON,
       });
       // Let the writer reach the gated stream.
       await new Promise((resolve) => setTimeout(resolve, 10));
@@ -1351,7 +1543,7 @@ describe("branch summary placement on fork/truncate flows", () => {
         aiService: fakeAiService(summaryModel("The abandoned attempt found the root cause.")),
         workspaceId: ws,
         abandonedMessages: meatyExchange("settled"),
-        experiments: RLM_ON,
+        isExperimentEnabled: RLM_ON,
         guardTailMessageId: "sb-1",
       });
 
@@ -1396,10 +1588,10 @@ describe("branch summary placement on fork/truncate flows", () => {
       });
       const model = summaryModel("The abandoned branch context both requests need.");
       const gatedAiService: BranchSummaryAiService = {
-        createModelWithPinnedMetadata: (async (...createArgs) => {
+        createModelWithPinnedOptions: (async (...createArgs) => {
           await modelGate;
-          return fakeAiService(model).createModelWithPinnedMetadata(...createArgs);
-        }) as BranchSummaryAiService["createModelWithPinnedMetadata"],
+          return fakeAiService(model).createModelWithPinnedOptions(...createArgs);
+        }) as BranchSummaryAiService["createModelWithPinnedOptions"],
         getWorkspaceMetadata: fakeAiService(model).getWorkspaceMetadata,
       };
       await startAbandonedBranchSummaryInBackground({
@@ -1407,7 +1599,7 @@ describe("branch summary placement on fork/truncate flows", () => {
         aiService: gatedAiService,
         workspaceId: ws,
         abandonedMessages: meatyExchange("concurrent"),
-        experiments: RLM_ON,
+        isExperimentEnabled: RLM_ON,
         guardTailMessageId: "cc-1",
       });
 
@@ -1465,7 +1657,7 @@ describe("branch summary placement on fork/truncate flows", () => {
         aiService: fakeAiService(summaryModel("A summary nobody ever consumes.")),
         workspaceId: ws,
         abandonedMessages: meatyExchange("cleared"),
-        experiments: RLM_ON,
+        isExperimentEnabled: RLM_ON,
         guardTailMessageId: "cl-1",
       });
 
@@ -1508,7 +1700,7 @@ describe("branch summary placement on fork/truncate flows", () => {
         aiService: fakeAiService(slowModel),
         workspaceId: ws,
         abandonedMessages: meatyExchange("invalidated"),
-        experiments: RLM_ON,
+        isExperimentEnabled: RLM_ON,
         guardTailMessageId: "inv-1",
         timeoutMs: 400,
       });
@@ -1544,10 +1736,10 @@ describe("branch summary placement on fork/truncate flows", () => {
       });
       const model = summaryModel("A summary that must never land after removal.");
       const gatedAiService: BranchSummaryAiService = {
-        createModelWithPinnedMetadata: (async (...createArgs) => {
+        createModelWithPinnedOptions: (async (...createArgs) => {
           await modelGate;
-          return fakeAiService(model).createModelWithPinnedMetadata(...createArgs);
-        }) as BranchSummaryAiService["createModelWithPinnedMetadata"],
+          return fakeAiService(model).createModelWithPinnedOptions(...createArgs);
+        }) as BranchSummaryAiService["createModelWithPinnedOptions"],
         getWorkspaceMetadata: fakeAiService(model).getWorkspaceMetadata,
       };
 
@@ -1556,7 +1748,7 @@ describe("branch summary placement on fork/truncate flows", () => {
         aiService: gatedAiService,
         workspaceId: ws,
         abandonedMessages: meatyExchange("await-race"),
-        experiments: RLM_ON,
+        isExperimentEnabled: RLM_ON,
         guardTailMessageId: "ar-1",
       });
 
@@ -1612,7 +1804,7 @@ describe("branch summary placement on fork/truncate flows", () => {
         aiService: fakeAiService(summaryModel("Summary appended mid-removal.")),
         workspaceId: ws,
         abandonedMessages: meatyExchange("serialized"),
-        experiments: RLM_ON,
+        isExperimentEnabled: RLM_ON,
         guardTailMessageId: "ser-1",
       });
       const deadline = Date.now() + 5_000;
@@ -1670,7 +1862,7 @@ describe("branch summary placement on fork/truncate flows", () => {
         ),
         workspaceId: ws,
         abandonedMessages: truncateResult.data.removedMessages,
-        experiments: RLM_ON,
+        isExperimentEnabled: RLM_ON,
       });
       expect(appended).not.toBeNull();
 
@@ -1708,7 +1900,7 @@ describe("branch summary placement on fork/truncate flows", () => {
         aiService: unreachableAiService(),
         workspaceId: "ws-near",
         abandonedMessages: nearlyMeaty,
-        experiments: RLM_ON,
+        isExperimentEnabled: RLM_ON,
       });
       expect(appended).toBeNull();
     } finally {

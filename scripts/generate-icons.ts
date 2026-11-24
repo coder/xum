@@ -13,7 +13,7 @@
  *
  * If no command is given, defaults to: png icns
  */
-import { mkdir, rm, copyFile, readFile, writeFile } from "node:fs/promises";
+import { mkdir, rm, readFile, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import sharp from "sharp";
@@ -79,30 +79,20 @@ type RasterTargetConfig = {
   cropViewBox?: string;
 };
 
-type SvgTargetConfig = {
-  svg: true;
-  source: string;
-};
-
-type LogoTargetConfig = RasterTargetConfig | SvgTargetConfig;
-
 // Keep the source + background pairing centralized so targets stay DRY.
 const MONO_ICON = { source: SOURCE_BLACK, bg: false } as const;
 const APP_ICON = { source: SOURCE_WHITE, bg: true } as const;
 
-// Crop the centered square source to the outlined "x" + cursor bounds so the
-// mark fills small tray images without clipping the glyph or cursor.
-// Content bounds: x 13.13…58.88, y 24.5…47.5 → 45.75×23 units. Keep
-// roughly one output pixel of horizontal breathing room at the 24px tray size.
-const TRAY_MARK_CROP = "11 24 50 24.5";
+// Crop the centered square source to the restored m-block bounds so the mark
+// fills small tray images without clipping the glyph or cursor.
+// Content bounds: x 8.85…63.15, y 24.5…47.5 → 54.3×23 units. Keep roughly
+// half a source unit of breathing room around the 2.33:1 mark.
+const TRAY_MARK_CROP = "8 24 56 24";
 
 // Targets to update (path -> config)
 const LOGO_TARGETS = {
   // VS Code extension (Black on Transparent)
   "vscode/icon.png": { size: 128, ...MONO_ICON },
-
-  // Browser asset (Vector)
-  "src/browser/assets/icons/xum.svg": { svg: true, source: SOURCE_BLACK },
 
   // Docs (docs.json points at logo-black/logo-white directly to avoid duplicates)
   "docs/img/logo.webp": { size: 512, ...MONO_ICON, format: "webp" },
@@ -115,13 +105,13 @@ const LOGO_TARGETS = {
   // iOS Safari uses apple-touch-icon for home screen installs.
   "public/apple-touch-icon.png": { size: 180, ...APP_ICON },
 
-  // Electron Tray Icons – Wide Xum Mark (Monochrome on Transparent)
+  // Electron Tray Icons – Wide m-Block Mark (Monochrome on Transparent)
   //
-  // The source SVGs have heavy internal padding (mark uses ~32% of canvas).
-  // We crop to TRAY_MARK_CROP before rendering so the mark fills the output.
+  // The restored mark is much wider than it is tall, so crop its internal
+  // source padding before rendering to fill the output without clipping.
   //
   // Pixel dimensions: 24×24 @1x → 48×48 @2x → 72×72 @3x.
-  // Square canvas; the mark (aspect ≈ 1.84:1) is height-constrained and
+  // Square canvas; the mark (aspect ≈ 2.33:1) is height-constrained and
   // centered horizontally with transparent side padding.
   //
   // macOS treats the black variant as a template image (adapts to light/dark
@@ -148,7 +138,7 @@ const LOGO_TARGETS = {
     bg: false,
     cropViewBox: TRAY_MARK_CROP,
   },
-} satisfies Record<string, LogoTargetConfig>;
+} satisfies Record<string, RasterTargetConfig>;
 
 const APP_ICON_PADDING_RATIO = 0.2;
 
@@ -286,14 +276,8 @@ async function updateAllLogos() {
 
   for (const [relativePath, config] of Object.entries(LOGO_TARGETS)) {
     const outputPath = path.join(ROOT, relativePath);
-
-    if ("svg" in config) {
-      // For SVG target, just copy the source SVG (optimize/clean if needed, but direct copy is safe)
-      await copyFile(config.source, outputPath);
-    } else {
-      const img = await generateRasterIcon(config);
-      await img.toFile(outputPath);
-    }
+    const img = await generateRasterIcon(config);
+    await img.toFile(outputPath);
     console.log(`✓ ${relativePath}`);
   }
 

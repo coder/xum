@@ -5,8 +5,10 @@ import * as path from "node:path";
 import { z } from "zod";
 
 import assert from "@/common/utils/assert";
-import type { Config } from "@/node/config";
+import type { WorkspaceSessionLocator } from "@/node/config";
 import { log } from "@/node/services/log";
+import { AsyncSemaphore } from "@/node/utils/concurrency/asyncSemaphore";
+import { MutexMap } from "@/node/utils/concurrency/mutexMap";
 import { isErrnoWithCode } from "@/node/utils/fs";
 
 /**
@@ -15,6 +17,15 @@ import { isErrnoWithCode } from "@/node/utils/fs";
  * accepted-delivery dedupe and crash recovery.
  */
 export const TERMINAL_ATTENTION_DIR = "terminal-attention";
+
+// Serializes delete() with the status updates' read-then-write per notification file, so an
+// update cannot re-create a record a concurrent delete removed (#5056). Module-level so every
+// store instance over the same sessions dir shares it. In-process only.
+const notificationFileLocks = new MutexMap<string>();
+
+// Enough to keep the disk queue busy on the all-ENOENT fast path without opening thousands of
+// directory handles at once on network or large session dirs.
+const SESSION_DIR_SCAN_CONCURRENCY = 16;
 
 const TERMINAL_ATTENTION_OUTPUT_DELIVERIES = [
   "already_injected",
@@ -78,11 +89,11 @@ const TerminalAttentionNotificationSchema = z.object({
  * by skipping malformed files at read time.
  */
 export class TerminalAttentionStore {
-  constructor(private readonly config: Pick<Config, "getSessionDir" | "sessionsDir">) {}
+  constructor(private readonly config: Pick<WorkspaceSessionLocator, "sessionsDir">) {}
 
   private dir(ownerWorkspaceId: string): string {
     assert(ownerWorkspaceId.trim().length > 0, "TerminalAttentionStore requires ownerWorkspaceId");
-    return path.join(this.config.getSessionDir(ownerWorkspaceId), TERMINAL_ATTENTION_DIR);
+    return path.join(this.config.sessionsDir, ownerWorkspaceId, TERMINAL_ATTENTION_DIR);
   }
 
   /** Stable id keyed by source and optional execution generation for per-assignment idempotency. */
@@ -138,6 +149,59 @@ export class TerminalAttentionStore {
     return record;
   }
 
+  /**
+   * Write-once settlement marker: records a notification directly in a terminal status with a
+   * single write (no pending intermediate a concurrent reader could misread as an owed wake).
+   * An existing record for the same id is left untouched. Omitting generationId settles the
+   * stable (un-suffixed) id, which older builds use for whole-source dedupe.
+   *
+   * wholeSourceRefresh instead settles the stable id while keeping the generationId FIELD and
+   * overwrites any existing record: that marker means "latest consumed generation of this
+   * source", so settlement must refresh a stale previous-generation record that survived its
+   * best-effort restart-time clear, and the recorded generation gives readers exact evidence
+   * that is immune to wall-clock corrections.
+   */
+  async recordSettled(
+    notification: Omit<
+      TerminalAttentionNotification,
+      "id" | "status" | "createdAt" | "outputDelivery"
+    > & {
+      status: "delivered" | "superseded";
+    },
+    options?: { wholeSourceRefresh?: boolean }
+  ): Promise<void> {
+    const wholeSourceRefresh = options?.wholeSourceRefresh === true;
+    const id = TerminalAttentionStore.notificationId(
+      notification.sourceKind,
+      notification.sourceId,
+      wholeSourceRefresh ? undefined : notification.generationId
+    );
+    if (!wholeSourceRefresh) {
+      const existing = await this.get(notification.ownerWorkspaceId, id);
+      if (existing != null) {
+        return;
+      }
+    }
+    await this.write(
+      {
+        id,
+        ownerWorkspaceId: notification.ownerWorkspaceId,
+        sourceKind: notification.sourceKind,
+        sourceId: notification.sourceId,
+        ...(notification.generationId != null ? { generationId: notification.generationId } : {}),
+        outputDelivery: outputDeliveryForSource(notification.sourceKind),
+        terminalOutcome: notification.terminalOutcome,
+        status: notification.status,
+        createdAt: new Date().toISOString(),
+        ...(notification.status === "delivered" ? { deliveredAt: new Date().toISOString() } : {}),
+      },
+      // Settlement markers are re-derivable dedupe over run + history evidence, and reconcilers
+      // write them while workspace removal may be deleting the session directory: never mkdir
+      // the owner dir back into existence for one (orphaned session state); drop it instead.
+      { createOwnerDir: false }
+    );
+  }
+
   async get(ownerWorkspaceId: string, id: string): Promise<TerminalAttentionNotification | null> {
     let raw: string;
     try {
@@ -173,6 +237,27 @@ export class TerminalAttentionStore {
     return records;
   }
 
+  /** True as soon as one pending record parses; skips the rest of the directory. */
+  private async hasPending(ownerWorkspaceId: string): Promise<boolean> {
+    const dir = this.dir(ownerWorkspaceId);
+    let entries: string[];
+    try {
+      entries = await fsPromises.readdir(dir);
+    } catch (error) {
+      if (isErrnoWithCode(error, "ENOENT")) return false;
+      throw error;
+    }
+    for (const entry of entries) {
+      if (!entry.endsWith(".json")) continue;
+      const raw = await fsPromises.readFile(path.join(dir, entry), "utf-8").catch(() => null);
+      if (raw == null) continue;
+      if (this.parse(raw)?.status === "pending") {
+        return true;
+      }
+    }
+    return false;
+  }
+
   async listPendingOwnerWorkspaceIds(): Promise<string[]> {
     let entries: Dirent[];
     try {
@@ -182,28 +267,37 @@ export class TerminalAttentionStore {
       throw error;
     }
 
-    const ownerWorkspaceIds: string[] = [];
-    for (const entry of entries) {
-      if (!entry.isDirectory()) continue;
-      if ((await this.listPending(entry.name)).length > 0) {
-        ownerWorkspaceIds.push(entry.name);
-      }
-    }
-    ownerWorkspaceIds.sort();
-    return ownerWorkspaceIds;
+    // Startup scans every session dir (thousands on large deployments); a sequential await per
+    // directory took minutes to find zero pending records, so overlap the readdir round trips.
+    const semaphore = new AsyncSemaphore(SESSION_DIR_SCAN_CONCURRENCY);
+    const results = await Promise.all(
+      entries.map(async (entry): Promise<string | null> => {
+        if (!entry.isDirectory()) return null;
+        const slot = await semaphore.acquire();
+        try {
+          return (await this.hasPending(entry.name)) ? entry.name : null;
+        } finally {
+          slot.release();
+        }
+      })
+    );
+    return results.filter((name): name is string => name != null).sort();
   }
 
   async delete(ownerWorkspaceId: string, id: string): Promise<void> {
-    await fsPromises.rm(this.file(ownerWorkspaceId, id), { force: true });
+    const file = this.file(ownerWorkspaceId, id);
+    await notificationFileLocks.withLock(file, () => fsPromises.rm(file, { force: true }));
   }
 
   async markPending(ownerWorkspaceId: string, id: string): Promise<void> {
-    const record = await this.get(ownerWorkspaceId, id);
-    if (record?.status !== "delivered") {
-      return;
-    }
-    const { deliveredAt: _deliveredAt, ...pendingRecord } = record;
-    await this.write({ ...pendingRecord, status: "pending" });
+    await notificationFileLocks.withLock(this.file(ownerWorkspaceId, id), async () => {
+      const record = await this.get(ownerWorkspaceId, id);
+      if (record?.status !== "delivered") {
+        return;
+      }
+      const { deliveredAt: _deliveredAt, ...pendingRecord } = record;
+      await this.write({ ...pendingRecord, status: "pending" });
+    });
   }
 
   async markDelivered(ownerWorkspaceId: string, id: string): Promise<void> {
@@ -219,20 +313,44 @@ export class TerminalAttentionStore {
     id: string,
     status: "delivered" | "superseded"
   ): Promise<void> {
-    const record = await this.get(ownerWorkspaceId, id);
-    if (record?.status !== "pending") {
-      return;
-    }
-    await this.write({
-      ...record,
-      status,
-      ...(status === "delivered" ? { deliveredAt: new Date().toISOString() } : {}),
+    await notificationFileLocks.withLock(this.file(ownerWorkspaceId, id), async () => {
+      const record = await this.get(ownerWorkspaceId, id);
+      if (record?.status !== "pending") {
+        return;
+      }
+      await this.write({
+        ...record,
+        status,
+        ...(status === "delivered" ? { deliveredAt: new Date().toISOString() } : {}),
+      });
     });
   }
 
-  private async write(record: TerminalAttentionNotification): Promise<void> {
+  private async write(
+    record: TerminalAttentionNotification,
+    options?: { createOwnerDir?: boolean }
+  ): Promise<void> {
     const dir = this.dir(record.ownerWorkspaceId);
-    await fsPromises.mkdir(dir, { recursive: true });
+    if (options?.createOwnerDir === false) {
+      try {
+        // Non-recursive: creates only the terminal-attention subdir under an owner session dir
+        // that still exists; a missing parent means the owner was removed.
+        await fsPromises.mkdir(dir);
+      } catch (error) {
+        if (isErrnoWithCode(error, "ENOENT")) {
+          log.debug("Dropping terminal attention write for removed owner session dir", {
+            ownerWorkspaceId: record.ownerWorkspaceId,
+            id: record.id,
+          });
+          return;
+        }
+        if (!isErrnoWithCode(error, "EEXIST")) {
+          throw error;
+        }
+      }
+    } else {
+      await fsPromises.mkdir(dir, { recursive: true });
+    }
     await fsPromises.writeFile(
       this.file(record.ownerWorkspaceId, record.id),
       JSON.stringify(record, null, 2),

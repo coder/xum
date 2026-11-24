@@ -1,9 +1,10 @@
 import type { ReactNode } from "react";
 import type { Meta, StoryObj } from "@storybook/react-vite";
-import { fireEvent, waitFor, within } from "@storybook/test";
+import { expect, fireEvent, waitFor, within } from "storybook/test";
 import { createDisplayOnlyFilePart } from "@/common/utils/attachments/displayOnlyFileParts";
 import { AttachFileToolCall } from "@/browser/features/Tools/AttachFileToolCall";
 import { lightweightMeta } from "@/browser/stories/meta.js";
+import { applyTouchPointerRules } from "@/browser/stories/helpers/touchPointer";
 
 const meta = {
   ...lightweightMeta,
@@ -18,6 +19,8 @@ type Story = StoryObj<typeof meta>;
 const samplePng =
   "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+/p9sAAAAASUVORK5CYII=";
 const sampleBytes = "ZGlzcGxheS1vbmx5IGZpbGU=";
+const longDisplayMediaType = `application/${"x".repeat(160)}`;
+const longDownloadMediaType = `image/${"y".repeat(80)}`;
 
 function createAttachFileResult(file: ReturnType<typeof createDisplayOnlyFilePart>) {
   return {
@@ -167,6 +170,77 @@ export const Gallery: Story = {
       </div>
     </ToolStoryShell>
   ),
+};
+
+export const LongMetadataPhone: Story = {
+  tags: ["attachment-responsive"],
+  globals: {
+    viewport: { value: "mobile1", isRotated: false },
+  },
+  parameters: {
+    pixel: {
+      matrix: { themes: ["dark", "light"], viewports: ["phone"] },
+    },
+  },
+  render: () => (
+    <ToolStoryShell>
+      <div className="w-[320px] max-w-full">
+        <AttachFileToolCall
+          toolName="attach_file"
+          args={{ path: "notes.bin" }}
+          result={{
+            type: "content",
+            value: [
+              { type: "text", text: "[Attachment prepared: narrow metadata]" },
+              createDisplayOnlyFilePart({
+                data: sampleBytes,
+                mediaType: longDisplayMediaType,
+                filename: "notes.bin",
+                size: 17,
+              }),
+              {
+                type: "media",
+                data: sampleBytes,
+                mediaType: longDownloadMediaType,
+                filename: "diagram.bin",
+              },
+            ],
+          }}
+          status="completed"
+        />
+      </div>
+    </ToolStoryShell>
+  ),
+  play: async ({ canvasElement }: { canvasElement: HTMLElement }) => {
+    const canvas = within(canvasElement);
+    const mediaTypes = await Promise.all([
+      canvas.findByText(longDisplayMediaType),
+      canvas.findByText(longDownloadMediaType),
+    ]);
+
+    await waitFor(() => {
+      for (const mediaType of mediaTypes) {
+        const card = mediaType.parentElement?.parentElement;
+        if (card == null) throw new Error("Attachment card was not rendered");
+        if (mediaType.getBoundingClientRect().right > card.getBoundingClientRect().right + 1) {
+          throw new Error("Media type overflows the attachment card");
+        }
+      }
+    });
+
+    // Touch phones give buttons a 44px minimum width, which replaced the Download button's
+    // content-based flex minimum and shrank it below its label beside the long description.
+    const removeTouchRules = applyTouchPointerRules(canvasElement.ownerDocument);
+    try {
+      const downloads = canvas.getAllByRole("button", { name: "Download" });
+      await expect(downloads.length).toBeGreaterThan(0);
+      for (const download of downloads) {
+        await expect(download.scrollWidth).toBeLessThanOrEqual(download.clientWidth);
+      }
+    } finally {
+      removeTouchRules();
+    }
+  },
 };
 
 // Shared render for the interactive image-menu stories below.

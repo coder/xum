@@ -1,5 +1,5 @@
 import type { Meta, StoryObj } from "@storybook/react-vite";
-import { waitFor, within } from "@storybook/test";
+import { waitFor, within } from "storybook/test";
 import { useState } from "react";
 
 import { lightweightMeta } from "@/browser/stories/meta.js";

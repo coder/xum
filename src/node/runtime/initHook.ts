@@ -1,3 +1,4 @@
+import * as path from "path";
 import type {
   ExecOptions,
   ExecStream,
@@ -24,6 +25,10 @@ import {
 import { log } from "@/node/services/log";
 import type { ThinkingLevel } from "@/common/types/thinking";
 import { assert } from "@/common/utils/assert";
+import {
+  DISABLE_PROJECT_AUTOMATION_ENV,
+  projectAutomationDisabled,
+} from "@/node/utils/projectAutomation";
 
 /**
  * Check whether the init hook should be skipped and log the reason.
@@ -46,6 +51,10 @@ export function shouldSkipInitHook(
       "Skipping .xum/init hook (project not trusted — should not reach here in normal flow)"
     );
     initLogger.logStep("Skipping .xum/init hook (project not trusted)");
+    return true;
+  }
+  if (projectAutomationDisabled()) {
+    initLogger.logStep(`Skipping .xum/init hook (${DISABLE_PROJECT_AUTOMATION_ENV}=1)`);
     return true;
   }
   return false;
@@ -80,6 +89,8 @@ export function getXumEnv(
     /** Cumulative session costs in USD (if available) */
     costsUsd?: number;
     workspaceId?: string;
+    /** Xum-owned durable scratch dir for this workspace (where it has one; runtimeScratchDir.ts). */
+    scratchDir?: string;
   }
 ): Record<string, string> {
   if (!projectPath) {
@@ -98,6 +109,11 @@ export function getXumEnv(
   if (options?.workspaceId != null) {
     assert(options.workspaceId.trim().length > 0, "workspaceId must not be empty");
     env.XUM_WORKSPACE_ID = options.workspaceId;
+  }
+
+  if (options?.scratchDir != null) {
+    assert(path.isAbsolute(options.scratchDir), "scratchDir must be an absolute path");
+    env.XUM_SCRATCH_DIR = options.scratchDir;
   }
 
   if (options?.modelString) {

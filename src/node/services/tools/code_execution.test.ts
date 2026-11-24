@@ -3,14 +3,11 @@
  */
 
 import { describe, it, expect, mock } from "bun:test";
-import {
-  createCodeExecutionTool,
-  retargetCodeExecutionTool,
-  clearTypeCaches,
-  type MountRunner,
-} from "./code_execution";
+import { createCodeExecutionTool, type MountRunner } from "./code_execution";
 import { QuickJSRuntimeFactory } from "@/node/services/ptc/quickjsRuntime";
 import { ToolBridge } from "@/node/services/ptc/toolBridge";
+import { extractAttachmentsFromToolOutput } from "@/node/utils/messages/toolResultAttachments";
+import { DISPLAY_DATA_STUB, MEDIA_DATA_STUB } from "@/common/utils/attachments/toolAttachmentParts";
 import type { Tool, ToolExecutionOptions } from "ai";
 import type { PTCEvent, PTCExecutionResult } from "@/node/services/ptc/types";
 import { z } from "zod";
@@ -18,8 +15,11 @@ import { DisposableTempDir } from "@/node/services/tempDir";
 import { SandboxHostService } from "@/node/services/sandbox/sandboxHostService";
 import { DurableEventJournal } from "@/node/utils/journal/durableEventJournal";
 import { createKernelFileLoader } from "@/node/services/tools/kernelFileLoad";
+import { registerCodexPluginHooks } from "@/node/services/agentPlugins/codexHookRunner";
+import { eventSpine } from "@/node/services/events/eventSpine";
 import { LocalRuntime } from "@/node/runtime/LocalRuntime";
 import { RESULT_HANDLE_VARS_CAP_BYTES, VARS_SNAPSHOT_MAX_BYTES } from "@/constants/resultHandles";
+import { KERNEL_RETAINED_MEDIA_BUDGET_BYTES } from "@/constants/kernelOutput";
 import * as fs from "node:fs/promises";
 import * as nodePath from "node:path";
 
@@ -204,6 +204,151 @@ describe("createCodeExecutionTool", () => {
   });
 
   describe("static analysis", () => {
+    it("rejects unescaped matching quotes without side effects and accepts a correctly quoted retry", async () => {
+      const executeBash = mock(() => mockResults.bash);
+      const tool = await createCodeExecutionTool(
+        runtimeFactory,
+        new ToolBridge({
+          bash: createMockTool("bash", z.object({ script: z.string() }), executeBash),
+        })
+      );
+      const script = [
+        "cat > /tmp/query.sql <<'SQL'",
+        "SELECT JSON_VALUE(report, '$.event_ticker') FROM `project.dataset.table`",
+        "SQL",
+        'bq.sh "$(cat /tmp/query.sql)" --label="${USER}"',
+        "printf '%s\\n' done",
+      ].join("\n");
+
+      const invalid = (await tool.execute!(
+        {
+          code: 'xum.bash({script: "must not run"});\nreturn xum.bash({script: "' + script + '"});',
+        },
+        mockToolCallOptions
+      )) as PTCExecutionResult;
+      expect(invalid.success).toBe(false);
+      expect(invalid.error).toContain("Code analysis failed");
+      expect(invalid.toolCalls).toHaveLength(0);
+      expect(executeBash).not.toHaveBeenCalled();
+
+      const valid = (await tool.execute!(
+        { code: "return xum.bash({script: " + JSON.stringify(script) + "});" },
+        mockToolCallOptions
+      )) as PTCExecutionResult;
+      expect(valid.success).toBe(true);
+      expect(valid.result).toEqual(mockResults.bash);
+      expect(executeBash).toHaveBeenCalledTimes(1);
+      expect(executeBash).toHaveBeenCalledWith({ script });
+
+      // Template literals need their own escaping even inside a shell heredoc.
+      const templateCode = [
+        "return xum.bash({script: `cat > /tmp/query.sql <<'SQL'",
+        "SELECT JSON_VALUE(report, '$.event_ticker') FROM \\`project.dataset.table\\`",
+        "SQL",
+        'bq.sh "$(cat /tmp/query.sql)" --label="\\${USER}"',
+        "printf '%s\\\\n' done`});",
+      ].join("\n");
+      const templateResult = (await tool.execute!(
+        { code: templateCode },
+        mockToolCallOptions
+      )) as PTCExecutionResult;
+      expect(templateResult.success).toBe(true);
+      expect(executeBash).toHaveBeenCalledTimes(2);
+      expect(executeBash).toHaveBeenLastCalledWith({ script });
+    });
+
+    it.each(["'", '"'])(
+      "passes raw multiline %s-quoted scripts to tools unchanged",
+      async (quote) => {
+        const executeBash = mock(() => mockResults.bash);
+        const tool = await createCodeExecutionTool(
+          runtimeFactory,
+          new ToolBridge({
+            bash: createMockTool("bash", z.object({ script: z.string() }), executeBash),
+          })
+        );
+        const script = [
+          "cat <<'SQL'",
+          "SELECT * FROM `project.dataset.table`",
+          "SQL",
+          'echo "${USER}"',
+          "printf '%s\\n' done",
+        ].join("\n");
+        // Escape quotes/backslashes, but deliberately leave newlines literal.
+        const literal =
+          quote + script.replaceAll("\\", "\\\\").replaceAll(quote, "\\" + quote) + quote;
+        const result = (await tool.execute!(
+          { code: "return xum.bash({script: " + literal + "});" },
+          mockToolCallOptions
+        )) as PTCExecutionResult;
+        expect(result.success).toBe(true);
+        expect(result.result).toEqual(mockResults.bash);
+        expect(executeBash).toHaveBeenCalledTimes(1);
+        expect(executeBash).toHaveBeenCalledWith({ script });
+      }
+    );
+
+    it.each([
+      ['return "first\nsecond";', "first\nsecond"],
+      ["return 'first\r\nsecond\rthird';", "first\r\nsecond\rthird"],
+      ['return "first\\\nsecond\nthird";', "firstsecond\nthird"],
+      ['return "first\\\r\nsecond\nthird";', "firstsecond\nthird"],
+      ['return "slash\\\\\nnext";', "slash\\\nnext"],
+      ['return "say \\"hello\\"\nworld\\t!";', 'say "hello"\nworld\t!'],
+      ["return \"a\nb\" + 'c\nd';", "a\nbc\nd"],
+      ['return `prefix ${"a\nb"} suffix`;', "prefix a\nb suffix"],
+      ['const r = /"/; /* \'\n */ return "a\nb" + r.test(\'"\');', "a\nbtrue"],
+    ])("executes multiline strings while retaining JS semantics: %j", async (code, expected) => {
+      const tool = await createCodeExecutionTool(runtimeFactory, new ToolBridge({}));
+      const result = (await tool.execute!({ code }, mockToolCallOptions)) as PTCExecutionResult;
+      expect(result.success).toBe(true);
+      expect(result.result).toBe(expected);
+    });
+
+    it.each([
+      ["return process.env;", "process"],
+      ['return require("fs");', "require"],
+      ['return import("fs");', "import"],
+      ['return "unfinished\n', "Code analysis failed"],
+      ["return @;", "Code analysis failed"],
+    ])(
+      "still checks the whole normalized program before side effects: %s",
+      async (suffix, error) => {
+        const executeBash = mock(() => mockResults.bash);
+        const tool = await createCodeExecutionTool(
+          runtimeFactory,
+          new ToolBridge({
+            bash: createMockTool("bash", z.object({ script: z.string() }), executeBash),
+          })
+        );
+        const result = (await tool.execute!(
+          { code: 'xum.bash({script: "first\nsecond"});\n' + suffix },
+          mockToolCallOptions
+        )) as PTCExecutionResult;
+        expect(result.success).toBe(false);
+        expect(result.error).toContain(error);
+        expect(result.error).toContain("(line 3)");
+        expect(result.toolCalls).toHaveLength(0);
+        expect(executeBash).not.toHaveBeenCalled();
+      }
+    );
+
+    it("rejects an exhausted normalization budget before running any tools", async () => {
+      const executeBash = mock(() => mockResults.bash);
+      const tool = await createCodeExecutionTool(
+        runtimeFactory,
+        new ToolBridge({
+          bash: createMockTool("bash", z.object({ script: z.string() }), executeBash),
+        })
+      );
+      const code = 'xum.bash({script: "must not run"});\n' + '"a\nb";\n'.repeat(1000);
+      const result = (await tool.execute!({ code }, mockToolCallOptions)) as PTCExecutionResult;
+      expect(result.success).toBe(false);
+      expect(result.error).toContain("Code analysis failed");
+      expect(result.toolCalls).toHaveLength(0);
+      expect(executeBash).not.toHaveBeenCalled();
+    });
+
     it("rejects code with syntax errors", async () => {
       const tool = await createCodeExecutionTool(runtimeFactory, new ToolBridge({}));
 
@@ -353,31 +498,27 @@ describe("createCodeExecutionTool", () => {
       expect(result.result).toBe(3);
     });
 
-    it("captures console.log output", async () => {
+    it("normalizes non-JSON guest values so the output survives strict JSONValue validation", async () => {
+      // Regression: console.log(undefined) / returned undefined fields used to
+      // reach the AI SDK verbatim, failing ModelMessage validation on the next
+      // step and killing the live stream (AI_InvalidPromptError) — while the
+      // retry, rebuilt from JSON-rehydrated history, succeeded.
       const tool = await createCodeExecutionTool(runtimeFactory, new ToolBridge({}));
 
       const result = (await tool.execute!(
-        { code: 'console.log("hello", 123); return "done"' },
+        {
+          code: "console.log(undefined); return { a: undefined, arr: [undefined, 1], nan: NaN };",
+        },
         mockToolCallOptions
       )) as PTCExecutionResult;
 
       expect(result.success).toBe(true);
-      expect(result.result).toBe("done");
-      expect(result.consoleOutput).toHaveLength(1);
-      expect(result.consoleOutput[0].level).toBe("log");
-      expect(result.consoleOutput[0].args).toEqual(["hello", 123]);
-    });
-
-    it("records tool execution time", async () => {
-      const tool = await createCodeExecutionTool(runtimeFactory, new ToolBridge({}));
-
-      const result = (await tool.execute!(
-        { code: "return 42" },
-        mockToolCallOptions
-      )) as PTCExecutionResult;
-
-      expect(result.success).toBe(true);
-      expect(result.duration_ms).toBeGreaterThanOrEqual(0);
+      // The live object must equal its own JSON round-trip (what a reloaded
+      // history would contain), so first-run and retry behavior are identical.
+      const roundTripped = JSON.parse(JSON.stringify(result)) as PTCExecutionResult;
+      expect(result).toEqual(roundTripped);
+      expect(result.result).toEqual({ arr: [null, 1], nan: null });
+      expect(result.consoleOutput[0]?.args).toEqual([null]);
     });
   });
 
@@ -435,7 +576,6 @@ describe("createCodeExecutionTool", () => {
         content: "mock file content",
         success: true,
       });
-      expect(result.toolCalls[0].duration_ms).toBeGreaterThanOrEqual(0);
     });
 
     it("validates tool arguments against schema at runtime", async () => {
@@ -506,65 +646,6 @@ describe("createCodeExecutionTool", () => {
       expect(result.toolCalls).toHaveLength(2);
       expect(result.toolCalls[0].result).toEqual({ count: 1 });
       expect(result.toolCalls[1].error).toContain("Second call failed");
-    });
-  });
-
-  describe("retargetCodeExecutionTool", () => {
-    it("retargets a captured execute reference onto the donor's bridge", async () => {
-      // The request.assemble wrapper scenario: middleware captured the
-      // pre-hook instance's execute, while a later rebuild removed `bash`
-      // from the bridgeable set. After retargeting, the captured reference
-      // must dispatch through the donor's bridge — bash is gone, file_read
-      // still works.
-      const bashExecute = mock(() => mockResults.bash);
-      const preHookTool = await createCodeExecutionTool(
-        runtimeFactory,
-        new ToolBridge({
-          bash: createMockTool("bash", z.object({ script: z.string() }), bashExecute),
-          file_read: createMockTool("file_read", z.object({ filePath: z.string() })),
-        })
-      );
-      const donorTool = await createCodeExecutionTool(
-        runtimeFactory,
-        new ToolBridge({
-          file_read: createMockTool("file_read", z.object({ filePath: z.string() })),
-        })
-      );
-
-      // Wrapper-style capture BEFORE the retarget.
-      const capturedExecute = preHookTool.execute!.bind(preHookTool);
-
-      expect(retargetCodeExecutionTool(preHookTool, donorTool)).toBe(true);
-
-      const bashResult = (await capturedExecute(
-        { code: 'return mux.bash({ script: "echo hi" })' },
-        mockToolCallOptions
-      )) as PTCExecutionResult;
-      expect(bashResult.success).toBe(false);
-      expect(bashExecute).not.toHaveBeenCalled();
-
-      const readResult = (await capturedExecute(
-        { code: 'return mux.file_read({ filePath: "a.txt" })' },
-        mockToolCallOptions
-      )) as PTCExecutionResult;
-      expect(readResult.success).toBe(true);
-      expect(readResult.result).toMatchObject({ content: "mock file content" });
-    });
-
-    it("returns false when either tool was not created by the factory", async () => {
-      const realTool = await createCodeExecutionTool(runtimeFactory, new ToolBridge({}));
-      const foreignTool = createMockTool("bash", z.object({ script: z.string() }));
-
-      expect(retargetCodeExecutionTool(foreignTool, realTool)).toBe(false);
-      expect(retargetCodeExecutionTool(realTool, foreignTool)).toBe(false);
-
-      // The real tool stays functional after rejected retargets.
-      const result = (await realTool.execute!(
-        { code: "return 7" },
-        mockToolCallOptions
-      )) as PTCExecutionResult;
-      expect(result.success).toBe(true);
-      expect(result.result).toBe(7);
     });
   });
 
@@ -649,8 +730,6 @@ describe("createCodeExecutionTool", () => {
 
   describe("type caching", () => {
     it("returns consistent types for same tool set", async () => {
-      clearTypeCaches();
-
       const mockTools: Record<string, Tool> = {
         file_read: createMockTool("file_read", z.object({ filePath: z.string() }), () => ({
           content: "test",
@@ -668,8 +747,6 @@ describe("createCodeExecutionTool", () => {
     });
 
     it("regenerates types when tool set changes", async () => {
-      clearTypeCaches();
-
       const tools1: Record<string, Tool> = {
         file_read: createMockTool("file_read", z.object({ filePath: z.string() }), () => ({
           content: "test",
@@ -863,24 +940,6 @@ describe("createCodeExecutionTool", () => {
       expect(recovered.result).toEqual({ state: "durable", self: "undefined" });
       await host.disposeScope("ws-cyclic-vars");
     });
-
-    it("clearTypeCaches forces regeneration", async () => {
-      const mockTools: Record<string, Tool> = {
-        file_read: createMockTool("file_read", z.object({ filePath: z.string() }), () => ({
-          content: "test",
-        })),
-      };
-
-      // First call to populate cache
-      await createCodeExecutionTool(runtimeFactory, new ToolBridge(mockTools));
-
-      // Clear and verify new generation works
-      clearTypeCaches();
-
-      const tool = await createCodeExecutionTool(runtimeFactory, new ToolBridge(mockTools));
-      const desc = (tool as { description?: string }).description ?? "";
-      expect(desc).toContain("function file_read");
-    });
   });
 
   describe("result handle offloading (RLM persistent kernel)", () => {
@@ -933,6 +992,622 @@ describe("createCodeExecutionTool", () => {
       await host.disposeScope("ws-offload");
     });
 
+    // Native insert/replace tools are direct-only. The legacy line-edit fixture
+    // keeps nested edit capture/budget coverage without re-exposing those tools.
+    it("keeps results on persistence-critical records (file_edit_*/agent_skill_read) in kernel mode", async () => {
+      // Post-compaction persistence extractors mine nested file_edit_* diffs
+      // (extractEditedFileDiffs) and agent_skill_read snapshots
+      // (loadedSkillSnapshots) from history; suppressing these like ordinary
+      // kernel records would silently lose that context after compaction.
+      using tmp = new DisposableTempDir("code-exec-persist-records");
+      const host = new SandboxHostService();
+      const tools: Record<string, Tool> = {
+        file_edit_replace_lines: createMockTool(
+          "file_edit_replace_lines",
+          z.object({ path: z.string() }),
+          () => ({
+            success: true,
+            diff: "@@ -0,0 +1 @@\n+hello",
+          })
+        ),
+        agent_skill_read: createMockTool(
+          "agent_skill_read",
+          z.object({ name: z.string() }),
+          () => ({
+            success: true,
+            skill: { frontmatter: { name: "demo" }, body: "Body" },
+          })
+        ),
+      };
+      const tool = await createCodeExecutionTool(
+        runtimeFactory,
+        new ToolBridge(tools),
+        undefined,
+        persistentRunner(host, "ws-persist-records", tmp.path)
+      );
+
+      const result = (await tool.execute!(
+        {
+          code: 'mux.file_edit_replace_lines({path: "/a.ts"}); mux.agent_skill_read({name: "demo"}); return true;',
+        },
+        mockToolCallOptions
+      )) as PTCExecutionResult;
+      expect(result.success).toBe(true);
+      const editRecord = result.toolCalls.find((r) => r.toolName === "file_edit_replace_lines");
+      expect((editRecord?.result as { diff?: string })?.diff).toContain("+hello");
+      const skillRecord = result.toolCalls.find((r) => r.toolName === "agent_skill_read");
+      const skill = (skillRecord?.result as { skill?: { body?: string } })?.skill;
+      expect(skill?.body).toBe("Body");
+      await host.disposeScope("ws-persist-records");
+    });
+
+    it("keeps oversized persistence results while carrying media separately", async () => {
+      // Creation-time bounding replaces results over the 16KB threshold with
+      // a __kernelBounded marker before compaction runs, so the persistence
+      // exemption must preserve the diff while media rides only the carrier.
+      using tmp = new DisposableTempDir("code-exec-exempt-bounds");
+      const host = new SandboxHostService();
+      const bigDiff = `@@ -0,0 +1 @@\n+${"x".repeat(20_000)}`;
+      const mediaData = "aGVsbG8=";
+      const tools: Record<string, Tool> = {
+        file_edit_replace_lines: createMockTool(
+          "file_edit_replace_lines",
+          z.object({ path: z.string() }),
+          () => ({ success: true, diff: bigDiff })
+        ),
+        mcp__shots__take: createMockTool("mcp__shots__take", z.object({}), () => ({
+          type: "content",
+          value: [
+            { type: "text", text: "took a screenshot" },
+            { type: "media", mediaType: "image/png", data: mediaData },
+          ],
+        })),
+      };
+      const tool = await createCodeExecutionTool(
+        runtimeFactory,
+        new ToolBridge(tools),
+        undefined,
+        persistentRunner(host, "ws-exempt-bounds", tmp.path)
+      );
+
+      const result = (await tool.execute!(
+        {
+          code: 'mux.file_edit_replace_lines({path: "/big.ts"}); mux.mcp__shots__take({}); return true;',
+        },
+        mockToolCallOptions
+      )) as PTCExecutionResult;
+      expect(result.success).toBe(true);
+
+      const editRecord = result.toolCalls.find((r) => r.toolName === "file_edit_replace_lines");
+      expect((editRecord?.result as { diff?: string })?.diff).toBe(bigDiff);
+
+      const shotRecord = result.toolCalls.find((r) => r.toolName === "mcp__shots__take");
+      expect(shotRecord?.result).toBeUndefined();
+      expect(shotRecord?.ok).toBe(true);
+      expect(shotRecord?.bytes).toBeGreaterThan(0);
+      // The raw bytes ride the attachments carrier for request-time extraction.
+      expect(result.attachments).toEqual([
+        { type: "media", mediaType: "image/png", data: mediaData },
+      ]);
+      await host.disposeScope("ws-exempt-bounds");
+    });
+
+    it("bounds oversized diffs at a hunk boundary at capture (parseable prefix + truncation flag)", async () => {
+      // generateDiff is unbounded upstream; a >50k diff must be bounded at
+      // capture — but a mid-hunk slice is unparseable (parsePatch throws,
+      // combineDiffs falls back to only the LAST diff, erasing this edit), so
+      // whole hunks are kept and diffTruncated carries the loss signal.
+      using tmp = new DisposableTempDir("code-exec-oversized-diff");
+      const host = new SandboxHostService();
+      const hunk1 = `@@ -1,0 +1,1 @@\n+${"a".repeat(30_000)}\n`;
+      const hunk2 = `@@ -5,0 +7,1 @@\n+${"b".repeat(30_000)}\n`;
+      const hugeDiff = `${hunk1}${hunk2}`;
+      const tools: Record<string, Tool> = {
+        file_edit_replace_lines: createMockTool(
+          "file_edit_replace_lines",
+          z.object({ path: z.string() }),
+          () => ({
+            success: true,
+            diff: hugeDiff,
+          })
+        ),
+      };
+      const tool = await createCodeExecutionTool(
+        runtimeFactory,
+        new ToolBridge(tools),
+        undefined,
+        persistentRunner(host, "ws-oversized-diff", tmp.path)
+      );
+
+      const result = (await tool.execute!(
+        { code: 'mux.file_edit_replace_lines({path: "/huge.ts"}); return true;' },
+        mockToolCallOptions
+      )) as PTCExecutionResult;
+      expect(result.success).toBe(true);
+      const record = result.toolCalls.find((r) => r.toolName === "file_edit_replace_lines");
+      const retained = record?.result as { diff?: string; diffTruncated?: boolean };
+      // The first whole hunk is retained; the second (which would cross the
+      // cap) is dropped, and the truncation is flagged for the extractor.
+      expect(retained?.diff).toBe(hunk1);
+      expect(retained?.diffTruncated).toBe(true);
+      await host.disposeScope("ws-oversized-diff");
+    });
+
+    it("preserves the edit path on a bounded-args marker", async () => {
+      // Inserting >2KiB of content bounds the record's ARGS to a
+      // __kernelBounded marker; without the merged-back path, extractors
+      // could not attribute the retained diff and would silently drop the
+      // successful edit from post-compaction context (round 8, P1).
+      using tmp = new DisposableTempDir("code-exec-bounded-edit-args");
+      const host = new SandboxHostService();
+      const tools: Record<string, Tool> = {
+        file_edit_replace_lines: createMockTool(
+          "file_edit_replace_lines",
+          z.object({ path: z.string(), content: z.string() }),
+          () => ({ success: true, diff: "@@ -1,0 +1,1 @@\n+hello\n" })
+        ),
+      };
+      const tool = await createCodeExecutionTool(
+        runtimeFactory,
+        new ToolBridge(tools),
+        undefined,
+        persistentRunner(host, "ws-bounded-edit-args", tmp.path)
+      );
+
+      const result = (await tool.execute!(
+        {
+          code: 'mux.file_edit_replace_lines({path: "/kept.ts", content: "x".repeat(5000)}); return true;',
+        },
+        mockToolCallOptions
+      )) as PTCExecutionResult;
+      expect(result.success).toBe(true);
+      const record = result.toolCalls.find((r) => r.toolName === "file_edit_replace_lines");
+      const args = record?.args as {
+        __kernelBounded?: boolean;
+        path?: string;
+        preview?: string;
+      };
+      expect(args.__kernelBounded).toBe(true);
+      expect(args.path).toBe("/kept.ts");
+      // The oversized content itself stays bounded to the marker preview.
+      expect(JSON.stringify(args).length).toBeLessThan(4 * 1024);
+      expect((record?.result as { diff?: string })?.diff).toContain("+hello");
+      await host.disposeScope("ws-bounded-edit-args");
+    });
+
+    it("budgets media containers at capture in classic (non-kernel) mode too", async () => {
+      // Exclusive PTC makes the bridge the only route to executable MCP
+      // tools even without RLM, and records/events persist into session
+      // history in every mode while request-time extraction rewrites only
+      // the provider copy — so the aggregate media budget must apply to
+      // ephemeral registrations as well (round 8). Top-level {type:"content"}
+      // carriers are stripped by the bridge before guests or records see them,
+      // so the budget's remaining job is media under WRAPPER shapes the
+      // attachments carrier does not handle.
+      const bigImage = "A".repeat(2 * 1024 * 1024);
+      const tools: Record<string, Tool> = {
+        mcp__shots__take: createMockTool("mcp__shots__take", z.object({}), () => ({
+          shot: {
+            type: "content",
+            value: [
+              { type: "media", mediaType: "image/png", data: bigImage },
+              { type: "media", mediaType: "image/png", data: bigImage },
+            ],
+          },
+        })),
+      };
+      const tool = await createCodeExecutionTool(runtimeFactory, new ToolBridge(tools));
+
+      const result = (await tool.execute!(
+        // The guest still receives the full container: only the RECORD is
+        // sanitized.
+        { code: "const r = mux.mcp__shots__take({}); return r.shot.value[1].data.length;" },
+        mockToolCallOptions
+      )) as PTCExecutionResult;
+      expect(result.success).toBe(true);
+      expect(result.result).toBe(bigImage.length);
+      const record = result.toolCalls.find((r) => r.toolName === "mcp__shots__take");
+      const value = (
+        record?.result as {
+          shot?: { value?: Array<{ type?: string; data?: string; text?: string }> };
+        }
+      )?.shot?.value;
+      expect(value?.[0]?.data).toBe(bigImage);
+      expect(value?.[1]?.type).toBe("text");
+      expect(value?.[1]?.text).toContain("aggregate media budget exceeded");
+    });
+
+    it("shares one classic-mode capture budget across calls in an execution", async () => {
+      // Classic mode has no kernel caps and no retained-result budget, so a
+      // fresh per-call media allowance would let a model-authored loop of
+      // bridged media calls persist unbounded multi-megabyte records (r19).
+      // One shared per-execution budget bounds the sum: later calls' media
+      // degrade to placeholders. Wrapped containers bypass the bridge's
+      // carrier strip, so the raw payloads reach capture.
+      const image = "A".repeat(1_300_000);
+      const tools: Record<string, Tool> = {
+        mcp__shots__take: createMockTool("mcp__shots__take", z.object({}), () => ({
+          shot: {
+            type: "content",
+            value: [{ type: "media", mediaType: "image/png", data: image }],
+          },
+        })),
+      };
+      const tool = await createCodeExecutionTool(runtimeFactory, new ToolBridge(tools));
+
+      const result = (await tool.execute!(
+        { code: "for (let i = 0; i < 3; i++) { mux.mcp__shots__take({}); } return true;" },
+        mockToolCallOptions
+      )) as PTCExecutionResult;
+      expect(result.success).toBe(true);
+      const records = result.toolCalls.filter((r) => r.toolName === "mcp__shots__take");
+      expect(records).toHaveLength(3);
+      const partOf = (record: (typeof records)[number]) =>
+        (
+          record.result as {
+            shot?: { value?: Array<{ type?: string; data?: string; text?: string }> };
+          }
+        )?.shot?.value?.[0];
+      // Two ~1.3MB images fit the shared 3MiB budget; the third exceeds it.
+      expect(partOf(records[0])?.data).toBe(image);
+      expect(partOf(records[1])?.data).toBe(image);
+      expect(partOf(records[2])?.type).toBe("text");
+      expect(partOf(records[2])?.text).toContain("aggregate media budget exceeded");
+    });
+
+    it("sanitizes media containers passed as args to another bridged call in classic mode", async () => {
+      // `const img = mux.<mediaTool>({}); mux.<consumer>({payload: img})`
+      // copies the container into the consumer record's ARGS and start/end
+      // events; without bounding, repeated passes persist unbudgeted base64
+      // (r22). Args share the same per-execution capture budget as results.
+      // The wrapped container bypasses the bridge's carrier strip, so the
+      // guest holds RAW media to copy into the consumer's args.
+      const image = "A".repeat(1_300_000);
+      const tools: Record<string, Tool> = {
+        mcp__shots__take: createMockTool("mcp__shots__take", z.object({}), () => ({
+          shot: {
+            type: "content",
+            value: [{ type: "media", mediaType: "image/png", data: image }],
+          },
+        })),
+        mcp__sink__send: createMockTool("mcp__sink__send", z.object({}).passthrough(), () => ({
+          ok: true,
+        })),
+      };
+      const tool = await createCodeExecutionTool(runtimeFactory, new ToolBridge(tools));
+
+      const result = (await tool.execute!(
+        {
+          code:
+            "const img = mux.mcp__shots__take({}); " +
+            "mux.mcp__sink__send({payload: img}); " +
+            "mux.mcp__sink__send({payload: img}); return true;",
+        },
+        mockToolCallOptions
+      )) as PTCExecutionResult;
+      expect(result.success).toBe(true);
+      const sinkRecords = result.toolCalls.filter((r) => r.toolName === "mcp__sink__send");
+      expect(sinkRecords).toHaveLength(2);
+      const argPart = (record: (typeof sinkRecords)[number]) =>
+        (
+          record.args as {
+            payload?: {
+              shot?: { value?: Array<{ type?: string; data?: string; text?: string }> };
+            };
+          }
+        )?.payload?.shot?.value?.[0];
+      // Result (1.3MB) + first args copy (1.3MB) fit the shared 3MiB budget;
+      // the second args copy exceeds it and degrades to a placeholder.
+      expect(argPart(sinkRecords[0])?.data).toBe(image);
+      expect(argPart(sinkRecords[1])?.type).toBe("text");
+      expect(argPart(sinkRecords[1])?.text).toContain("aggregate media budget exceeded");
+    });
+
+    it("charges retained results against one execution-wide budget", async () => {
+      // Retention bypasses the per-record 16KiB kernel cap by design, but a
+      // loop of retained calls (each up to ~3MiB of media) must not grow
+      // toolCalls and streamed history without limit (round 10): once the
+      // execution-wide budget is exhausted, further oversized results fall
+      // back to normal bounding and compaction drops them with honest sizes.
+      using tmp = new DisposableTempDir("code-exec-exec-budget");
+      const host = new SandboxHostService();
+      const imageData = "A".repeat(KERNEL_RETAINED_MEDIA_BUDGET_BYTES - 1024);
+      const bigDiff = `@@ -1,0 +1,1 @@\n+${"d".repeat(30_000)}\n@@ -9,0 +10,1 @@\n+${"e".repeat(30_000)}\n`;
+      const tools: Record<string, Tool> = {
+        // Wrapped so the raw payload reaches capture instead of the bridge's
+        // carrier strip.
+        mcp__shots__take: createMockTool("mcp__shots__take", z.object({}), () => ({
+          shot: {
+            type: "content",
+            value: [{ type: "media", mediaType: "image/png", data: imageData }],
+          },
+        })),
+        file_edit_replace_lines: createMockTool(
+          "file_edit_replace_lines",
+          z.object({ path: z.string() }),
+          (args) => ({
+            success: !(args as { path: string }).path.endsWith("failed.ts"),
+            diff: bigDiff,
+          })
+        ),
+      };
+      const tool = await createCodeExecutionTool(
+        runtimeFactory,
+        new ToolBridge(tools),
+        undefined,
+        persistentRunner(host, "ws-exec-budget", tmp.path)
+      );
+
+      const result = (await tool.execute!(
+        {
+          code:
+            "for (let i = 0; i < 5; i++) { mux.mcp__shots__take({}); } " +
+            'mux.file_edit_replace_lines({path: "/after-budget.ts"}); ' +
+            'mux.file_edit_replace_lines({path: "/after-budget-failed.ts"}); return true;',
+        },
+        mockToolCallOptions
+      )) as PTCExecutionResult;
+      expect(result.success).toBe(true);
+      const records = result.toolCalls.filter((r) => r.toolName === "mcp__shots__take");
+      expect(records).toHaveLength(5);
+      // First four ~3MiB containers fit the 12MiB execution budget and are
+      // retained; the fifth exceeds it, gets normally bounded at capture, and
+      // compaction drops the non-exempt marker while reporting the true size.
+      for (const record of records.slice(0, 4)) {
+        const value = (record.result as { shot?: { value?: Array<{ data?: string }> } })?.shot
+          ?.value;
+        expect(value?.[0]?.data).toBe(imageData);
+      }
+      const overflow = records[4];
+      expect(overflow.result).toBeUndefined();
+      expect(overflow.ok).toBe(true);
+      expect(overflow.bytes).toBeGreaterThan(3_000_000);
+
+      // Persistence-critical records after overflow: the name-based
+      // exemption must not preserve the __kernelBounded marker as a result —
+      // compaction emits the normal {ok, bytes} summary so edit extractors
+      // keep PATH attribution (round 12), and a FAILED edit's success bit
+      // survives through the marker instead of misreporting ok:true.
+      const edits = result.toolCalls.filter((r) => r.toolName === "file_edit_replace_lines");
+      expect(edits).toHaveLength(2);
+      const [editOk, editFailed] = edits;
+      expect(editOk?.result).toBeUndefined();
+      expect(editOk?.ok).toBe(true);
+      expect((editOk?.args as { path?: string })?.path).toBe("/after-budget.ts");
+      expect(editFailed?.result).toBeUndefined();
+      expect(editFailed?.ok).toBe(false);
+      await host.disposeScope("ws-exec-budget");
+    });
+
+    it("sanitizes returned and console-logged media containers in classic mode", async () => {
+      // Classic executions have no offload stage: `return xum.<mediaTool>()`
+      // assigns the guest value directly to the outer PTCExecutionResult
+      // result, which persists into partial.json/chat.jsonl — the
+      // record-level sanitizer alone leaves that copy unbudgeted (round 9).
+      // Console args are sanitized at CAPTURE (streamed events included);
+      // over-budget console records are separately dropped whole by the
+      // console capture budget, so the observable case here is unsupported
+      // media riding under that budget.
+      const bigImage = "A".repeat(2 * 1024 * 1024);
+      const audioData = "d2F2".repeat(50);
+      const tools: Record<string, Tool> = {
+        // Wrapped: raw media reaches the guest/records. The rec tool below
+        // stays a top-level carrier; the bridge stubs its audio data, and
+        // capture still bounds the stubbed unsupported part to a placeholder.
+        mcp__shots__take: createMockTool("mcp__shots__take", z.object({}), () => ({
+          shot: {
+            type: "content",
+            value: [
+              { type: "media", mediaType: "image/png", data: bigImage },
+              { type: "media", mediaType: "image/png", data: bigImage },
+            ],
+          },
+        })),
+        mcp__rec__capture: createMockTool("mcp__rec__capture", z.object({}), () => ({
+          type: "content",
+          value: [{ type: "media", mediaType: "audio/wav", data: audioData }],
+        })),
+      };
+      const tool = await createCodeExecutionTool(runtimeFactory, new ToolBridge(tools));
+
+      const result = (await tool.execute!(
+        {
+          // Wrapped, not returned at the root: the sanitizer must walk the
+          // whole value graph (round 10), a root-only check would miss this.
+          code: "const r = mux.mcp__shots__take({}); console.log(mux.mcp__rec__capture({})); return { wrapped: r };",
+        },
+        mockToolCallOptions
+      )) as PTCExecutionResult;
+      expect(result.success).toBe(true);
+
+      const outer = (
+        result.result as {
+          wrapped?: {
+            shot?: { value?: Array<{ type?: string; data?: string; text?: string }> };
+          };
+        }
+      )?.wrapped?.shot?.value;
+      // The outer return draws from the SAME execution allowance as the
+      // nested record (r29): the record capture already retained the first
+      // ~2MiB image out of the 3MiB budget, so the returned copy of the same
+      // container cannot retain it AGAIN — both copies exceeding the shared
+      // remainder collapse to placeholders instead of doubling the bound.
+      expect(outer?.[0]?.type).toBe("text");
+      expect(outer?.[0]?.text).toContain("aggregate media budget exceeded");
+      expect(outer?.[1]?.type).toBe("text");
+      expect(outer?.[1]?.text).toContain("aggregate media budget exceeded");
+      // The payload itself is not lost: the nested record retains it.
+      const shotsRecord = result.toolCalls.find((r) => r.toolName === "mcp__shots__take");
+      const recordValue = (shotsRecord?.result as { shot?: { value?: Array<{ data?: string }> } })
+        ?.shot?.value;
+      expect(recordValue?.[0]?.data).toBe(bigImage);
+
+      const consoleArg = (
+        result.consoleOutput[0]?.args[0] as {
+          value?: Array<{ type?: string; text?: string }>;
+        }
+      )?.value;
+      expect(consoleArg?.[0]?.type).toBe("text");
+      expect(consoleArg?.[0]?.text).toContain("not supported as a model attachment");
+      expect(JSON.stringify(result.consoleOutput)).not.toContain(audioData);
+    });
+
+    it("charges retained media against an aggregate budget", async () => {
+      // MCP applies only a per-part guard: many individually-allowed images
+      // must not persist unbounded aggregate base64 into records/events.
+      using tmp = new DisposableTempDir("code-exec-media-budget");
+      const host = new SandboxHostService();
+      const bigImage = "A".repeat(KERNEL_RETAINED_MEDIA_BUDGET_BYTES - 100);
+      const secondImage = "B".repeat(500);
+      const tools: Record<string, Tool> = {
+        // Wrapped so the raw payload reaches capture instead of the bridge's
+        // carrier strip.
+        mcp__shots__take: createMockTool("mcp__shots__take", z.object({}), () => ({
+          shot: {
+            type: "content",
+            value: [
+              { type: "media", mediaType: "image/png", data: bigImage },
+              { type: "media", mediaType: "image/png", data: secondImage },
+            ],
+          },
+        })),
+      };
+      const tool = await createCodeExecutionTool(
+        runtimeFactory,
+        new ToolBridge(tools),
+        undefined,
+        persistentRunner(host, "ws-media-budget", tmp.path)
+      );
+
+      const result = (await tool.execute!(
+        { code: "mux.mcp__shots__take({}); return true;" },
+        mockToolCallOptions
+      )) as PTCExecutionResult;
+      expect(result.success).toBe(true);
+      const record = result.toolCalls.find((r) => r.toolName === "mcp__shots__take");
+      const value = (
+        record?.result as {
+          shot?: { value?: Array<{ type?: string; data?: string; text?: string }> };
+        }
+      )?.shot?.value;
+      expect(value?.[0]?.data).toBe(bigImage);
+      expect(value?.[1]?.type).toBe("text");
+      expect(value?.[1]?.text).toContain("aggregate media budget exceeded");
+      await host.disposeScope("ws-media-budget");
+    });
+
+    it("keeps media exempt when a server result spoofs the __kernelBounded field", async () => {
+      // The overflow marker's boolean is unnamespaced: a bridged server
+      // result can carry its own __kernelBounded field alongside real media,
+      // and marker-first compaction would drop the retained payload before
+      // request-time extraction could attach it (r27). Genuine markers never
+      // contain extractable media, so the media exemption wins.
+      using tmp = new DisposableTempDir("code-exec-marker-spoof");
+      const host = new SandboxHostService();
+      const image = "A".repeat(500);
+      const tools: Record<string, Tool> = {
+        // Wrapped: a top-level carrier would be rebuilt as a bare {type,value}
+        // by the bridge's strip, silently dropping the spoofed field; the
+        // wrapper keeps the spoof adjacent to RAW retained media (the r27
+        // marker-vs-media compaction race this test exists for).
+        mcp__shots__take: createMockTool("mcp__shots__take", z.object({}), () => ({
+          __kernelBounded: true,
+          shot: {
+            type: "content",
+            value: [{ type: "media", mediaType: "image/png", data: image }],
+          },
+        })),
+      };
+      const tool = await createCodeExecutionTool(
+        runtimeFactory,
+        new ToolBridge(tools),
+        undefined,
+        persistentRunner(host, "ws-marker-spoof", tmp.path)
+      );
+
+      const result = (await tool.execute!(
+        { code: "mux.mcp__shots__take({}); return true;" },
+        mockToolCallOptions
+      )) as PTCExecutionResult;
+      expect(result.success).toBe(true);
+      const record = result.toolCalls.find((r) => r.toolName === "mcp__shots__take");
+      const value = (record?.result as { shot?: { value?: Array<{ data?: string }> } })?.shot
+        ?.value;
+      expect(value?.[0]?.data).toBe(image);
+      await host.disposeScope("ws-marker-spoof");
+    });
+
+    it("bounds unsupported parts of mixed media containers at capture", async () => {
+      // A mixed top-level container is stripped by the bridge: the image's
+      // bytes ride the attachments carrier while the unsupported audio payload
+      // (up to 8 MiB per part) is discarded; neither may persist raw into the
+      // record/chat.jsonl, and capture still bounds the stubbed audio part to
+      // a placeholder.
+      using tmp = new DisposableTempDir("code-exec-mixed-media");
+      const host = new SandboxHostService();
+      const audioData = "d2F2".repeat(50);
+      const tools: Record<string, Tool> = {
+        mcp__shots__take: createMockTool("mcp__shots__take", z.object({}), () => ({
+          type: "content",
+          value: [
+            { type: "media", mediaType: "image/png", data: "aGVsbG8=" },
+            { type: "media", mediaType: "audio/wav", data: audioData },
+          ],
+        })),
+      };
+      const tool = await createCodeExecutionTool(
+        runtimeFactory,
+        new ToolBridge(tools),
+        undefined,
+        persistentRunner(host, "ws-mixed-media", tmp.path)
+      );
+
+      const result = (await tool.execute!(
+        { code: "mux.mcp__shots__take({}); return true;" },
+        mockToolCallOptions
+      )) as PTCExecutionResult;
+      expect(result.success).toBe(true);
+      const record = result.toolCalls.find((r) => r.toolName === "mcp__shots__take");
+      expect(record?.result).toBeUndefined();
+      expect(record?.ok).toBe(true);
+      expect(record?.bytes).toBeGreaterThan(0);
+      expect(JSON.stringify(record)).not.toContain(audioData);
+      expect(result.attachments).toEqual([
+        { type: "media", mediaType: "image/png", data: "aGVsbG8=" },
+      ]);
+      await host.disposeScope("ws-mixed-media");
+    });
+
+    it("does not exempt unsupported media (audio) from kernel record suppression", async () => {
+      // Request-time extraction only consumes supported attachment types
+      // (images/PDF); exempting audio/blob media would leave raw base64 in
+      // persisted records and provider requests with no attachment payoff.
+      using tmp = new DisposableTempDir("code-exec-audio-bounds");
+      const host = new SandboxHostService();
+      const tools: Record<string, Tool> = {
+        mcp__rec__capture: createMockTool("mcp__rec__capture", z.object({}), () => ({
+          type: "content",
+          value: [{ type: "media", mediaType: "audio/wav", data: "d2F2" }],
+        })),
+      };
+      const tool = await createCodeExecutionTool(
+        runtimeFactory,
+        new ToolBridge(tools),
+        undefined,
+        persistentRunner(host, "ws-audio-bounds", tmp.path)
+      );
+
+      const result = (await tool.execute!(
+        { code: "mux.mcp__rec__capture({}); return true;" },
+        mockToolCallOptions
+      )) as PTCExecutionResult;
+      expect(result.success).toBe(true);
+      const record = result.toolCalls.find((r) => r.toolName === "mcp__rec__capture");
+      expect(record?.result).toBeUndefined();
+      expect(record?.ok).toBe(true);
+      await host.disposeScope("ws-audio-bounds");
+    });
+
     it("marks compact records not-ok when the tool resolved with success:false", async () => {
       // file_read-style tools resolve normally with {success:false} for
       // missing/oversized/directory paths — no thrown error. The compact
@@ -967,6 +1642,40 @@ describe("createCodeExecutionTool", () => {
       expect(record.error).toBeUndefined();
       expect(record.ok).toBe(false);
       await host.disposeScope("ws-result-failure");
+    });
+
+    it("keeps failure status when the failing result is oversized and capture-bounded", async () => {
+      // A failing result over the kernel result cap is replaced with a
+      // __kernelBounded marker at creation; the success bit must survive onto
+      // EVERY marker (r29 — not just the retained-budget branch), or
+      // compaction would report the failed call ok:true and read tracking
+      // would advertise a never-read path.
+      using tmp = new DisposableTempDir("code-exec-oversized-failure");
+      const host = new SandboxHostService();
+      const failingReadTools: Record<string, Tool> = {
+        file_read: createMockTool("file_read", z.object({ path: z.string() }), () => ({
+          success: false,
+          error: `Backend failure: ${"x".repeat(64 * 1024)}`,
+        })),
+      };
+      const tool = await createCodeExecutionTool(
+        runtimeFactory,
+        new ToolBridge(failingReadTools),
+        undefined,
+        persistentRunner(host, "ws-oversized-failure", tmp.path)
+      );
+
+      const result = (await tool.execute!(
+        { code: 'const r = mux.file_read({path: "/missing.txt"}); return r.success;' },
+        mockToolCallOptions
+      )) as PTCExecutionResult;
+      expect(result.success).toBe(true);
+      expect(result.result).toBe(false);
+      const record = result.toolCalls[0];
+      expect(record.toolName).toBe("file_read");
+      expect(record.error).toBeUndefined();
+      expect(record.ok).toBe(false);
+      await host.disposeScope("ws-oversized-failure");
     });
 
     it("bounds nested-call args/results at creation: emitted events never carry full payloads", async () => {
@@ -1017,6 +1726,104 @@ describe("createCodeExecutionTool", () => {
       const fetchResult = fetchEnd!.result as { __kernelBounded?: boolean; bytes?: number };
       expect(fetchResult.__kernelBounded).toBe(true);
       await host.disposeScope("ws-event-bound");
+    });
+
+    it("threads the nested record callId into bridged execute options", async () => {
+      // The UI keys nested cards and live events (workflow-run-attached,
+      // task-created, live bash output) by the PTC record callId; execute()
+      // must observe the SAME id or those events target an id no rendered
+      // card carries.
+      using tmp = new DisposableTempDir("code-exec-callid");
+      const host = new SandboxHostService();
+      const executed: Array<{ toolCallId: string; tag: string }> = [];
+      const probeTool: Tool = {
+        description: "Probe tool",
+        inputSchema: z.object({ tag: z.string() }),
+        execute: (args, options) => {
+          executed.push({ toolCallId: options.toolCallId, tag: (args as { tag: string }).tag });
+          return Promise.resolve({ success: true });
+        },
+      };
+      const emitted: Array<{
+        type?: string;
+        callId?: string;
+        toolName?: string;
+        args?: { tag?: string };
+      }> = [];
+      const tool = await createCodeExecutionTool(
+        runtimeFactory,
+        new ToolBridge({ probe: probeTool }),
+        (event) => emitted.push(event as (typeof emitted)[number]),
+        persistentRunner(host, "ws-callid", tmp.path)
+      );
+
+      const result = (await tool.execute!(
+        { code: 'mux.probe({tag: "a"}); mux.probe({tag: "b"}); return true;' },
+        mockToolCallOptions
+      )) as PTCExecutionResult;
+      expect(result.success).toBe(true);
+
+      const starts = emitted.filter((e) => e.type === "tool-call-start" && e.toolName === "probe");
+      expect(starts).toHaveLength(2);
+      expect(executed).toHaveLength(2);
+      for (const call of executed) {
+        const start = starts.find((e) => e.args?.tag === call.tag);
+        expect(start?.callId).toBe(call.toolCallId);
+      }
+      expect(executed[0].toolCallId).not.toBe(executed[1].toolCallId);
+      await host.disposeScope("ws-callid");
+    });
+
+    it("retains workflow identity on kernel-bounded workflow_run args and results", async () => {
+      // Oversized workflow launches and results collapse to markers, but the
+      // transcript card needs script_path (display) and runId/status (durable
+      // run refetch) to render the live workflow instead of raw JSON.
+      using tmp = new DisposableTempDir("code-exec-wf-bound");
+      const host = new SandboxHostService();
+      const workflowTools: Record<string, Tool> = {
+        workflow_run: createMockTool(
+          "workflow_run",
+          z.object({ script_path: z.string(), args: z.unknown() }),
+          () => ({
+            status: "completed",
+            runId: "wfr_bounded",
+            result: { reportMarkdown: "r".repeat(64 * 1024) },
+          })
+        ),
+      };
+      const emitted: Array<{ type?: string; toolName?: string; args?: unknown; result?: unknown }> =
+        [];
+      const tool = await createCodeExecutionTool(
+        runtimeFactory,
+        new ToolBridge(workflowTools),
+        (event) => emitted.push(event as (typeof emitted)[number]),
+        persistentRunner(host, "ws-wf-bound", tmp.path)
+      );
+
+      const result = (await tool.execute!(
+        {
+          code: 'const r = mux.workflow_run({script_path: "skill://demo/workflow.js", args: {problem: "p".repeat(4096)}}); return r.runId;',
+        },
+        mockToolCallOptions
+      )) as PTCExecutionResult;
+      expect(result.success).toBe(true);
+      // The guest still sees the full result.
+      expect(result.result).toBe("wfr_bounded");
+
+      const end = emitted.find((e) => e.type === "tool-call-end" && e.toolName === "workflow_run");
+      expect(end).toBeDefined();
+      const argsMarker = end!.args as { __kernelBounded?: boolean; script_path?: string };
+      expect(argsMarker.__kernelBounded).toBe(true);
+      expect(argsMarker.script_path).toBe("skill://demo/workflow.js");
+      const resultMarker = end!.result as {
+        __kernelBounded?: boolean;
+        runId?: string;
+        status?: string;
+      };
+      expect(resultMarker.__kernelBounded).toBe(true);
+      expect(resultMarker.runId).toBe("wfr_bounded");
+      expect(resultMarker.status).toBe("completed");
+      await host.disposeScope("ws-wf-bound");
     });
 
     it("bounds oversized nested-call args in compact records (no echo of kernel data)", async () => {
@@ -2063,6 +2870,77 @@ describe("createCodeExecutionTool", () => {
       await host.disposeScope("ws-load-err");
     });
 
+    it("a PostToolUse block on file_read makes mux.load throw; vars[key] stays unset", async () => {
+      // Codex P1 (PRRT_kwDOPxxmWM6r6NnK): a post-block replaced only the hook-visible summary, so
+      // the whole file still reached vars and the script could return it to the model.
+      using tmp = new DisposableTempDir("code-exec-load-post-block");
+      await fs.writeFile(nodePath.join(tmp.path, "secret.txt"), "SECRET_VALUE_42\n", "utf8");
+      const workspaceId = "ws-load-post-block";
+      const unregister = registerCodexPluginHooks(eventSpine, {
+        workspaceId,
+        pluginName: "guard",
+        pluginInstanceId: "guard",
+        order: 0,
+        hooks: [
+          {
+            key: "hooks/hooks.json#PostToolUse[0][0]",
+            hash: "h".repeat(64),
+            event: "PostToolUse",
+            matcher: "^file_read$",
+            handler: { type: "mcp_tool", server: "guard", tool: "check", input: {} },
+            status: "runnable",
+            source: "hooks/hooks.json",
+          },
+        ],
+        deps: {
+          isHookAllowed: () => Promise.resolve(true),
+          canCallPluginTool: () => true,
+          callPluginTool: () =>
+            Promise.resolve({
+              structuredContent: { decision: "block", reason: "secrets stay out" },
+            }),
+          notifyUser: () => undefined,
+        },
+      });
+      const host = new SandboxHostService();
+      try {
+        const runtime = new LocalRuntime(tmp.path);
+        const tool = await createCodeExecutionTool(
+          runtimeFactory,
+          new ToolBridge(fileReadTools()),
+          undefined,
+          kernelRunner(host, workspaceId, tmp.path),
+          {
+            loadFile: createKernelFileLoader({
+              cwd: tmp.path,
+              runtime,
+              hooks: { runtime, cwd: tmp.path, runtimeTempDir: tmp.path, workspaceId },
+            }),
+          }
+        );
+
+        const result = (await tool.execute!(
+          {
+            code: `
+              let error = "";
+              try { mux.load({ path: "secret.txt", key: "data" }); } catch (e) { error = String(e); }
+              return { error, data: typeof vars.data };
+            `,
+          },
+          mockToolCallOptions
+        )) as PTCExecutionResult;
+
+        expect(result.success).toBe(true);
+        const returned = result.result as { error: string; data: string };
+        expect(returned.error).toContain("[plugin:guard] secrets stay out");
+        expect(returned.data).toBe("undefined");
+        expect(JSON.stringify(result)).not.toContain("SECRET_VALUE_42");
+      } finally {
+        unregister();
+        await host.disposeScope(workspaceId);
+      }
+    });
+
     it("honors grants: file_read denied => mux.load denied", async () => {
       using tmp = new DisposableTempDir("code-exec-load");
       const host = new SandboxHostService();
@@ -2152,5 +3030,101 @@ describe("createCodeExecutionTool", () => {
       expect(withoutFileRead.description).not.toContain("function load(");
       await host.disposeScope("ws-load-types");
     });
+  });
+});
+
+describe("nested attachment delivery", () => {
+  const runtimeFactory = new QuickJSRuntimeFactory();
+  const mediaPart = {
+    type: "media" as const,
+    data: "QkFTRTY0REFUQQ==",
+    mediaType: "image/png",
+    filename: "board.png",
+  };
+
+  function attachFileTool(): Tool {
+    return createMockTool("attach_file", z.object({ path: z.string() }), () => ({
+      type: "content",
+      value: [{ type: "text", text: "[Attachment prepared: board.png]" }, mediaPart],
+    }));
+  }
+
+  it("re-attaches media stripped from nested tool results onto the execution result", async () => {
+    const tool = await createCodeExecutionTool(
+      runtimeFactory,
+      new ToolBridge({ attach_file: attachFileTool() })
+    );
+
+    const result = (await tool.execute!(
+      { code: 'return xum.attach_file({ path: "/board.png" });', timeout_secs: null },
+      mockToolCallOptions
+    )) as PTCExecutionResult;
+
+    expect(result.success).toBe(true);
+    // Original media rides the top-level result for the request-path lift
+    expect(result.attachments).toEqual([mediaPart]);
+    const sandboxVisible = JSON.stringify({ result: result.result, toolCalls: result.toolCalls });
+    expect(sandboxVisible).not.toContain(mediaPart.data);
+    const extracted = extractAttachmentsFromToolOutput(result);
+    expect(extracted?.attachments).toEqual([
+      { data: mediaPart.data, mediaType: mediaPart.mediaType, filename: mediaPart.filename },
+    ]);
+
+    const returned = result.result as { value: Array<{ type: string; text?: string }> };
+    expect(returned.value[1]).toEqual({ type: "text", text: MEDIA_DATA_STUB });
+  });
+
+  it("re-attaches display-only files stripped from nested tool results", async () => {
+    const displayPart = {
+      type: "display_file" as const,
+      data: "RElTUExBWQ==",
+      mediaType: "text/markdown",
+      filename: "notes.md",
+      providerOptions: { mux: { displayOnly: true as const, size: 7 } },
+    };
+    const tool = await createCodeExecutionTool(
+      runtimeFactory,
+      new ToolBridge({
+        attach_file: createMockTool("attach_file", z.object({ path: z.string() }), () => ({
+          type: "content",
+          value: [displayPart],
+        })),
+      })
+    );
+
+    const result = (await tool.execute!(
+      { code: 'return xum.attach_file({ path: "/notes.md" });', timeout_secs: null },
+      mockToolCallOptions
+    )) as PTCExecutionResult;
+
+    expect(result.success).toBe(true);
+    // Display bytes ride the carrier for UI rendering; sandbox-visible values
+    // only carry the stubbed shape so host-side records stay bounded.
+    expect(result.attachments).toEqual([displayPart]);
+    const sandboxVisible = JSON.stringify({ result: result.result, toolCalls: result.toolCalls });
+    expect(sandboxVisible).not.toContain(displayPart.data);
+    const returned = result.result as { value: Array<{ type: string; data?: string }> };
+    expect(returned.value[0].type).toBe("display_file");
+    expect(returned.value[0].data).toBe(DISPLAY_DATA_STUB);
+  });
+
+  it("omits attachments when no nested tool produced media", async () => {
+    const tool = await createCodeExecutionTool(
+      runtimeFactory,
+      new ToolBridge({
+        bash: createMockTool("bash", z.object({ script: z.string() }), () => ({
+          success: true,
+          output: "ok",
+        })),
+      })
+    );
+
+    const result = (await tool.execute!(
+      { code: 'return xum.bash({ script: "true" });', timeout_secs: null },
+      mockToolCallOptions
+    )) as PTCExecutionResult;
+
+    expect(result.success).toBe(true);
+    expect(result.attachments).toBeUndefined();
   });
 });

@@ -11,6 +11,8 @@
  * Extends RemoteRuntime for shared exec/file operations.
  */
 
+import { DOCKER_SCRATCH_DIR } from "./runtimeScratchDir";
+import { isContainerUnavailableExit } from "./containerExecFailure";
 import { spawn } from "child_process";
 import { createHash } from "crypto";
 import * as path from "path";
@@ -32,8 +34,8 @@ import { RemoteRuntime, type SpawnResult } from "./RemoteRuntime";
 import { findInitHookRelativePath, runInitHookOnRuntime, runWorkspaceInitHook } from "./initHook";
 import { getProjectName } from "@/node/utils/runtime/helpers";
 import { getErrorMessage } from "@/common/utils/errors";
-import { syncProjectViaGitBundle } from "./gitBundleSync";
-import { GIT_NO_HOOKS_ENV, gitNoHooksPrefix } from "@/node/utils/gitNoHooksEnv";
+import { buildSourceRefSnapshotCommand, syncProjectViaGitBundle } from "./gitBundleSync";
+import { gitNoHooksPrefix } from "@/node/utils/gitNoHooksEnv";
 import {
   readHostGitconfig,
   resolveGhToken,
@@ -63,6 +65,9 @@ function sanitizeContainerUserId(rawValue: string): string {
   const trimmedValue = rawValue.trim();
   return /^\d+$/.test(trimmedValue) ? trimmedValue : "0";
 }
+
+/** The `docker exec` arguments that print the home of the container's default user. */
+const PRINT_HOME_ARGS = ["sh", "-c", "echo $HOME"];
 
 interface ContainerUserInfo {
   uid: string;
@@ -198,6 +203,19 @@ function buildCredentialArgs(): string[] {
 }
 
 /**
+ * #6426: how often this process created or deleted each container name. Module level, because a
+ * runtime object is made per call. It is part of getAgentHostKey, so a container that Xum created
+ * again under the same name never reuses the cached plugin snapshot of the old one, and no docker
+ * process runs to tell them apart. Bumped AFTER each create attempt and removal: a snapshot is
+ * keyed when its read starts, so a read that raced the change keeps the old key.
+ */
+const containerGenerations = new Map<string, number>();
+
+function bumpContainerGeneration(containerName: string): void {
+  containerGenerations.set(containerName, (containerGenerations.get(containerName) ?? 0) + 1);
+}
+
+/**
  * Run docker run with streaming output (for image pull progress).
  * Streams stdout/stderr to initLogger for visibility during image pulls.
  */
@@ -318,6 +336,11 @@ export function getContainerName(projectPath: string, workspaceName: string): st
  * Extends RemoteRuntime for shared exec/file operations.
  */
 export class DockerRuntime extends RemoteRuntime {
+  /** Runtime.mode. A prototype getter, like `location`, so subclasses and Object.create doubles inherit it. */
+  // eslint-disable-next-line @typescript-eslint/class-literal-property-style -- same as location: Object.create(X.prototype) doubles would read undefined from a readonly field
+  get mode(): "docker" {
+    return "docker";
+  }
   private readonly config: DockerRuntimeConfig;
   /** Container name - set during construction (for existing) or createWorkspace (for new) */
   private containerName?: string;
@@ -340,16 +363,20 @@ export class DockerRuntime extends RemoteRuntime {
     return this.containerName;
   }
 
-  /**
-   * Get Docker image name
-   */
-  public getImage(): string {
-    return this.config.image;
-  }
-
   // ===== RemoteRuntime abstract method implementations =====
 
   protected readonly commandPrefix = "Docker";
+
+  override getAgentHostKey(): string | undefined {
+    // Without a name the container is not known yet.
+    return this.containerName !== undefined
+      ? JSON.stringify([
+          "docker",
+          this.containerName,
+          containerGenerations.get(this.containerName) ?? 0,
+        ])
+      : undefined;
+  }
 
   protected getBasePath(): string {
     return CONTAINER_SRC_DIR;
@@ -368,6 +395,10 @@ export class DockerRuntime extends RemoteRuntime {
 
   protected cdCommand(cwd: string): string {
     return `cd ${shescape.quote(cwd)}`;
+  }
+
+  override isTransportFailureExit(exitCode: number, stderr: string): boolean {
+    return isContainerUnavailableExit(exitCode, stderr);
   }
 
   protected async spawnRemoteProcess(
@@ -412,24 +443,44 @@ export class DockerRuntime extends RemoteRuntime {
   }
   // ===== Runtime interface implementations =====
 
-  resolvePath(filePath: string): Promise<string> {
+  async resolvePath(filePath: string): Promise<string> {
     // DockerRuntime uses a fixed workspace base (/src), but we still want reasonable shell-style
     // behavior for callers that pass "~" or "~/...".
-    //
-    // NOTE: Some base images (e.g., codercom/*-base) run as a non-root user (like "coder"), so
-    // "~" should resolve to that user's home (e.g., /home/coder), not /root.
-    const home = this.containerHome ?? "/root";
-
     if (filePath === "~") {
-      return Promise.resolve(home);
+      return this.resolveContainerHome();
     }
     if (filePath.startsWith("~/")) {
-      return Promise.resolve(path.posix.join(home, filePath.slice(2)));
+      return path.posix.join(await this.resolveContainerHome(), filePath.slice(2));
     }
 
-    return Promise.resolve(
-      filePath.startsWith("/") ? filePath : path.posix.join(CONTAINER_SRC_DIR, filePath)
+    return filePath.startsWith("/") ? filePath : path.posix.join(CONTAINER_SRC_DIR, filePath);
+  }
+
+  // Task.create and the agent routes build a runtime per call and read ~/.xum/agents before
+  // ensureReady detects the container user. For a non-root user, a guessed /root (mode 700) fails
+  // every such read with EACCES. A failed probe is not cached.
+  private async resolveContainerHome(): Promise<string> {
+    if (this.containerHome !== undefined) return this.containerHome;
+    // Before createWorkspace there is no container to ask.
+    if (this.containerName === undefined) return "/root";
+
+    const probe = await runContainerSpawnCommand(
+      ["exec", this.containerName, ...PRINT_HOME_ARGS],
+      5000
     );
+    const home = probe.stdout.trim();
+    if (probe.exitCode !== 0 || home === "") {
+      // A negative exit code means the CLI did not finish (it timed out, or could not start), so
+      // the container's state is unknown.
+      const unavailable =
+        probe.exitCode < 0 || isContainerUnavailableExit(probe.exitCode, probe.stderr);
+      throw new RuntimeError(
+        `Failed to resolve the home of container ${this.containerName}: ${probe.stderr.trim()}`,
+        unavailable ? "network" : "exec"
+      );
+    }
+    this.containerHome = home;
+    return home;
   }
 
   getWorkspacePath(_projectPath: string, _workspaceName: string): string {
@@ -553,7 +604,7 @@ export class DockerRuntime extends RemoteRuntime {
     }
 
     // Do NOT delete container on hook failure - user can debug.
-    return runWorkspaceInitHook({
+    const result = await runWorkspaceInitHook({
       params,
       runtimeType: "docker",
       findHookRelativePath: () => findInitHookRelativePath(this, params.workspacePath),
@@ -569,6 +620,9 @@ export class DockerRuntime extends RemoteRuntime {
         );
       },
     });
+    // #6426: the checkout is populated now; a snapshot read while it was being made is stale.
+    bumpContainerGeneration(this.containerName);
+    return result;
   }
 
   /**
@@ -623,7 +677,7 @@ export class DockerRuntime extends RemoteRuntime {
     const [uidResult, gidResult, homeResult] = await Promise.all([
       runDockerCommand(`exec ${containerName} id -u`, 5000, abortSignal),
       runDockerCommand(`exec ${containerName} id -g`, 5000, abortSignal),
-      runDockerCommand(`exec ${containerName} sh -c 'echo $HOME'`, 5000, abortSignal),
+      runContainerSpawnCommand(["exec", containerName, ...PRINT_HOME_ARGS], 5000, abortSignal),
     ]);
 
     return {
@@ -652,7 +706,9 @@ export class DockerRuntime extends RemoteRuntime {
     abortSignal?: AbortSignal
   ): Promise<DockerCommandResult> {
     return runDockerCommand(
-      `exec --user root ${containerName} sh -c 'mkdir -p ${CONTAINER_SRC_DIR} /var/mux/plans && chown ${userInfo.uid}:${userInfo.gid} ${CONTAINER_SRC_DIR} /var/mux /var/mux/plans'`,
+      // DOCKER_SCRATCH_DIR is the workspace's $XUM_SCRATCH_DIR: it lives and dies with this
+      // container, which is exactly the workspace's lifetime (no volume to clean up).
+      `exec --user root ${containerName} sh -c 'mkdir -p ${CONTAINER_SRC_DIR} /var/mux/plans ${DOCKER_SCRATCH_DIR} && chown ${userInfo.uid}:${userInfo.gid} ${CONTAINER_SRC_DIR} /var/mux /var/mux/plans ${DOCKER_SCRATCH_DIR}'`,
       10000,
       abortSignal
     );
@@ -749,6 +805,8 @@ export class DockerRuntime extends RemoteRuntime {
       abortSignal,
       shareCredentials: this.config.shareCredentials,
     });
+    // #6426: after the attempt (even a failed run can leave a container under this name).
+    bumpContainerGeneration(containerName);
     if (runResult.exitCode !== 0) {
       await runDockerCommand(`rm -f ${containerName}`, 10000);
       throw new Error(`Failed to create container: ${runResult.stderr}`);
@@ -971,6 +1029,7 @@ export class DockerRuntime extends RemoteRuntime {
       if (inspectResult.exitCode !== 0) {
         // Only treat as "doesn't exist" if Docker says so
         if (inspectResult.stderr.toLowerCase().includes("no such object")) {
+          bumpContainerGeneration(containerName);
           return { success: true, deletedPath };
         }
         return {
@@ -1039,6 +1098,7 @@ export class DockerRuntime extends RemoteRuntime {
 
       // Stop and remove container
       const rmResult = await runDockerCommand(`rm -f ${containerName}`, 30000);
+      bumpContainerGeneration(containerName);
 
       if (rmResult.exitCode !== 0) {
         return {
@@ -1065,6 +1125,9 @@ export class DockerRuntime extends RemoteRuntime {
     const destContainerName = getContainerName(projectPath, newWorkspaceName);
     const hostTempPath = path.join(os.tmpdir(), `mux-fork-${Date.now()}.bundle`);
     const containerBundlePath = "/tmp/fork.bundle";
+    // Cleanup only touches containers we actually used: a pre-aborted fork must not spawn
+    // Docker at all (a slow daemon made the cleanup outlast the caller, flaking CI).
+    let srcBundleAttempted = false;
     let destContainerCreated = false;
     let forkSucceeded = false;
 
@@ -1099,6 +1162,7 @@ export class DockerRuntime extends RemoteRuntime {
       // 3. Create git bundle inside source container
       initLogger.logStep("Creating git bundle from source...");
       throwIfAborted();
+      srcBundleAttempted = true;
       const bundleResult = await runDockerCommand(
         `exec ${srcContainerName} git -C ${CONTAINER_SRC_DIR} bundle create ${containerBundlePath} --all`,
         300000,
@@ -1132,6 +1196,7 @@ export class DockerRuntime extends RemoteRuntime {
       dockerArgs.push(this.config.image, "sleep", "infinity");
       throwIfAborted();
       const runResult = await runContainerSpawnCommand(dockerArgs, 60000, abortSignal);
+      bumpContainerGeneration(destContainerName);
       if (runResult.exitCode !== 0) {
         // Handle TOCTOU race - container may have been created between check and run
         if (runResult.stderr.includes("already in use")) {
@@ -1175,14 +1240,10 @@ export class DockerRuntime extends RemoteRuntime {
       }
 
       initLogger.logStep("Cloning repository in destination...");
-      // Disable git hooks inside the container for untrusted projects
-      const noHooksEnvCmd = params.trusted
-        ? ""
-        : "env " +
-          Object.entries(GIT_NO_HOOKS_ENV)
-            .map(([k, v]) => `${k}=${v}`)
-            .join(" ") +
-          " ";
+      // Disable git hooks inside the container unless gitHooksAllowed (docker
+      // exec has no shell, so the assignments need an explicit env wrapper).
+      const cloneNhp = gitNoHooksPrefix(params.trusted);
+      const noHooksEnvCmd = cloneNhp === "" ? "" : `env ${cloneNhp}`;
       throwIfAborted();
       const cloneResult = await runDockerCommand(
         `exec ${destContainerName} ${noHooksEnvCmd}git clone ${containerBundlePath} ${CONTAINER_SRC_DIR}`,
@@ -1234,6 +1295,17 @@ export class DockerRuntime extends RemoteRuntime {
         // Ignore - best-effort
       }
 
+      // Record the copied branches and stash before step 8 can remove origin/*, so the task_remove
+      // lossy check counts only the fork's own commits (#5105). Best-effort: without it the check
+      // counts every other branch.
+      try {
+        const snapshotCmd = `cd ${CONTAINER_SRC_DIR} && ${buildSourceRefSnapshotCommand(gitNoHooksPrefix(params.trusted))}`;
+        // Array args: the pipeline must reach the container's shell, not the host's (cmd.exe on Windows).
+        await runContainerSpawnCommand(["exec", destContainerName, "sh", "-c", snapshotCmd], 30000);
+      } catch {
+        // Ignore - best-effort
+      }
+
       // 8. Preserve origin URL (best-effort)
       try {
         const originResult = await runDockerCommand(
@@ -1280,6 +1352,8 @@ export class DockerRuntime extends RemoteRuntime {
       forkSucceeded = true;
       // Update containerName so subsequent initWorkspace() targets the forked container
       this.containerName = destContainerName;
+      // #6426: the clone is complete; a snapshot read while it was cloning is stale.
+      bumpContainerGeneration(destContainerName);
       return { success: true, workspacePath: CONTAINER_SRC_DIR, sourceBranch };
     } catch (error) {
       return { success: false, error: getErrorMessage(error) };
@@ -1287,9 +1361,11 @@ export class DockerRuntime extends RemoteRuntime {
       // 10. Cleanup (best-effort, ignore errors)
       /* eslint-disable @typescript-eslint/no-empty-function */
       // Clean up bundle in source container
-      await runDockerCommand(`exec ${srcContainerName} rm -f ${containerBundlePath}`, 5000).catch(
-        () => {}
-      );
+      if (srcBundleAttempted) {
+        await runDockerCommand(`exec ${srcContainerName} rm -f ${containerBundlePath}`, 5000).catch(
+          () => {}
+        );
+      }
       // Clean up bundle in destination container (if it exists)
       if (destContainerCreated) {
         await runDockerCommand(

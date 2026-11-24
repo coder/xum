@@ -1,3 +1,4 @@
+import { CacheTtlSchema, ServiceTierSchema } from "@/common/config/schemas/providersConfig";
 /**
  * Pure field-wise resolver for agent AI settings (model, thinkingLevel,
  * reasoningMode). Every execution surface resolves through this one precedence
@@ -5,7 +6,8 @@
  *
  *   1. explicit invocation overrides
  *   2. target workspace per-agent bucket
- *   3. target configured profile (delegated `subagent` override, then base)
+ *   3. target configured profile (delegated `subagent` override, then calling
+ *      workspace Exec settings for Exec sub-agents only, then base)
  *   4. target definition frontmatter `ai` defaults
  *   5. declared ancestors child to root (config profile, then definition
  *      defaults), then the implicit plan/exec fallback (reasoningMode only)
@@ -33,7 +35,9 @@ import {
   type OpenAIReasoningMode,
   type ThinkingLevel,
 } from "@/common/types/thinking";
+import type { AnthropicCacheTtl } from "@/common/utils/ai/cacheStrategy";
 import { normalizeModelInput } from "@/common/utils/ai/normalizeModelInput";
+import { openaiCyberModeAvailable } from "@/common/utils/ai/cyberMode";
 import { openaiProModeAvailable } from "@/common/utils/ai/proMode";
 import {
   enforceThinkingPolicy,
@@ -82,8 +86,7 @@ function buildCandidates(input: ResolveAgentAiSettingsInput): Candidate[] {
 
   const pushConfig = (agentId: string, reasoningOnly: boolean) => {
     const entry = defaults[agentId];
-    if (!entry) return;
-    if (input.profile === "subagent" && entry.subagent) {
+    if (input.profile === "subagent" && entry?.subagent) {
       candidates.push({
         values: {
           model: entry.subagent.modelString,
@@ -94,11 +97,26 @@ function buildCandidates(input: ResolveAgentAiSettingsInput): Candidate[] {
         reasoningOnly,
       });
     }
+    // A chat's Exec choice outranks global defaults, but never explicit child
+    // overrides. Do not promote this context for Exec-derived custom agents.
+    if (
+      input.profile === "subagent" &&
+      input.targetAgentId === "exec" &&
+      agentId === "exec" &&
+      input.parentWorkspaceExecSettings
+    ) {
+      candidates.push({
+        values: input.parentWorkspaceExecSettings,
+        source: { tier: "parent-workspace-exec", agentId: "exec" },
+      });
+    }
+    if (!entry) return;
     candidates.push({
       values: {
         model: entry.modelString,
         thinkingLevel: entry.thinkingLevel,
         reasoningMode: entry.reasoningMode,
+        cacheTtl: entry.cacheTtl,
       },
       source: { tier: "config", agentId },
       reasoningOnly,
@@ -112,6 +130,7 @@ function buildCandidates(input: ResolveAgentAiSettingsInput): Candidate[] {
       values: {
         model: input.targetDefinitionAiDefaults.model,
         thinkingLevel: input.targetDefinitionAiDefaults.thinkingLevel,
+        cacheTtl: input.targetDefinitionAiDefaults.cacheTtl,
       },
       source: { tier: "definition", agentId: input.targetAgentId },
     });
@@ -119,14 +138,18 @@ function buildCandidates(input: ResolveAgentAiSettingsInput): Candidate[] {
 
   const chainIds = new Set<string>([input.targetAgentId]);
   for (const ancestor of input.ancestors ?? []) {
-    if (chainIds.has(ancestor.agentId)) continue;
-    chainIds.add(ancestor.agentId);
-    pushConfig(ancestor.agentId, false);
+    // An ID can come back further down a resolved chain (see collectDefinitionLayers): its
+    // Settings already ranked at its first hop, but this hop's frontmatter ranks here.
+    if (!chainIds.has(ancestor.agentId)) {
+      chainIds.add(ancestor.agentId);
+      pushConfig(ancestor.agentId, false);
+    }
     if (ancestor.definitionAiDefaults) {
       candidates.push({
         values: {
           model: ancestor.definitionAiDefaults.model,
           thinkingLevel: ancestor.definitionAiDefaults.thinkingLevel,
+          cacheTtl: ancestor.definitionAiDefaults.cacheTtl,
         },
         source: { tier: "definition", agentId: ancestor.agentId },
       });
@@ -157,7 +180,7 @@ function buildCandidates(input: ResolveAgentAiSettingsInput): Candidate[] {
 /** First candidate whose field survives coercion wins; invalid values fall through. */
 function pickField<T>(
   candidates: readonly Candidate[],
-  field: "model" | "thinkingLevel" | "reasoningMode",
+  field: "model" | "thinkingLevel" | "reasoningMode" | "serviceTier" | "cacheTtl",
   coerce: (raw: unknown) => T | undefined,
   diagnostics: string[]
 ): { value: T; source: AiSettingSource } | undefined {
@@ -178,6 +201,27 @@ function pickField<T>(
 function coerceModel(raw: unknown): string | undefined {
   if (typeof raw !== "string" || raw.trim().length === 0) return undefined;
   return normalizeModelInput(raw).model ?? undefined;
+}
+
+/**
+ * The agent's Anthropic prompt-cache TTL from its Settings value, its frontmatter, then each
+ * declared base (Settings, then frontmatter), on the same walk as model/thinking. Undefined
+ * when no layer sets one: the caller then uses the global providers.jsonc TTL and the
+ * legacy request-level fallbacks. Per agent for every run kind, so the delegated profile and
+ * the implicit exec fallback contribute nothing.
+ */
+export function resolveAgentCacheTtl(
+  input: Pick<
+    ResolveAgentAiSettingsInput,
+    "targetAgentId" | "agentAiDefaults" | "targetDefinitionAiDefaults" | "ancestors"
+  >
+): { value: AnthropicCacheTtl; source: AiSettingSource } | undefined {
+  return pickField(
+    buildCandidates({ ...input, profile: "interactive" }),
+    "cacheTtl",
+    (raw) => CacheTtlSchema.safeParse(raw).data,
+    []
+  );
 }
 
 export function resolveAgentAiSettings(
@@ -227,6 +271,17 @@ export function resolveAgentAiSettings(
     reasoning = pickField(candidates, "reasoningMode", coerceOpenAIReasoningMode, diagnostics);
   }
 
+  // Absent speed stays absent so legacy chats still inherit the provider default.
+  const serviceTier =
+    input.explicit?.serviceTier != null
+      ? { value: input.explicit.serviceTier, source: { tier: "explicit" as const } }
+      : pickField(
+          candidates,
+          "serviceTier",
+          (raw) => ServiceTierSchema.safeParse(raw).data,
+          diagnostics
+        );
+
   // --- effective values (provider-safe) ---
   const minThinkingFloor = resolveMinimumThinkingLevel(
     model.value,
@@ -243,23 +298,30 @@ export function resolveAgentAiSettings(
   const proAvailable =
     input.proModeAvailable ?? openaiProModeAvailable(model.value, { providersConfig });
   const effectiveReasoning =
-    reasoning?.value === "pro" && !proAvailable ? undefined : reasoning?.value;
+    (reasoning?.value === "pro" && !proAvailable) ||
+    (reasoning?.value === "cyber" && !openaiCyberModeAvailable(model.value, { providersConfig }))
+      ? undefined
+      : reasoning?.value;
 
   return {
     selected: {
       model: model.value,
       thinkingLevel: thinking.value,
       ...(reasoning !== undefined ? { reasoningMode: reasoning.value } : {}),
+      ...(serviceTier != null ? { serviceTier: serviceTier.value } : {}),
     },
     effective: {
       model: model.value,
       thinkingLevel: effectiveThinking,
       ...(effectiveReasoning !== undefined ? { reasoningMode: effectiveReasoning } : {}),
+      // Route/model gating happens when building OpenAI provider options.
+      ...(serviceTier != null ? { serviceTier: serviceTier.value } : {}),
     },
     sources: {
       model: model.source,
       thinkingLevel: thinking.source,
       ...(reasoning !== undefined ? { reasoningMode: reasoning.source } : {}),
+      ...(serviceTier != null ? { serviceTier: serviceTier.source } : {}),
     },
     diagnostics,
   };

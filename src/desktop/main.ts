@@ -16,6 +16,7 @@ import "source-map-support/register";
 import { promises as fsPromises } from "node:fs";
 import * as path from "node:path";
 import { createRequire } from "node:module";
+import { pathToFileURL } from "node:url";
 import { cleanupObsoleteXumBinArtifacts, getXumHome } from "@/common/constants/paths";
 import { getElectronAppIdentity } from "@/common/compat/electronAppIdentity";
 import {
@@ -41,15 +42,26 @@ if (process.platform === "darwin") {
   }
 }
 
+import { DesktopWindowManager } from "./desktopWindowManager";
+import { createComputerUseHostBridge } from "./computerUseHostBridge";
+import { KeepAwakeController } from "./keepAwake";
+import { RemoteConnectionManager } from "./remoteConnectionManager";
+import { guardSubframeNavigation } from "./subframeNavigation";
+import { getLocalServerLoadUrl } from "./localServerDiscovery";
+import { REMOTE_CONNECTION_CHANNELS } from "@/common/constants/remoteConnection";
 import { randomBytes } from "crypto";
-import { RPCHandler } from "@orpc/server/message-port";
-import { onError } from "@orpc/server";
-import { router } from "../node/orpc/router";
-import { formatOrpcError } from "../node/orpc/formatOrpcError";
-import { ServerLockfile } from "../node/services/serverLockfile";
 import "disposablestack/auto";
 
-import type { MenuItemConstructorOptions, MessageBoxOptions } from "electron";
+import type {
+  BrowserWindowConstructorOptions,
+  Event as ElectronEvent,
+  IpcMainEvent,
+  IpcMainInvokeEvent,
+  MenuItemConstructorOptions,
+  MessageBoxOptions,
+  Session,
+  WebContents,
+} from "electron";
 import {
   app,
   crashReporter,
@@ -60,7 +72,9 @@ import {
   dialog,
   nativeImage,
   nativeTheme,
+  powerSaveBlocker,
   screen,
+  session as electronSession,
   shell,
 } from "electron";
 
@@ -170,7 +184,6 @@ import { normalizeAndValidateExternalUrl } from "./utils/normalizeAndValidateExt
 import { hasSameOrigin } from "./utils/hasSameOrigin";
 import assert from "../common/utils/assert";
 import { setOpenSSHHostKeyPolicyMode } from "@/node/runtime/sshConnectionPool";
-import { loadTokenizerModules } from "../node/utils/main/tokenizer";
 import { isBashAvailable } from "../node/utils/main/bashPath";
 import windowStateKeeper from "electron-window-state";
 import { getTitleBarOptions } from "./titleBarOptions";
@@ -181,25 +194,110 @@ import {
 } from "./utils/xumProtocolRegistration";
 import { getErrorMessage } from "@/common/utils/errors";
 import { log } from "@/node/services/log";
+import {
+  createHangTracker,
+  getRecentHangRecords,
+  JS_CALL_STACKS_FEATURE,
+  mergeEnableFeatures,
+} from "./perf/hangStacks";
+import { createRendererCpuProfiler, RendererTargetRegistry } from "./perf/rendererCpuProfiler";
+import { type AppPage, installAppDocumentPolicy } from "./perf/appDocumentPolicy";
+import {
+  installSessionTapeReplayEgressBlock,
+  refuseSessionTapeReplayExternalOpen,
+} from "./sessionTapeReplayEgress";
+import { TERMINAL_DEV_SERVER_ORIGIN } from "./terminalDevServerOrigin";
+import { isSessionTapeReplayConfigured } from "@/common/utils/sessionTapes/sessionTapeReplay";
+
+// Lets the main process read a hung renderer's JS stack (see ./perf/hangStacks). Merge into
+// any --enable-features value from the launch command line instead of replacing it.
+// Must be called before app.whenReady().
+app.commandLine.appendSwitch(
+  "enable-features",
+  mergeEnableFeatures(app.commandLine.getSwitchValue("enable-features"), JS_CALL_STACKS_FEATURE)
+);
+
+// Perf harness (XUM_REPLAY_TAPES): Chromium's browser-internal fetches (e.g. spellcheck
+// dictionary downloads) bypass webRequest, so in replay mode no host name resolves except
+// localhost and the configured dev-server host (dev-server mode). Requests to literal IPs still
+// meet the webRequest block. Before app.whenReady().
+if (isSessionTapeReplayConfigured(process.env)) {
+  const devHost = shouldUseDevServer() ? getXumEnv("DEVSERVER_HOST") : undefined;
+  app.commandLine.appendSwitch(
+    "host-resolver-rules",
+    `MAP * ~NOTFOUND, EXCLUDE localhost${devHost ? `, EXCLUDE ${devHost}` : ""}`
+  );
+}
 
 // React DevTools for development profiling
 // Using dynamic import() to avoid loading electron-devtools-installer at module init time
 
 // IMPORTANT: Lazy-load heavy dependencies to maintain fast startup time
 //
-// To keep startup time under 4s, avoid importing AI SDK packages at the top level.
-// These files MUST use dynamic import():
-//   - main.ts, config.ts, preload.ts (startup-critical)
+// To keep startup time under 4s, nothing this file imports statically (directly or
+// transitively) may load AI SDK packages. Load them via dynamic import() instead:
 //
 // ✅ GOOD: const { createAnthropic } = await import("@ai-sdk/anthropic");
 // ❌ BAD:  import { createAnthropic } from "@ai-sdk/anthropic";
 //
-// Enforcement: scripts/check_eager_imports.sh validates this in CI
+// Enforcement: scripts/check-startup-imports.ts (make static-check) walks the static
+// import graph of this file and fails on banned packages.
 //
 // Lazy-load Config and ServiceContainer to avoid loading heavy AI SDK dependencies at startup
 // These will be loaded on-demand when createWindow() is called
 let config: Config | null = null;
 let services: ServiceContainer | null = null;
+let remoteConnectionManager: RemoteConnectionManager | null = null;
+// Holds the display-sleep blocker while local agents work (opt-in via config.keepScreenAwake).
+let keepAwake: KeepAwakeController | null = null;
+const localIpcWindows = new Map<WebContents, URL>();
+
+function isTrustedLocalUrl(target: string, expected: URL): boolean {
+  try {
+    const url = new URL(target);
+    return expected.protocol === "file:"
+      ? url.protocol === "file:" && url.host === expected.host && url.pathname === expected.pathname
+      : url.origin === expected.origin;
+  } catch {
+    return false;
+  }
+}
+
+function createLocalWindow(
+  options: BrowserWindowConstructorOptions,
+  page: "index.html" | "terminal.html" | "desktop.html" = "index.html"
+): BrowserWindow {
+  const window = new BrowserWindow(options);
+  const contents = window.webContents;
+  const expected =
+    !app.isPackaged && !forceDistLoad
+      ? new URL(
+          page === "terminal.html"
+            ? "http://localhost:5173"
+            : "http://" + (getXumEnv("DEVSERVER_HOST") ?? "127.0.0.1") + ":" + devServerPort
+        )
+      : pathToFileURL(path.join(__dirname, "..", page));
+  localIpcWindows.set(contents, expected);
+  contents.once("destroyed", () => localIpcWindows.delete(contents));
+  // Redirects and other packaged files must not retain this window's privileged preload.
+  const guardNavigation = (event: ElectronEvent, target: string): void => {
+    if (!isTrustedLocalUrl(target, expected)) event.preventDefault();
+  };
+  contents.on("will-navigate", guardNavigation);
+  contents.on("will-redirect", guardNavigation);
+  guardSubframeNavigation(contents);
+  return window;
+}
+
+function isLocalIpcSender(event: IpcMainEvent | IpcMainInvokeEvent): boolean {
+  const expected = localIpcWindows.get(event.sender);
+  return (
+    expected != null &&
+    event.senderFrame === event.sender.mainFrame &&
+    isTrustedLocalUrl(event.senderFrame.url, expected)
+  );
+}
+
 const requireDesktopModule = createRequire(__filename);
 
 // XUM_PROXY_URI is canonical; the transition layer mirrors legacy MUX_PROXY_URI.
@@ -368,6 +466,66 @@ function timestamp(): string {
   return `${hours}:${minutes}:${seconds}.${ms}`;
 }
 
+function initializeRemoteConnections(): void {
+  const manager = new RemoteConnectionManager({
+    createWindow: (options) => {
+      const window = new BrowserWindow(options);
+      // Remote servers render the same Artifacts tab (sandboxed subframes).
+      guardSubframeNavigation(window.webContents);
+      return window;
+    },
+    onDisconnected: () => {
+      if (!isQuitting) openXumFromTray();
+    },
+    onStateChanged: (state) => {
+      if (mainWindow && !mainWindow.isDestroyed()) {
+        mainWindow.webContents.send(REMOTE_CONNECTION_CHANNELS.stateChanged, state);
+      }
+      const returnItem = Menu.getApplicationMenu()?.getMenuItemById("return-to-local");
+      if (returnItem) returnItem.enabled = state.status !== "disconnected";
+    },
+    openExternal: (url) => {
+      if (refuseSessionTapeReplayExternalOpen(url)) return;
+      shell.openExternal(url).catch(() => {
+        log.warn("Cannot open the remote server link in the browser.");
+      });
+    },
+  });
+  remoteConnectionManager = manager;
+
+  // Keep desktop connection controls off the network API and out of remote pages.
+  const assertLocalController = (event: IpcMainInvokeEvent): void => {
+    if (!isLocalIpcSender(event) || event.sender !== mainWindow?.webContents) {
+      throw new Error("Remote connection controls require the local desktop window.");
+    }
+  };
+  electronIpcMain.handle(REMOTE_CONNECTION_CHANNELS.getState, (event) => {
+    assertLocalController(event);
+    return manager.getState();
+  });
+  electronIpcMain.handle(REMOTE_CONNECTION_CHANNELS.connect, (event, url: unknown) => {
+    assertLocalController(event);
+    if (typeof url !== "string") throw new Error("Enter a valid server URL.");
+    return manager.connect(url);
+  });
+  electronIpcMain.handle(REMOTE_CONNECTION_CHANNELS.disconnect, (event) => {
+    assertLocalController(event);
+    manager.disconnect();
+  });
+  electronIpcMain.handle(REMOTE_CONNECTION_CHANNELS.openLocalServer, async (event) => {
+    assertLocalController(event);
+    assert(config, "Open Server Window requires the loaded config");
+    // peek() never deletes a stale lock, so discovery cannot race a starting xum server.
+    // loadServices() has already loaded this module; importing it here keeps zod off the
+    // pre-splash path (#4423).
+    // eslint-disable-next-line no-restricted-syntax -- keeps zod off the pre-splash path (#4423)
+    const { ServerLockfile } = await import("../node/services/serverLockfile");
+    const lock = await new ServerLockfile(config.rootDir).peek();
+    // The token stays in this process: it only reaches the sandboxed window's load URL.
+    return manager.openLocalServer(getLocalServerLoadUrl(lock, process.pid));
+  });
+}
+
 function createMenu() {
   const template: MenuItemConstructorOptions[] = [
     {
@@ -410,7 +568,35 @@ function createMenu() {
     },
     {
       label: "Window",
-      submenu: [{ role: "minimize" }, { role: "close" }],
+      submenu: [
+        { role: "minimize" },
+        { role: "close" },
+        { type: "separator" },
+        {
+          id: "open-server-window",
+          label: "Open Server Window",
+          // No accelerator, for the same reason as Return to Local below: the renderer owns
+          // Ctrl/Cmd+Shift+O (KEYBINDS.OPEN_SERVER_WINDOW) and runs the same flow. The flow lives
+          // in the local renderer so failures land on Settings → Remote Connection.
+          click: () => {
+            if (!mainWindow || mainWindow.isDestroyed()) return;
+            openXumFromTray();
+            mainWindow.webContents.send(REMOTE_CONNECTION_CHANNELS.openServerWindowRequested);
+          },
+        },
+        {
+          id: "return-to-local",
+          label: "Return to Local",
+          // No accelerator: menu accelerators are global on macOS (registerAccelerator: false is
+          // Linux/Windows only), so it would take Ctrl/Cmd+Shift+L (Show Last Prompt) from the local
+          // window, which stays visible next to the server window. The server window's
+          // before-input-event handler provides the shortcut there.
+          enabled:
+            remoteConnectionManager?.getState().status !== "disconnected" &&
+            remoteConnectionManager != null,
+          click: () => remoteConnectionManager?.disconnect(),
+        },
+      ],
     },
   ];
 
@@ -424,6 +610,7 @@ function createMenu() {
           label: "Settings...",
           accelerator: "Cmd+,",
           click: () => {
+            openXumFromTray();
             services?.menuEventService.emitOpenSettings();
           },
         },
@@ -499,15 +686,8 @@ function openXumFromTray() {
     return;
   }
 
-  // On macOS the app stays open after all windows are closed; recreate the window.
-  if (process.platform === "darwin") {
-    if (!services) {
-      console.warn(`[${timestamp()}] [tray] Cannot open xum (services not loaded yet)`);
-      return;
-    }
-
-    createWindow();
-  }
+  // A remote window can keep the app open after the local window closes.
+  if (services) createWindow();
 }
 
 function updateTrayIcon() {
@@ -562,6 +742,20 @@ function createTray() {
 }
 
 /**
+ * How long to leave the main thread idle after the splash window's `show` event so its first
+ * frame reaches the screen. The imports that are only needed once services run load
+ * synchronously inside loadServices() (kept off the pre-splash path, #4423), and it starts right
+ * after `show`; without this wait they block the main thread before the first frame is
+ * presented, so the window maps but stays blank (measured on Linux: the logo painted ~1.5 s
+ * after `show`; 30-100 ms waits painted it within ~10 ms).
+ * Electron has no "first frame presented" signal for an onscreen window: ready-to-show fires
+ * before `show`, and waiting on capturePage() or a double requestAnimationFrame painted in time
+ * in only 2/10 and 2/3 runs, so a short timer is the only option. It only bounds startup by this many ms;
+ * if it is too short, the result is today's behavior (logo late), never a hang.
+ */
+const SPLASH_FIRST_PAINT_WAIT_MS = 60;
+
+/**
  * Create and show splash screen - instant visual feedback (<100ms)
  *
  * Shows a lightweight native window with static HTML while services load.
@@ -593,12 +787,14 @@ async function showSplashScreen() {
   // Wait for the window to actually be shown and rendered before continuing
   // This ensures the splash is visible before we block the event loop with heavy work
   await new Promise<void>((resolve) => {
+    // eslint-disable-next-line @typescript-eslint/no-non-null-assertion -- legacy site from before the ban; remove when touching this line
     splashWindow!.once("show", () => {
       const loadTime = Date.now() - startTime;
       console.log(`[${timestamp()}] Splash screen shown (${loadTime}ms)`);
-      // Give one more event loop tick for the window to actually paint
-      setImmediate(resolve);
+      // Let the first frame reach the screen before loadServices() blocks the main thread.
+      setTimeout(resolve, SPLASH_FIRST_PAINT_WAIT_MS);
     });
+    // eslint-disable-next-line @typescript-eslint/no-non-null-assertion -- legacy site from before the ban; remove when touching this line
     splashWindow!.show();
   });
 
@@ -637,25 +833,61 @@ async function loadServices(): Promise<void> {
   // - ServiceContainer transitively imports the entire AI SDK (ai, @ai-sdk/anthropic, etc.)
   // - These are large modules (~100ms load time) that would block splash from appearing
   // - Loading happens once, then cached
+  // - formatOrpcError reaches WorkflowService (effect, oRPC schemas) for one string constant,
+  //   and tokenizer warm-up reaches the tool schemas; together they cost ~500 ms before the
+  //   splash when imported statically (#4423). scripts/check-startup-imports.ts bans effect
+  //   and zod so they stay here.
   const [
-    { Config: ConfigClass },
+    { createConfigStores },
     { ServiceContainer: ServiceContainerClass },
     { TerminalWindowManager: TerminalWindowManagerClass },
+    { router },
+    { formatOrpcError },
+    { warmConfiguredTokenizers },
+    { RPCHandler },
+    { onError },
+    { ServerLockfile },
   ] = await Promise.all([
     import("../node/config"),
     import("../node/services/serviceContainer"),
     import("./terminalWindowManager"),
+    // The oRPC router statically reaches every handler (and the `ai` package via
+    // workspaceTitleGenerator), so it must stay off the pre-splash import path.
+    import("../node/orpc/router"),
+    import("../node/orpc/formatOrpcError"),
+    import("../node/utils/main/tokenizerWarmModels"),
+    import("@orpc/server/message-port"),
+    import("@orpc/server"),
+    import("../node/services/serverLockfile"),
   ]);
   /* eslint-enable no-restricted-syntax */
-  config = new ConfigClass();
+  const stores = createConfigStores();
+  config = stores.config;
 
-  services = new ServiceContainerClass(config);
+  services = new ServiceContainerClass(stores);
   // Desktop bootstrap owns interactive host-key trust policy
   setOpenSSHHostKeyPolicyMode("strict");
-  await services.initialize();
+  await services.initializeCore();
   // Keep the latest update status in main so close-to-tray can prompt for installs.
   services.updateService.onStatus((status) => {
     latestUpdateStatus = status;
+  });
+
+  // Backend services run in-process here, so main can observe workspace activity directly.
+  // Only local activity is tracked: remote-backend windows run their agents elsewhere.
+  keepAwake = new KeepAwakeController({
+    blocker: powerSaveBlocker,
+    isEnabled: () => stores.config.getKeepScreenAwakeEnabled(),
+    onEnabledChanged: (callback) => stores.config.onConfigChanged(callback),
+    activity: services.workspaceService,
+  });
+  // Do not await: the initial activity seed enumerates config and probes workspace state on
+  // disk, which can be slow on large stores and must not keep the window behind the splash
+  // screen. start() subscribes synchronously, so live events already reconcile while the
+  // seed is in flight, and dispose() on quit is safe mid-seed.
+  keepAwake.start().catch((error: unknown) => {
+    // Startup must never fail over an optional convenience; live events still reconcile.
+    log.error("keep-awake: failed to start controller", { error });
   });
 
   // Generate auth token (use env var or random per-session)
@@ -753,7 +985,13 @@ async function loadServices(): Promise<void> {
   });
 
   electronIpcMain.on("start-orpc-server", (event) => {
+    // SECURITY AUDIT: only registered local main frames can receive the local bearer credential.
+    if (!isLocalIpcSender(event)) {
+      for (const port of event.ports) port.close();
+      return;
+    }
     const [serverPort] = event.ports;
+    if (!serverPort) return;
     // Use Object.defineProperties to copy all property descriptors from
     // orpcContext as own-properties (required by oRPC's internal property
     // enumeration) while preserving any getters that must resolve lazily
@@ -821,14 +1059,17 @@ async function loadServices(): Promise<void> {
   }
 
   // Set TerminalWindowManager for desktop mode (pop-out terminal windows)
-  const terminalWindowManager = new TerminalWindowManagerClass(config);
+  const terminalWindowManager = new TerminalWindowManagerClass(config, (options) =>
+    createLocalWindow(options, "terminal.html")
+  );
   services.setProjectDirectoryPicker(async (initialPath) => {
     const win = BrowserWindow.getFocusedWindow();
     if (!win) return null;
 
     // If the caller provided an existing directory, seed the picker there so the
     // user starts inside (or alongside) the path they already typed/selected.
-    let defaultPath: string | undefined;
+    // Otherwise start in home: Electron 43+ opens pickers without a defaultPath in Downloads.
+    let defaultPath = app.getPath("home");
     if (initialPath && initialPath.trim().length > 0) {
       try {
         const stat = await fsPromises.stat(initialPath);
@@ -836,7 +1077,7 @@ async function loadServices(): Promise<void> {
           defaultPath = initialPath;
         }
       } catch {
-        // Path doesn't exist or isn't accessible — let Electron pick a default.
+        // Path doesn't exist or isn't accessible; keep the home default.
       }
     }
 
@@ -851,9 +1092,42 @@ async function loadServices(): Promise<void> {
     return res.canceled || res.filePaths.length === 0 ? null : res.filePaths[0];
   });
 
+  services.setDesktopWindowManager(
+    new DesktopWindowManager(
+      (options) => createLocalWindow(options, "desktop.html"),
+      app.isPackaged
+    )
+  );
+  services.setComputerUseHostBridge(createComputerUseHostBridge());
   services.setTerminalWindowManager(terminalWindowManager);
 
-  loadTokenizerModules().catch((error) => {
+  // Renderer CPU profiles after perf flight recorder trips (experiment perfFlightRecorder).
+  // Pages announce their recorder rendererId; only trusted local main frames are mapped.
+  const perfRendererTargets = new RendererTargetRegistry();
+  electronIpcMain.on("mux:perf-announce-renderer-id", (event, rendererId: unknown) => {
+    if (!isLocalIpcSender(event)) return;
+    perfRendererTargets.announce(rendererId, event.sender);
+  });
+  services.setSessionTapesFolderRevealer(async (dir) => {
+    // openPath resolves with an error message ("" on success) instead of rejecting.
+    const error = await shell.openPath(dir);
+    if (error) throw new Error(error);
+  });
+  services.perfCaptures.setRendererProfiler(
+    createRendererCpuProfiler({
+      registry: perfRendererTargets,
+      getMainWebContents: () =>
+        mainWindow != null && !mainWindow.isDestroyed() ? mainWindow.webContents : null,
+    })
+  );
+  // "Report slowness" bundles add desktop-only data and reveal the folder when written.
+  services.perfReports.setDesktopHooks({
+    getHangRecords: getRecentHangRecords,
+    getAppMetrics: () => app.getAppMetrics(),
+    revealPath: (dirPath) => shell.showItemInFolder(dirPath),
+  });
+
+  warmConfiguredTokenizers(() => stores.config.loadConfigOrDefault()).catch((error) => {
     console.error("Failed to preload tokenizer modules:", error);
   });
 
@@ -864,14 +1138,37 @@ async function loadServices(): Promise<void> {
   console.log(`[${timestamp()}] Services loaded in ${loadTime}ms`);
 }
 
+/**
+ * Opt the app document (and only it) into JS call stacks for hang diagnostics. A native
+ * mainFrame filter keeps subresources out of the JS callback, so this needs no restart or
+ * opt-in and stays on by default.
+ */
+function installHangStackDocumentPolicy(session: Session, appPage: AppPage): void {
+  try {
+    installAppDocumentPolicy(session, appPage);
+  } catch (error) {
+    // Hang stacks are diagnostics only; never block loading the app.
+    log.warn("[diag] failed to install Document-Policy for hang stacks", {
+      error: getErrorMessage(error),
+    });
+  }
+}
+
+function shouldUseDevServer(): boolean {
+  return (isE2ETest && !forceDistLoad) || (!app.isPackaged && !forceDistLoad);
+}
+
+function getDevServerUrl(): string {
+  return `http://${getXumEnv("DEVSERVER_HOST") ?? "127.0.0.1"}:${devServerPort}`;
+}
+
 function createWindow() {
   assert(services, "Services must be loaded before creating window");
 
   mainWindowFinishedLoading = false;
 
-  const useDevServer = (isE2ETest && !forceDistLoad) || (!app.isPackaged && !forceDistLoad);
-  const devHost = getXumEnv("DEVSERVER_HOST") ?? "127.0.0.1";
-  const devServerUrl = `http://${devHost}:${devServerPort}`;
+  const useDevServer = shouldUseDevServer();
+  const devServerUrl = getDevServerUrl();
   let devServerRetryTimeout: ReturnType<typeof setTimeout> | null = null;
   let devServerRetryAttempt = 0;
 
@@ -926,7 +1223,7 @@ function createWindow() {
 
   console.log(`[${timestamp()}] [window] Creating BrowserWindow...`);
 
-  mainWindow = new BrowserWindow({
+  mainWindow = createLocalWindow({
     x: windowState.x,
     y: windowState.y,
     width: windowState.width,
@@ -996,8 +1293,7 @@ function createWindow() {
       void prompt
         .then(({ response }) => {
           if (response === 0) {
-            services?.updateService.install();
-            return;
+            return services?.updateService.install();
           }
 
           if (response === 1) {
@@ -1024,6 +1320,7 @@ function createWindow() {
   });
 
   const openExternalUrl = (url: string): void => {
+    if (refuseSessionTapeReplayExternalOpen(url)) return;
     const externalUrl = normalizeAndValidateExternalUrl({
       url,
       localhostProxyTemplate,
@@ -1040,6 +1337,7 @@ function createWindow() {
   });
 
   mainWindow.webContents.on("will-navigate", (event, url) => {
+    // eslint-disable-next-line @typescript-eslint/no-non-null-assertion -- legacy site from before the ban; remove when touching this line
     const currentOrigin = new URL(mainWindow!.webContents.getURL()).origin;
     const targetOrigin = new URL(url).origin;
     // Prevent navigation away from app origin, open externally instead.
@@ -1055,6 +1353,10 @@ function createWindow() {
   console.time("[window] Content load");
   if (useDevServer) {
     // Development mode: load from vite dev server
+    installHangStackDocumentPolicy(mainWindow.webContents.session, {
+      kind: "devServer",
+      url: devServerUrl,
+    });
     loadFromDevServer();
     if (!isE2ETest) {
       mainWindow.webContents.once("did-finish-load", () => {
@@ -1065,6 +1367,10 @@ function createWindow() {
     // Production mode: load built files
     const htmlPath = path.join(__dirname, "../index.html");
     console.log(`[${timestamp()}] [window] Loading from file: ${htmlPath}`);
+    installHangStackDocumentPolicy(mainWindow.webContents.session, {
+      kind: "file",
+      path: htmlPath,
+    });
     void mainWindow.loadFile(htmlPath);
   }
 
@@ -1078,10 +1384,7 @@ function createWindow() {
     mainWindowFinishedLoading = true;
     flushBufferedXumDeepLinks();
 
-    // NOTE: Tokenizer modules are NOT loaded at startup anymore!
-    // The Proxy in tokenizer.ts loads them on-demand when first accessed.
-    // This reduces startup time from ~8s to <1s.
-    // First token count will use approximation, accurate count caches in background.
+    // Tokenizer encodings warm in background workers from loadServices (loadTokenizerModules).
   });
 
   // Diagnostic crash hooks — log only, no recovery side effects.
@@ -1117,8 +1420,33 @@ function createWindow() {
     }
   );
 
+  const hungWindow = mainWindow;
+  const hangTracker = createHangTracker({
+    collect: () => {
+      if (hungWindow.isDestroyed() || hungWindow.webContents.mainFrame.isDestroyed()) {
+        throw new Error("window destroyed");
+      }
+      return hungWindow.webContents.mainFrame.collectJavaScriptCallStack();
+    },
+    getUrl: () => (hungWindow.isDestroyed() ? "" : hungWindow.webContents.getURL()),
+    log,
+  });
   mainWindow.webContents.on("unresponsive", () => {
     log.warn("[diag] renderer unresponsive");
+    // Never rejects; it resolves once the hung renderer's JS stack (or the reason it is
+    // unavailable) has been logged.
+    void hangTracker.onUnresponsive();
+  });
+  mainWindow.webContents.on("responsive", () => {
+    hangTracker.onResponsive();
+  });
+  // A crash or reload of the hung page never emits `responsive`; without a reset the
+  // reused WebContents would ignore every later hang.
+  mainWindow.webContents.on("render-process-gone", () => {
+    hangTracker.onPageReset();
+  });
+  mainWindow.webContents.on("did-navigate", () => {
+    hangTracker.onPageReset();
   });
 
   // Forward renderer console errors to the log service so they reach the log
@@ -1206,14 +1534,28 @@ async function startDesktopAfterStorage(): Promise<void> {
     try {
       console.log("App ready, creating window...");
 
+      // Perf harness (XUM_REPLAY_TAPES): block renderer egress before any window (splash
+      // included) loads; the backend serves tapes only after this. A failure must not leave
+      // replay mode with network access, so it fails startup.
+      if (isSessionTapeReplayConfigured(process.env)) {
+        installSessionTapeReplayEgressBlock(
+          electronSession.defaultSession,
+          shouldUseDevServer() ? [getDevServerUrl(), TERMINAL_DEV_SERVER_ORIGIN] : []
+        );
+      }
+
       if (await maybeRunAttachFileSmokeTest()) {
         return;
       }
 
       registerXumProtocolClients();
 
-      // Install React DevTools in development
-      if (!app.isPackaged) {
+      // Install React DevTools in development, but not in E2E runs. E2E (and
+      // especially perf profiling) must match packaged builds, which never
+      // install the extension: its installHook.js measurably distorts CPU and
+      // layout profiles. Skipping it also removes a network download from tests.
+      // Not in replay mode either: the extension download is network egress.
+      if (!app.isPackaged && !isE2ETest && !isSessionTapeReplayConfigured(process.env)) {
         try {
           const { default: installExtension, REACT_DEVELOPER_TOOLS } =
             // eslint-disable-next-line no-restricted-syntax -- dev-only dependency, intentionally lazy-loaded
@@ -1240,7 +1582,12 @@ async function startDesktopAfterStorage(): Promise<void> {
         await showSplashScreen(); // Wait for splash to actually load
       }
       await loadServices();
+      initializeRemoteConnections();
       createWindow();
+      // Task recovery finishes during core init; housekeeping must not gate the window.
+      void services?.runStartupHousekeeping().catch((error: unknown) => {
+        log.error("[startup] Background startup housekeeping failed", { error });
+      });
       createTray();
       // Note: splash closes in ready-to-show event handler
 
@@ -1271,6 +1618,11 @@ async function startDesktopAfterStorage(): Promise<void> {
     // Ensure window close handlers don't block an explicit quit.
     // IMPORTANT: must be set before any early returns.
     isQuitting = true;
+    remoteConnectionManager?.dispose();
+    // Release the display-sleep blocker before services tear down; Electron would drop it on
+    // exit anyway, but a slow dispose must not keep the screen awake meanwhile.
+    keepAwake?.dispose();
+    keepAwake = null;
     if (isUpdateInstallInProgress()) {
       // Don't block updater-driven quitAndInstall() — let Electron quit immediately
       // so the platform installer can take over. Best-effort cleanup only.

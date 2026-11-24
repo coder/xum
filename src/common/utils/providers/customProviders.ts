@@ -3,6 +3,7 @@ import {
   SUPPORTED_PROVIDERS,
   type ProviderName,
 } from "@/common/constants/providers";
+import { TYPESAFE_PROVIDER_KEY } from "@/constants/autoModelRouting";
 export const CUSTOM_PROVIDER_TYPES = [
   "openai-compatible",
   "openai-responses",
@@ -24,6 +25,8 @@ const RESERVED_CUSTOM_PROVIDER_IDS = new Set<string>([
   "prototype",
   "constructor",
   "hasOwnProperty",
+  // Holds the TypeSafe evaluation-model key (auto routing) in providers.jsonc.
+  TYPESAFE_PROVIDER_KEY,
 ]);
 
 const SUPPORTED_PROVIDER_NAMES: ReadonlySet<string> = new Set(SUPPORTED_PROVIDERS);
@@ -63,10 +66,6 @@ export function validateCustomProviderId(id: string): CustomProviderIdValidation
   }
 
   return { ok: true };
-}
-
-export function isValidCustomProviderId(id: string): boolean {
-  return validateCustomProviderId(id).ok;
 }
 
 /**
@@ -163,6 +162,14 @@ export function getCustomProviderIds(providersConfig: ProvidersConfigWithProvide
   }
 
   return providerIds;
+}
+
+/** Built-in providers, then custom providers; a custom id shadowing a built-in is listed once. */
+export function getProviderIdsForUi(
+  providersConfig: ProvidersConfigWithProviderType | null | undefined
+): string[] {
+  const customProviders = providersConfig ? getCustomProviderIds(providersConfig) : [];
+  return Array.from(new Set([...SUPPORTED_PROVIDERS, ...customProviders]));
 }
 
 export function getShadowedCustomProviderIds(

@@ -26,8 +26,8 @@ assets must be regenerated and committed.
 # 1. Build Storybook
 make storybook-build
 
-# 2. Serve the static build (keep running in background)
-python3 -m http.server 6006 -d storybook-static &
+# 2. Serve the static build as a background bash task (see "Start a Static Server")
+python3 -m http.server 6006 -d storybook-static
 
 # 3. Capture all screenshots (3800px, WebP quality 90)
 bun run scripts/capture-readme-screenshots.ts

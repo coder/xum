@@ -18,6 +18,8 @@ import {
 import type { Config } from "@/node/config";
 import type { MuxMessage } from "@/common/types/message";
 import { isWorkspaceArchived } from "@/common/utils/archive";
+import { isDurableContextResetBoundaryMarker } from "@/common/utils/messages/compactionBoundary";
+import { isModelHiddenMessage } from "@/common/utils/messages/modelHiddenMessages";
 import type { AIService } from "./aiService";
 import type { ExtensionMetadataService } from "./ExtensionMetadataService";
 import type { HistoryService } from "./historyService";
@@ -68,8 +70,25 @@ interface State {
    * `runForWorkspace`.
    *
    * null if we have never settled on a transcript for this workspace.
+   * On the first run after process start it is seeded from the hash
+   * persisted next to the sidebar status (see persistedHashChecked).
    */
   lastInputHash: string | null;
+  /**
+   * Whether we already tried seeding lastInputHash from the hash persisted
+   * alongside the sidebar status (ExtensionMetadataService). Done lazily on
+   * the first runForWorkspace per process so a server restart doesn't
+   * regenerate statuses for chats whose transcript hasn't changed.
+   */
+  persistedHashChecked: boolean;
+  /**
+   * Whether lastInputHash settled by persisting a sidebar status (true) or
+   * without one, e.g. placeholder rejection (false). Only persisted settles
+   * are invalidated when another writer clears the shared status slot;
+   * invalidating placeholder settles would retry the same
+   * placeholder-producing transcript on every tick.
+   */
+  lastInputHashPersisted: boolean;
   /**
    * Hash of the transcript the scheduler last examined, even if that input
    * did not settle into a sidebar status (for example, a pre-provider config
@@ -199,6 +218,8 @@ export class AgentStatusService {
         const id = ws.id ?? ws.name;
         if (typeof id !== "string" || id.length === 0) continue;
         if (isWorkspaceArchived(ws.archivedAt, ws.unarchivedAt)) continue;
+        // Side chats have no sidebar status UI; inherited context must not trigger paid background work.
+        if (ws.sideChatParentWorkspaceId != null) continue;
         const state = this.tracked.get(id);
         if (state?.inFlight) continue;
         const snapshot = snapshots.get(id);
@@ -269,6 +290,22 @@ export class AgentStatusService {
       // chat pivoted again.
       const state = this.ensureState(workspaceId);
 
+      // First look at this workspace since process start: seed the dedup
+      // hash persisted alongside the sidebar status so a restart doesn't
+      // regenerate every idle chat. A stale or missing persisted hash simply
+      // misses the dedup branch below and regenerates as before.
+      if (!state.persistedHashChecked) {
+        state.persistedHashChecked = true;
+        if (state.lastInputHash === null) {
+          const persisted = await this.extensionMetadata.getSidebarStatusInputHash(workspaceId);
+          if (persisted !== null) {
+            // The reader only returns hashes backed by a live status, so a
+            // seeded hash is by definition a persisted settle.
+            state.lastInputHash = persisted;
+            state.lastInputHashPersisted = true;
+          }
+        }
+      }
       const markRecencyObserved = () => {
         if (observedRecency !== null) {
           state.lastObservedRecency = observedRecency;
@@ -281,9 +318,10 @@ export class AgentStatusService {
       // Pre-provider failures and the empty/dedup-hit branches use bare
       // `markRecencyObserved()` because they should still retry on the same
       // transcript when conditions change.
-      const settleOnTranscript = () => {
+      const settleOnTranscript = (persistedStatus: boolean) => {
         markRecencyObserved();
         state.lastInputHash = dedupHash;
+        state.lastInputHashPersisted = persistedStatus;
         resetProviderFailureTracking(state);
       };
 
@@ -328,8 +366,24 @@ export class AgentStatusService {
       // the streaming bit must force a re-generation so the new liveness
       // hint actually applies.
       if (state.lastInputHash === dedupHash) {
-        markRecencyObserved();
-        return;
+        // Codex review: another writer (the todo path) can clear the shared
+        // status slot at any time, including between scheduler reads, so a
+        // dispatch-time snapshot would be stale here. Confirm at the skip
+        // decision itself: the authoritative reader returns null once the
+        // slot is cleared. Placeholder settles skip the recheck — they never
+        // persisted a status, so an empty slot is their steady state, and
+        // rechecking would retry the same placeholder transcript every tick.
+        const stillBacked =
+          !state.lastInputHashPersisted ||
+          (await this.extensionMetadata.getSidebarStatusInputHash(workspaceId)) === dedupHash;
+        if (stillBacked) {
+          markRecencyObserved();
+          return;
+        }
+        // Slot cleared (or rewritten) since we settled: drop the stale
+        // settle and regenerate now instead of leaving the sidebar blank.
+        state.lastInputHash = null;
+        state.lastInputHashPersisted = false;
       }
       if (isWaitingForProviderFailureCooldown(state, dedupHash, this.clock())) {
         // Provider-side failures are not permanently settled: after the
@@ -363,7 +417,6 @@ export class AgentStatusService {
             usage,
             usageOptions.providerMetadata,
             {
-              costsIncluded: usageOptions.costsIncluded,
               analyticsSource: "workspace_status",
               // Creation-time identity from the generator's pinned snapshot.
               metadataModel: usageOptions.metadataModel,
@@ -371,6 +424,15 @@ export class AgentStatusService {
           );
           if (recorded) {
             this.requestAnalyticsIngest?.(workspaceId);
+            // #6118: this spend bypasses the stream, so tell the open chat about it, as the
+            // bash AI proxy does; otherwise the footer total misses it until a reload.
+            this.workspaceService.emitChatEvent(workspaceId, {
+              type: "session-usage-delta",
+              workspaceId,
+              sourceWorkspaceId: workspaceId,
+              byModelDelta: { [recorded.model]: recorded.usage },
+              timestamp: Date.now(),
+            });
           }
         },
       });
@@ -432,7 +494,7 @@ export class AgentStatusService {
           workspaceId,
           message: result.data.status.message,
         });
-        settleOnTranscript();
+        settleOnTranscript(false);
         return;
       }
 
@@ -443,7 +505,9 @@ export class AgentStatusService {
         const snapshot = await this.extensionMetadata.setSidebarStatus(
           workspaceId,
           result.data.status,
-          { skipIfRecencyAdvancedSince: observedRecency }
+          // inputHash persists atomically with the status so a restarted
+          // process can skip regenerating this exact input.
+          { inputHash: dedupHash, skipIfRecencyAdvancedSince: observedRecency }
         );
         if (this.stopped) return;
         if (!snapshot) {
@@ -458,7 +522,7 @@ export class AgentStatusService {
           });
           return;
         }
-        settleOnTranscript();
+        settleOnTranscript(true);
         this.workspaceService.emitWorkspaceActivity(workspaceId, snapshot);
       } catch (error) {
         log.error("AgentStatusService: failed to persist generated status", {
@@ -480,6 +544,8 @@ export class AgentStatusService {
       state = {
         lastRanAt: 0,
         lastInputHash: null,
+        persistedHashChecked: false,
+        lastInputHashPersisted: false,
         lastSeenInputHash: null,
         lastObservedRecency: null,
         lastProviderFailureHash: null,
@@ -495,18 +561,41 @@ export class AgentStatusService {
   /**
    * Build the trailing chat transcript, capped by message count and
    * AGENT_STATUS_MAX_TRANSCRIPT_TOKENS. Includes the in-flight partial
-   * assistant message (HistoryService.readPartial) so the hash refreshes
+   * assistant message (HistoryService.readStatusPartial) so the hash refreshes
    * mid-stream — exactly when "what is the agent doing now" matters most.
    */
   private async buildTrailingTranscript(workspaceId: string): Promise<string> {
-    const result = await this.historyService.getLastMessages(
+    // Sidebar status is a provider request too, so it reads the same context the agent's model
+    // sees: getHistoryFromLatestBoundary starts at the latest compaction boundary (the summary
+    // row is kept, the conversation it replaced is not; #4421) or manual reset. It honors RAW
+    // reset floors, so a malformed reset row still discards everything before it (#4555).
+    // Only the trailing window is read: the suffix holds at least the last
+    // AGENT_STATUS_MAX_TRAILING_MESSAGES status rows of that read, so the filtered window below
+    // is unchanged without parsing the whole epoch under the history lock (#4720). Rows over
+    // 1 MiB come back status-grade (null tool payloads, empty file URLs), which the formatter
+    // never reads (#4790); so does a partial over 1 MiB (#5213).
+    //
+    // UI-only rows (plan-review snapshot/resolve/reopen records, workflow display-only rows)
+    // must not leak into the request, and a readable reset marker is structure, not
+    // conversation. The window is counted in VISIBLE rows: counting before filtering would let
+    // a burst of hidden records (resolving many threads) evict the recent conversation, and
+    // each hidden append would change the hash by evicting a visible row.
+    const history = await this.historyService.getStatusHistorySuffix(
       workspaceId,
-      AGENT_STATUS_MAX_TRAILING_MESSAGES
+      AGENT_STATUS_MAX_TRAILING_MESSAGES,
+      isStatusTranscriptRow
     );
-    if (!result.success) return "";
-
-    const committedMessages: MuxMessage[] = [...result.data];
-    const partial = await this.historyService.readPartial(workspaceId);
+    if (!history.success) {
+      log.debug("Agent status: history read failed; skipping this run", {
+        workspaceId,
+        error: history.error,
+      });
+      return "";
+    }
+    const committedMessages = history.data
+      .filter(isStatusTranscriptRow)
+      .slice(-AGENT_STATUS_MAX_TRAILING_MESSAGES);
+    const partial = await this.historyService.readStatusPartial(workspaceId);
 
     // Partial messages get an "(in progress)" role suffix so the model sees
     // they aren't finalized; committed messages render with their normal
@@ -536,6 +625,11 @@ export class AgentStatusService {
     }
     return formatted.slice(drop).join("\n\n");
   }
+}
+
+/** Status-visible rows; also the suffix read's stop predicate, so the window cannot differ. */
+function isStatusTranscriptRow(message: MuxMessage): boolean {
+  return !isDurableContextResetBoundaryMarker(message) && !isModelHiddenMessage(message);
 }
 
 function extractMessageText(message: MuxMessage): string {
@@ -618,14 +712,25 @@ function computeTranscriptHash(transcript: string): string {
 }
 
 /**
+ * Codex review: the dedup hash is persisted across restarts, so unlike the
+ * old process-local cache it is no longer naturally invalidated by upgrades.
+ * Bump this when status-generation semantics change without changing
+ * transcript bytes (prompt guidance, placeholder rules, tool-summary
+ * interpretation) so persisted hashes from older builds miss once and
+ * stale statuses regenerate predictably.
+ */
+const STATUS_GENERATION_VERSION = "G1";
+
+/**
  * Dedup key for generation: combines the transcript hash with the
  * streaming bit, because `streaming` changes the prompt's tense guidance
  * (and therefore the generated status). Same transcript + different
- * streaming → must regenerate. Cheap: hashes a 3-byte prefix + the
+ * streaming → must regenerate. Cheap: hashes a short prefix + the
  * already-computed transcript hash.
  */
 function computeDedupHash(transcriptHash: string, streaming: boolean): string {
   return createHash("sha256")
+    .update(STATUS_GENERATION_VERSION + "\n")
     .update(streaming ? "S1\n" : "S0\n")
     .update(transcriptHash)
     .digest("hex");

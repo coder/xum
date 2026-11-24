@@ -88,12 +88,15 @@ describe("Queued messages during stream completion", () => {
 
     // Create a deterministic COMPLETING window by gating the async stream-end handler
     // (AgentSession awaits CompactionHandler.handleCompletion before it can go idle).
-    type SessionInternals = {
-      compactionHandler: {
-        handleCompletion: (event: unknown) => Promise<boolean>;
+    interface SessionInternals {
+      contextController: {
+        compactionHandler: {
+          handleCompletion: (event: unknown) => Promise<boolean>;
+        };
       };
-    };
-    const compactionHandler = (session as unknown as SessionInternals).compactionHandler;
+    }
+    const compactionHandler = (session as unknown as SessionInternals).contextController
+      .compactionHandler;
 
     const enteredCompletion = createDeferred<void>();
     const releaseCompletion = createDeferred<void>();
@@ -159,12 +162,15 @@ describe("Queued messages during stream completion", () => {
 
     const session = env.services.workspaceService.getOrCreateSession(workspaceId);
 
-    type SessionInternals = {
-      compactionHandler: {
-        handleCompletion: (event: unknown) => Promise<boolean>;
+    interface SessionInternals {
+      contextController: {
+        compactionHandler: {
+          handleCompletion: (event: unknown) => Promise<boolean>;
+        };
       };
-    };
-    const compactionHandler = (session as unknown as SessionInternals).compactionHandler;
+    }
+    const compactionHandler = (session as unknown as SessionInternals).contextController
+      .compactionHandler;
 
     const enteredCompletion = createDeferred<void>();
     const releaseCompletion = createDeferred<void>();
@@ -233,12 +239,15 @@ describe("Queued messages during stream completion", () => {
     const session = env.services.workspaceService.getOrCreateSession(workspaceId);
     const aiService = env.services.aiService;
 
-    type SessionInternals = {
-      compactionHandler: {
-        handleCompletion: (event: unknown) => Promise<boolean>;
+    interface SessionInternals {
+      contextController: {
+        compactionHandler: {
+          handleCompletion: (event: unknown) => Promise<boolean>;
+        };
       };
-    };
-    const compactionHandler = (session as unknown as SessionInternals).compactionHandler;
+    }
+    const compactionHandler = (session as unknown as SessionInternals).contextController
+      .compactionHandler;
 
     const enteredCompletion = createDeferred<void>();
     const releaseCompletion = createDeferred<void>();
@@ -330,11 +339,9 @@ describe("Queued messages during stream completion", () => {
       }
 
       // Verify the queued message made it into the second stream prompt.
-      const promptResult = aiService.debugGetLastMockPrompt(workspaceId);
-      if (!promptResult.success || !promptResult.data) {
-        throw new Error("Mock prompt snapshot missing after queued stream start");
-      }
-      const promptUserMessages = promptResult.data
+      const prompt = aiService.mockAiStreamPlayer?.debugGetLastPrompt(workspaceId);
+      if (!prompt) throw new Error("Mock prompt snapshot missing after queued stream start");
+      const promptUserMessages = prompt
         .filter((message) => message.role === "user")
         .map((message) =>
           message.parts
@@ -369,12 +376,15 @@ describe("Queued messages during stream completion", () => {
 
     const session = env.services.workspaceService.getOrCreateSession(workspaceId);
 
-    type SessionInternals = {
-      compactionHandler: {
-        handleCompletion: (event: unknown) => Promise<boolean>;
+    interface SessionInternals {
+      contextController: {
+        compactionHandler: {
+          handleCompletion: (event: unknown) => Promise<boolean>;
+        };
       };
-    };
-    const compactionHandler = (session as unknown as SessionInternals).compactionHandler;
+    }
+    const compactionHandler = (session as unknown as SessionInternals).contextController
+      .compactionHandler;
 
     const enteredCompletion = createDeferred<void>();
     const releaseCompletion = createDeferred<void>();
@@ -388,9 +398,9 @@ describe("Queued messages during stream completion", () => {
         return originalHandleCompletion(event);
       });
 
-    type WorkspaceServiceInternals = {
+    interface WorkspaceServiceInternals {
       historyService: HistoryService;
-    };
+    }
     const historyService = (env.services.workspaceService as unknown as WorkspaceServiceInternals)
       .historyService;
     const truncateSpy = jest.spyOn(historyService, "truncateAfterMessage");
@@ -439,6 +449,8 @@ describe("Queued messages during stream completion", () => {
         HAIKU_MODEL,
         {
           editMessageId: firstUserMessageId,
+          // Programmatic edit with no client transcript view: opt out of the content fence.
+          unfencedEdit: true,
         }
       );
 
@@ -478,12 +490,15 @@ describe("Queued messages during stream completion", () => {
 
     const session = env.services.workspaceService.getOrCreateSession(workspaceId);
 
-    type SessionInternals = {
-      compactionHandler: {
-        handleCompletion: (event: unknown) => Promise<boolean>;
+    interface SessionInternals {
+      contextController: {
+        compactionHandler: {
+          handleCompletion: (event: unknown) => Promise<boolean>;
+        };
       };
-    };
-    const compactionHandler = (session as unknown as SessionInternals).compactionHandler;
+    }
+    const compactionHandler = (session as unknown as SessionInternals).contextController
+      .compactionHandler;
 
     const originalHandleCompletion = compactionHandler.handleCompletion.bind(compactionHandler);
     const handleCompletionSpy = jest
@@ -560,12 +575,15 @@ describe("Queued messages during stream completion", () => {
 
     // Create a deterministic COMPLETING window by gating the async stream-end handler
     // (AgentSession awaits CompactionHandler.handleCompletion before it can go idle).
-    type SessionInternals = {
-      compactionHandler: {
-        handleCompletion: (event: unknown) => Promise<boolean>;
+    interface SessionInternals {
+      contextController: {
+        compactionHandler: {
+          handleCompletion: (event: unknown) => Promise<boolean>;
+        };
       };
-    };
-    const compactionHandler = (session as unknown as SessionInternals).compactionHandler;
+    }
+    const compactionHandler = (session as unknown as SessionInternals).contextController
+      .compactionHandler;
 
     const enteredCompletion = createDeferred<void>();
     const releaseCompletion = createDeferred<void>();
@@ -579,9 +597,9 @@ describe("Queued messages during stream completion", () => {
         return originalHandleCompletion(event);
       });
 
-    type WorkspaceServiceInternals = {
+    interface WorkspaceServiceInternals {
       historyService: HistoryService;
-    };
+    }
     const historyService = (env.services.workspaceService as unknown as WorkspaceServiceInternals)
       .historyService;
 
@@ -646,21 +664,26 @@ describe("Queued messages during stream completion", () => {
       }
       expect(queuedEvent.queuedMessages).toEqual([queuedText]);
 
+      const editWaiting = createDeferred<void>();
+      const waitForIdle = session.waitForIdle.bind(session);
+      const waitForIdleSpy = jest.spyOn(session, "waitForIdle").mockImplementationOnce((signal) => {
+        editWaiting.resolve();
+        return waitForIdle(signal);
+      });
+
       const editedText = "Edited message";
       const editSendPromise = sendMessageWithModel(env, workspaceId, editedText, HAIKU_MODEL, {
         editMessageId: firstUserMessageId,
+        // Programmatic edit with no client transcript view: opt out of the content fence.
+        unfencedEdit: true,
       });
 
-      // Ensure the edit armed the defer latch before allowing stream-end cleanup to continue.
-      // Without this, the test can race stream-end and release the completion gate too early.
-      const armedDeferLatch = await waitFor(() => {
-        return Boolean(
-          (session as unknown as { deferQueuedFlushUntilAfterEdit?: boolean })
-            .deferQueuedFlushUntilAfterEdit
-        );
-      }, 5000);
-      if (!armedDeferLatch) {
-        throw new Error("Edit never armed deferQueuedFlushUntilAfterEdit latch");
+      // Join the actual edit wait before releasing completion, rather than polling
+      // a private latch that duplicates the reservation owning this operation.
+      try {
+        await editWaiting.promise;
+      } finally {
+        waitForIdleSpy.mockRestore();
       }
 
       releaseCompletion.resolve();

@@ -1,4 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it } from "bun:test";
+import { restoreDomGlobals, saveDomGlobals } from "../../../tests/ui/domGlobals";
 import { cleanup, renderHook } from "@testing-library/react";
 import { GlobalWindow } from "happy-dom";
 import type { RefObject } from "react";
@@ -48,6 +49,7 @@ function createFakeTextarea(initialScrollHeight: number): {
 
 describe("useAutoResizeTextarea", () => {
   beforeEach(() => {
+    saveDomGlobals();
     const domWindow = new GlobalWindow() as unknown as Window & typeof globalThis;
     globalThis.window = domWindow;
     globalThis.document = domWindow.document;
@@ -59,8 +61,7 @@ describe("useAutoResizeTextarea", () => {
 
   afterEach(() => {
     cleanup();
-    globalThis.window = undefined as unknown as Window & typeof globalThis;
-    globalThis.document = undefined as unknown as Document;
+    restoreDomGlobals();
   });
 
   it("skips measurement entirely while the value is empty", () => {

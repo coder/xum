@@ -1,6 +1,12 @@
 import { describe, expect, test } from "bun:test";
 import type { OpenAIReasoningMode, ThinkingLevel } from "@/common/types/thinking";
-import { resolveWorkspaceAiSettingsForAgent } from "./workspaceModeAi";
+import type { AgentAiDefaults } from "@/common/types/agentAiDefaults";
+import { getAgentBases, setAgentBases } from "./aiSelectionIntent";
+import {
+  resolveConfiguredAiDefaults,
+  resolveInheritedLayerModel,
+  resolveWorkspaceAiSettingsForAgent,
+} from "./workspaceModeAi";
 
 describe("resolveWorkspaceAiSettingsForAgent", () => {
   test("uses global agent defaults when configured", () => {
@@ -40,7 +46,7 @@ describe("resolveWorkspaceAiSettingsForAgent", () => {
   test("uses workspace-by-agent fallback when explicitly enabled", () => {
     const result = resolveWorkspaceAiSettingsForAgent({
       agentId: "exec",
-      agentAiDefaults: {},
+      agentAiDefaults: { exec: { modelString: "openai:gpt-5.3-codex", thinkingLevel: "high" } },
       workspaceByAgent: {
         exec: { model: "openai:gpt-5.2", thinkingLevel: "medium" },
       },
@@ -60,7 +66,7 @@ describe("resolveWorkspaceAiSettingsForAgent", () => {
   test("ignores workspace-by-agent fallback when disabled", () => {
     const result = resolveWorkspaceAiSettingsForAgent({
       agentId: "exec",
-      agentAiDefaults: {},
+      agentAiDefaults: { exec: { modelString: "openai:gpt-5.3-codex", thinkingLevel: "high" } },
       workspaceByAgent: {
         exec: { model: "openai:gpt-5.2", thinkingLevel: "medium" },
       },
@@ -370,6 +376,28 @@ describe("resolveWorkspaceAiSettingsForAgent", () => {
     });
   });
 
+  test.each([undefined, "", "bogus", 42, "openai:gpt-5.2"])(
+    "invalid cached fields use configured defaults (%s)",
+    (model) => {
+      const result = resolveWorkspaceAiSettingsForAgent({
+        agentId: "exec",
+        agentAiDefaults: { exec: { modelString: "openai:gpt-5.2", thinkingLevel: "high" } },
+        workspaceByAgent: {
+          exec: {
+            model: model as string,
+            thinkingLevel: "invalid" as ThinkingLevel,
+          },
+        },
+        useWorkspaceByAgentFallback: true,
+        fallbackModel: "openai:gpt-5.2-mini",
+        existingModel: "anthropic:claude-opus-4-6",
+        existingThinking: "off",
+      });
+      expect(result.resolvedModel).toBe("openai:gpt-5.2");
+      expect(result.resolvedThinking).toBe("high");
+    }
+  );
+
   test("guards non-string persisted model values", () => {
     const result = resolveWorkspaceAiSettingsForAgent({
       agentId: "exec",
@@ -384,5 +412,90 @@ describe("resolveWorkspaceAiSettingsForAgent", () => {
       resolvedThinking: "off",
       resolvedReasoningMode: "standard",
     });
+  });
+});
+
+describe("resolveConfiguredAiDefaults Auto flags", () => {
+  test("the nearest declared layer setting a dimension decides Auto", () => {
+    const agentBaseById = new Map([
+      ["reviewer", "writer"],
+      ["writer", "exec"],
+    ]);
+    const resolve = (agentAiDefaults: AgentAiDefaults) => {
+      const configured = resolveConfiguredAiDefaults("reviewer", agentAiDefaults, agentBaseById);
+      return {
+        model: configured.autoModelRouting === true,
+        thinkingLevel: configured.autoThinkingLevel === true,
+      };
+    };
+
+    // A child's concrete value blocks ancestor Auto for that dimension only.
+    expect(
+      resolve({
+        reviewer: { modelString: "openai:gpt-5.2" },
+        exec: { autoModelRouting: true, autoThinkingLevel: true },
+      })
+    ).toEqual({ model: false, thinkingLevel: true });
+
+    // Auto plus a concrete value on the same layer stays Auto.
+    expect(
+      resolve({
+        writer: { modelString: "openai:gpt-5.2", autoModelRouting: true },
+        exec: { modelString: "anthropic:claude-opus-4-6" },
+      })
+    ).toEqual({ model: true, thinkingLevel: false });
+  });
+
+  test("the implicit exec fallback contributes no Auto to undeclared agents", () => {
+    const configured = resolveConfiguredAiDefaults("custom", {
+      exec: { autoModelRouting: true, autoThinkingLevel: true },
+    });
+    expect(configured.autoModelRouting).toBeUndefined();
+    expect(configured.autoThinkingLevel).toBeUndefined();
+  });
+});
+
+describe("resolveConfiguredAiDefaults with a settings base (Cursor model: fast)", () => {
+  test("an agent's applied settings base replaces its base in the loaded agent bases", () => {
+    setAgentBases("settings-base-scope", [
+      { id: "ci-watcher", base: "exec", aiSettingsBase: "explore" },
+    ]);
+    const configured = resolveConfiguredAiDefaults(
+      "ci-watcher",
+      { explore: { modelString: "custom:m-explore" }, exec: { modelString: "custom:m-exec" } },
+      getAgentBases("settings-base-scope")
+    );
+    expect(configured.modelString).toBe("custom:m-explore");
+  });
+});
+
+describe("resolveInheritedLayerModel", () => {
+  // ci-watcher's resolved layers when a project exec.md pins a model: Explore, then Exec.
+  const layers = {
+    ancestors: [
+      { agentId: "explore", definitionAiDefaults: { cacheTtl: "5m" as const } },
+      { agentId: "exec", definitionAiDefaults: { model: "custom:exec-pin" } },
+    ],
+  };
+
+  test("ranks a layer's Settings model above a later layer's pinned model", () => {
+    expect(
+      resolveInheritedLayerModel("ci-watcher", layers, {
+        explore: { modelString: "custom:m-explore" },
+      })
+    ).toBe("custom:m-explore");
+    expect(resolveInheritedLayerModel("ci-watcher", layers, {})).toBe("custom:exec-pin");
+  });
+
+  test("leaves the agent's own Settings model out", () => {
+    expect(
+      resolveInheritedLayerModel(
+        "ci-watcher",
+        { ancestors: [] },
+        {
+          "ci-watcher": { modelString: "custom:own" },
+        }
+      )
+    ).toBeUndefined();
   });
 });

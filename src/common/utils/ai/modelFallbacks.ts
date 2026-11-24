@@ -11,24 +11,86 @@ import type { ModelFallbacks } from "@/common/config/schemas/appConfigOnDisk";
 export const MODEL_FALLBACK_CHAIN_LIMIT = 3;
 
 /**
- * Default refusal-fallback chains shipped with the app. Fable 5 safeguards
- * may refuse requests the current Opus tier can serve, so retrying on Opus is
- * the sensible out-of-the-box behavior.
+ * Refusal-fallback chains that the one-time seed passes add to EXISTING
+ * configs. Fable safeguards may refuse requests the Opus tier can serve, so
+ * retrying on Opus is the sensible out-of-the-box behavior.
+ *
+ * The target is pinned to the literal Opus 5 id rather than KNOWN_MODELS.OPUS.id:
+ * Opus 5.5 (the current `opus` alias) ships the same safeguard classifiers as
+ * Fable 5.1, so it is not a proven refusal-recovery target, and pinning keeps
+ * fresh installs and already-seeded configs on identical bytes without a
+ * chain-target migration. Revisit once Opus 5.5 refusal behavior is known.
+ * Opus 5 is also one of Anthropic's permitted server-side fallback targets for
+ * Fable 5.2 (https://platform.claude.com/docs/en/models/fable-5-2/whats-new-fable-5-2).
  *
  * Seeded into the config exactly once, guarded by
- * migrations.defaultModelFallbacksSeeded — on versions that know the flag,
- * user edits or deletions of these chains are never overridden by updates.
- * (Versions predating the flag strip it on save, so a downgrade→save→
+ * migrations.defaultModelFallbacksSeededFable52 (each earlier fable alias move
+ * has its own flag, see LEGACY_DEFAULT_MODEL_FALLBACKS) — on versions that know
+ * the flag, user edits or deletions of these chains are never overridden by
+ * updates. (Versions predating the flag strip it on save, so a downgrade→save→
  * re-upgrade round-trip re-seeds a deleted chain; bounded to re-adding this
  * benign, re-deletable default.)
  */
+export const SEEDED_MODEL_FALLBACKS: ModelFallbacks = {
+  [KNOWN_MODELS.FABLE.id]: { models: ["anthropic:claude-opus-5"] },
+};
+
+/**
+ * Default refusal-fallback chains for fresh installs: the seeded chains plus
+ * chains added after the seed flags shipped. Those later chains reach fresh
+ * installs only; existing configs get no migration and no new flag, and users
+ * add them by hand (docs/config/models.mdx). Maintainer decision on #5087.
+ * (The fable chain is not such a later chain: it keeps the existing `fable`
+ * alias fallback alive across alias moves, so it is seeded.)
+ *
+ * Sonnet 5.5 → Sonnet 5 mirrors Anthropic's own server-side fallback for
+ * Sonnet 5.5's cyber safeguards. Both ids are pinned literals, not
+ * KNOWN_MODELS.SONNET: a later `sonnet` alias move must not retarget the chain.
+ */
 export const DEFAULT_MODEL_FALLBACKS: ModelFallbacks = {
-  [KNOWN_MODELS.FABLE.id]: { models: [KNOWN_MODELS.OPUS.id] },
+  ...SEEDED_MODEL_FALLBACKS,
+  "anthropic:claude-sonnet-5-5": { models: ["anthropic:claude-sonnet-5"] },
+};
+
+/**
+ * Default chain of the Fable 5 era, seeded by the original seed pass
+ * (migrations.defaultModelFallbacksSeeded). A build whose FABLE is Fable 5
+ * trusts that flag for this key, so every pass that claims the flag also
+ * carries this chain and a downgrade keeps refusal fallback.
+ */
+export const FABLE_5_DEFAULT_MODEL_FALLBACKS: ModelFallbacks = {
+  "anthropic:claude-fable-5": { models: ["anthropic:claude-opus-5"] },
+};
+
+/**
+ * Default chain of the Fable 5.1 era, seeded by the
+ * migrations.defaultModelFallbacksSeededFable51 pass. Same downgrade reasoning
+ * as FABLE_5_DEFAULT_MODEL_FALLBACKS, for builds whose FABLE is Fable 5.1.
+ */
+export const FABLE_5_1_DEFAULT_MODEL_FALLBACKS: ModelFallbacks = {
+  "anthropic:claude-fable-5-1": { models: ["anthropic:claude-opus-5"] },
+};
+
+/**
+ * Legacy default chains for earlier fable ids, seeded alongside
+ * DEFAULT_MODEL_FALLBACKS on fresh installs. Fresh installs mark every seed
+ * flag, so a downgrade to an older build would skip its own seed; carrying
+ * these chains keeps the old build's refusal fallback intact.
+ */
+export const LEGACY_DEFAULT_MODEL_FALLBACKS: ModelFallbacks = {
+  ...FABLE_5_DEFAULT_MODEL_FALLBACKS,
+  ...FABLE_5_1_DEFAULT_MODEL_FALLBACKS,
 };
 // Deep-freeze: entries are spread by reference into live configs (fresh-install
 // defaults, seed merge). Accidental in-place mutation must crash fast instead
 // of silently corrupting the process-wide default.
-for (const entry of Object.values(Object.freeze(DEFAULT_MODEL_FALLBACKS))) {
+for (const entry of [
+  ...Object.values(Object.freeze(SEEDED_MODEL_FALLBACKS)),
+  ...Object.values(Object.freeze(DEFAULT_MODEL_FALLBACKS)),
+  ...Object.values(Object.freeze(FABLE_5_DEFAULT_MODEL_FALLBACKS)),
+  ...Object.values(Object.freeze(FABLE_5_1_DEFAULT_MODEL_FALLBACKS)),
+  ...Object.values(Object.freeze(LEGACY_DEFAULT_MODEL_FALLBACKS)),
+]) {
   Object.freeze(entry);
   Object.freeze(entry.models);
 }

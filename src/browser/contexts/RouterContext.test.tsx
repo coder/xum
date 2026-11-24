@@ -1,15 +1,25 @@
 import { act, cleanup, render, waitFor } from "@testing-library/react";
-import { afterEach, beforeEach, describe, expect, test } from "bun:test";
+import { beforeEach, afterEach, describe, expect, test } from "bun:test";
+import { restoreDomGlobals, saveDomGlobals } from "../../../tests/ui/domGlobals";
 import { GlobalWindow } from "happy-dom";
 import { StrictMode } from "react";
-import { useLocation } from "react-router-dom";
+import { useLocation, useNavigate, type NavigateFunction } from "react-router-dom";
 import type { WorkspaceSelection } from "@/browser/components/AgentListItem/AgentListItem";
+import { getAppConfigStore } from "@/browser/stores/AppConfigStore";
 import {
   LAST_VISITED_ROUTE_KEY,
-  LAUNCH_BEHAVIOR_KEY,
   SELECTED_WORKSPACE_KEY,
+  type LaunchBehavior,
 } from "@/common/constants/storage";
 import { RouterProvider, useRouter, type RouterContext } from "./RouterContext";
+
+function setLaunchBehavior(launchBehavior: LaunchBehavior) {
+  getAppConfigStore().updateOptimistically({ userPreferences: { navigation: { launchBehavior } } });
+}
+
+afterEach(() => {
+  getAppConfigStore().updateOptimistically({ userPreferences: undefined });
+});
 
 function createMatchMedia(isStandalone = false): typeof window.matchMedia {
   return ((query: string) =>
@@ -55,91 +65,278 @@ function PathnameObserver() {
   return <div data-testid="pathname">{location.pathname}</div>;
 }
 
-describe("navigateFromSettings", () => {
-  beforeEach(() => {
-    installWindow("https://mux.example.com/workspace/test");
-  });
+describe("modal background location", () => {
+  let latestRouter: RouterContext | null = null;
+  let latestNavigate: NavigateFunction | null = null;
 
-  afterEach(() => {
-    cleanup();
-    globalThis.window = undefined as unknown as Window & typeof globalThis;
-    globalThis.document = undefined as unknown as Document;
-  });
+  function Observer() {
+    const router = useRouter();
+    const location = useLocation();
+    latestRouter = router;
+    latestNavigate = useNavigate();
 
-  test("restores the previous location.state when leaving settings", async () => {
-    let latestRouter: RouterContext | null = null;
+    return (
+      <div>
+        <div data-testid="pathname">{location.pathname}</div>
+        <div data-testid="search">{location.search}</div>
+        <div data-testid="settingsSection">{router.currentSettingsSection ?? ""}</div>
+        <div data-testid="workspaceId">{router.currentWorkspaceId ?? ""}</div>
+        <div data-testid="projectPathFromState">{router.currentProjectPathFromState ?? ""}</div>
+        <div data-testid="draftId">{router.pendingDraftId ?? ""}</div>
+        <div data-testid="analyticsOpen">{String(router.isAnalyticsOpen)}</div>
+      </div>
+    );
+  }
 
-    function Observer() {
-      const router = useRouter();
-      const location = useLocation();
-      latestRouter = router;
-
-      return (
-        <div>
-          <div data-testid="pathname">{location.pathname}</div>
-          <div data-testid="projectPathFromState">{router.currentProjectPathFromState ?? ""}</div>
-        </div>
-      );
-    }
-
+  async function renderRouter() {
     const view = render(
       <RouterProvider>
         <Observer />
       </RouterProvider>
     );
-
     await waitFor(() => {
       expect(latestRouter).not.toBeNull();
     });
+    return view;
+  }
+
+  beforeEach(saveDomGlobals);
+  afterEach(() => {
+    cleanup();
+    latestRouter = null;
+    latestNavigate = null;
+    restoreDomGlobals();
+  });
+
+  test("keeps the workspace behind settings across section switches and redirects", async () => {
+    installWindow("https://mux.example.com/workspace/test");
+    const view = await renderRouter();
+
+    act(() => latestRouter!.navigateToSettings("general"));
+    await waitFor(() => {
+      expect(view.getByTestId("settingsSection").textContent).toBe("general");
+    });
+    expect(view.getByTestId("workspaceId").textContent).toBe("test");
+
+    act(() => latestRouter!.navigateToSettings("models"));
+    await waitFor(() => {
+      expect(view.getByTestId("settingsSection").textContent).toBe("models");
+    });
+    act(() => latestRouter!.navigateToSettings("experiments", { replace: true }));
+    await waitFor(() => {
+      expect(view.getByTestId("settingsSection").textContent).toBe("experiments");
+    });
+    expect(view.getByTestId("workspaceId").textContent).toBe("test");
+
+    act(() => latestRouter!.navigateFromSettings());
+    await waitFor(() => {
+      expect(view.getByTestId("pathname").textContent).toBe("/workspace/test");
+    });
+    expect(view.getByTestId("settingsSection").textContent).toBe("");
+  });
+
+  test("keeps the project draft and its location.state behind settings and restores them", async () => {
+    installWindow("https://mux.example.com/workspace/test");
+    const view = await renderRouter();
 
     // Use a project path that cannot be recovered from the URL alone, so losing
     // location.state would break the /project view.
     const projectPath = "/tmp/unconfigured-project";
-
-    act(() => {
-      latestRouter!.navigateToProject(projectPath);
-    });
-
+    act(() => latestRouter!.navigateToProject(projectPath, "draft-1"));
     await waitFor(() => {
       expect(view.getByTestId("pathname").textContent).toBe("/project");
-      expect(view.getByTestId("projectPathFromState").textContent).toBe(projectPath);
     });
 
-    // Allow effects to flush so RouterContext has a chance to snapshot the last
-    // non-settings location before we navigate into settings.
-    await act(async () => {
-      await Promise.resolve();
-    });
-
-    act(() => {
-      latestRouter!.navigateToSettings("general");
-    });
-
+    act(() => latestRouter!.navigateToSettings("providers"));
     await waitFor(() => {
-      expect(view.getByTestId("pathname").textContent).toBe("/settings/general");
+      expect(view.getByTestId("pathname").textContent).toBe("/settings/providers");
     });
+    expect(view.getByTestId("projectPathFromState").textContent).toBe(projectPath);
+    expect(view.getByTestId("draftId").textContent).toBe("draft-1");
 
-    act(() => {
-      latestRouter!.navigateFromSettings();
-    });
-
+    act(() => latestRouter!.navigateFromSettings());
     await waitFor(() => {
       expect(view.getByTestId("pathname").textContent).toBe("/project");
-      expect(view.getByTestId("projectPathFromState").textContent).toBe(projectPath);
+    });
+    expect(view.getByTestId("search").textContent).toContain("draft=draft-1");
+    expect(view.getByTestId("projectPathFromState").textContent).toBe(projectPath);
+  });
+
+  test("treats cold settings links and malformed background state as the root page", async () => {
+    installWindow("https://mux.example.com/settings/providers");
+    const view = await renderRouter();
+
+    expect(view.getByTestId("settingsSection").textContent).toBe("providers");
+    expect(view.getByTestId("workspaceId").textContent).toBe("");
+    act(() => latestRouter!.navigateFromSettings());
+    await waitFor(() => {
+      expect(view.getByTestId("pathname").textContent).toBe("/");
+    });
+
+    act(() => {
+      void latestNavigate!("/settings/general", {
+        state: { settingsBackground: { pathname: 42, search: "?x", state: null } },
+      });
+    });
+    await waitFor(() => {
+      expect(view.getByTestId("settingsSection").textContent).toBe("general");
+    });
+    expect(view.getByTestId("workspaceId").textContent).toBe("");
+    act(() => latestRouter!.navigateFromSettings());
+    await waitFor(() => {
+      expect(view.getByTestId("pathname").textContent).toBe("/");
+    });
+  });
+
+  test("keeps the workspace behind analytics; closing or going back returns to it", async () => {
+    installWindow("https://mux.example.com/workspace/test");
+    const view = await renderRouter();
+
+    act(() => latestRouter!.navigateToAnalytics());
+    await waitFor(() => {
+      expect(view.getByTestId("pathname").textContent).toBe("/analytics");
+    });
+    expect(view.getByTestId("analyticsOpen").textContent).toBe("true");
+    expect(view.getByTestId("workspaceId").textContent).toBe("test");
+
+    act(() => latestRouter!.navigateFromAnalytics());
+    await waitFor(() => {
+      expect(view.getByTestId("pathname").textContent).toBe("/workspace/test");
+    });
+    expect(view.getByTestId("analyticsOpen").textContent).toBe("false");
+
+    act(() => latestRouter!.navigateToAnalytics());
+    await waitFor(() => {
+      expect(view.getByTestId("pathname").textContent).toBe("/analytics");
+    });
+    act(() => {
+      void latestNavigate!(-1);
+    });
+    await waitFor(() => {
+      expect(view.getByTestId("pathname").textContent).toBe("/workspace/test");
+    });
+    expect(view.getByTestId("analyticsOpen").textContent).toBe("false");
+  });
+
+  test("opens dispatched before a re-render push a single analytics history entry", async () => {
+    installWindow("https://mux.example.com/workspace/test");
+    const view = await renderRouter();
+
+    // Keydowns fired in one task all see the pre-open location before React re-renders.
+    act(() => {
+      const router = latestRouter!;
+      router.navigateToAnalytics();
+      router.navigateToAnalytics();
+      router.navigateToAnalytics();
+    });
+    await waitFor(() => {
+      expect(view.getByTestId("pathname").textContent).toBe("/analytics");
+    });
+
+    act(() => {
+      void latestNavigate!(-1);
+    });
+    await waitFor(() => {
+      expect(view.getByTestId("pathname").textContent).toBe("/workspace/test");
+    });
+
+    // Back to the same history entry must still be able to open analytics again.
+    act(() => latestRouter!.navigateToAnalytics());
+    await waitFor(() => {
+      expect(view.getByTestId("pathname").textContent).toBe("/analytics");
+    });
+  });
+
+  test("keeps the project draft and its location.state behind analytics and restores them", async () => {
+    installWindow("https://mux.example.com/workspace/test");
+    const view = await renderRouter();
+
+    const projectPath = "/tmp/unconfigured-project";
+    act(() => latestRouter!.navigateToProject(projectPath, "draft-1"));
+    await waitFor(() => {
+      expect(view.getByTestId("pathname").textContent).toBe("/project");
+    });
+
+    act(() => latestRouter!.navigateToAnalytics());
+    await waitFor(() => {
+      expect(view.getByTestId("pathname").textContent).toBe("/analytics");
+    });
+    expect(view.getByTestId("projectPathFromState").textContent).toBe(projectPath);
+    expect(view.getByTestId("draftId").textContent).toBe("draft-1");
+
+    act(() => latestRouter!.navigateFromAnalytics());
+    await waitFor(() => {
+      expect(view.getByTestId("pathname").textContent).toBe("/project");
+    });
+    expect(view.getByTestId("search").textContent).toContain("draft=draft-1");
+    expect(view.getByTestId("projectPathFromState").textContent).toBe(projectPath);
+  });
+
+  test("treats cold analytics links and malformed background state as the root page", async () => {
+    installWindow("https://mux.example.com/analytics");
+    const view = await renderRouter();
+
+    expect(view.getByTestId("analyticsOpen").textContent).toBe("true");
+    expect(view.getByTestId("workspaceId").textContent).toBe("");
+    act(() => latestRouter!.navigateFromAnalytics());
+    await waitFor(() => {
+      expect(view.getByTestId("pathname").textContent).toBe("/");
+    });
+
+    // A background pointing at a modal route must not nest modals.
+    act(() => {
+      void latestNavigate!("/analytics", {
+        state: { analyticsBackground: { pathname: "/settings/general", search: "", state: null } },
+      });
+    });
+    await waitFor(() => {
+      expect(view.getByTestId("analyticsOpen").textContent).toBe("true");
+    });
+    expect(view.getByTestId("settingsSection").textContent).toBe("");
+    act(() => latestRouter!.navigateFromAnalytics());
+    await waitFor(() => {
+      expect(view.getByTestId("pathname").textContent).toBe("/");
+    });
+  });
+
+  test("settings opened over analytics returns to analytics over the same page", async () => {
+    installWindow("https://mux.example.com/workspace/test");
+    const view = await renderRouter();
+
+    act(() => latestRouter!.navigateToAnalytics());
+    await waitFor(() => {
+      expect(view.getByTestId("pathname").textContent).toBe("/analytics");
+    });
+    act(() => latestRouter!.navigateToSettings("models"));
+    await waitFor(() => {
+      expect(view.getByTestId("settingsSection").textContent).toBe("models");
+    });
+    expect(view.getByTestId("analyticsOpen").textContent).toBe("true");
+    expect(view.getByTestId("workspaceId").textContent).toBe("test");
+
+    act(() => latestRouter!.navigateFromSettings());
+    await waitFor(() => {
+      expect(view.getByTestId("pathname").textContent).toBe("/analytics");
+    });
+    expect(view.getByTestId("workspaceId").textContent).toBe("test");
+
+    act(() => latestRouter!.navigateFromAnalytics());
+    await waitFor(() => {
+      expect(view.getByTestId("pathname").textContent).toBe("/workspace/test");
     });
   });
 });
 
 describe("browser startup launch behavior", () => {
+  beforeEach(saveDomGlobals);
   afterEach(() => {
     cleanup();
-    globalThis.window = undefined as unknown as Window & typeof globalThis;
-    globalThis.document = undefined as unknown as Document;
+    restoreDomGlobals();
   });
 
   test("dashboard mode preserves a direct /workspace/:id URL", async () => {
     installWindow("https://mux.example.com/workspace/direct-123");
-    window.localStorage.setItem(LAUNCH_BEHAVIOR_KEY, JSON.stringify("dashboard"));
+    setLaunchBehavior("dashboard");
 
     const view = render(
       <RouterProvider>
@@ -154,7 +351,7 @@ describe("browser startup launch behavior", () => {
 
   test("same-tab browser reload preserves a /workspace/:id URL in dashboard mode", async () => {
     installWindow("https://mux.example.com/workspace/reload-me", { navigationType: "reload" });
-    window.localStorage.setItem(LAUNCH_BEHAVIOR_KEY, JSON.stringify("dashboard"));
+    setLaunchBehavior("dashboard");
 
     const view = render(
       <RouterProvider>
@@ -169,7 +366,7 @@ describe("browser startup launch behavior", () => {
 
   test("last-workspace mode preserves a /workspace/:id URL", async () => {
     installWindow("https://mux.example.com/workspace/stale-123");
-    window.localStorage.setItem(LAUNCH_BEHAVIOR_KEY, JSON.stringify("last-workspace"));
+    setLaunchBehavior("last-workspace");
 
     const view = render(
       <RouterProvider>
@@ -184,7 +381,7 @@ describe("browser startup launch behavior", () => {
 
   test("dashboard mode still preserves non-workspace routes", async () => {
     installWindow("https://mux.example.com/settings/general");
-    window.localStorage.setItem(LAUNCH_BEHAVIOR_KEY, JSON.stringify("dashboard"));
+    setLaunchBehavior("dashboard");
 
     const view = render(
       <RouterProvider>
@@ -212,11 +409,164 @@ describe("browser startup launch behavior", () => {
   });
 });
 
-describe("desktop startup route restoration", () => {
+describe("browser tab history (#5699)", () => {
+  let latestRouter: RouterContext | null = null;
+
+  function Observer() {
+    latestRouter = useRouter();
+    return <PathnameObserver />;
+  }
+
+  async function renderRouter() {
+    const view = render(
+      <RouterProvider>
+        <Observer />
+      </RouterProvider>
+    );
+    await waitFor(() => {
+      expect(latestRouter).not.toBeNull();
+    });
+    return view;
+  }
+
+  async function expectPathname(view: Awaited<ReturnType<typeof renderRouter>>, pathname: string) {
+    await waitFor(() => {
+      expect(view.getByTestId("pathname").textContent).toBe(pathname);
+    });
+  }
+
+  beforeEach(saveDomGlobals);
   afterEach(() => {
     cleanup();
-    globalThis.window = undefined as unknown as Window & typeof globalThis;
-    globalThis.document = undefined as unknown as Document;
+    latestRouter = null;
+    restoreDomGlobals();
+  });
+
+  test("the browser's Back and Forward buttons move between app pages", async () => {
+    installWindow("https://mux.example.com/workspace/a");
+    const view = await renderRouter();
+
+    act(() => latestRouter!.navigateToWorkspace("b"));
+    await expectPathname(view, "/workspace/b");
+    expect(window.location.pathname).toBe("/workspace/b");
+
+    act(() => window.history.back());
+    await expectPathname(view, "/workspace/a");
+    expect(window.location.pathname).toBe("/workspace/a");
+
+    act(() => window.history.forward());
+    await expectPathname(view, "/workspace/b");
+  });
+
+  test("the browser's Back button closes settings and returns to the page under it", async () => {
+    installWindow("https://mux.example.com/workspace/a");
+    const view = await renderRouter();
+
+    act(() => latestRouter!.navigateToSettings("providers"));
+    await expectPathname(view, "/settings/providers");
+    expect(latestRouter!.currentWorkspaceId).toBe("a");
+
+    act(() => window.history.back());
+    await expectPathname(view, "/workspace/a");
+    expect(latestRouter!.currentSettingsSection).toBeNull();
+  });
+
+  test("closing settings or analytics leaves no modal entry for the browser's Back to reopen", async () => {
+    installWindow("https://mux.example.com/workspace/a");
+    const view = await renderRouter();
+    act(() => latestRouter!.navigateToWorkspace("b"));
+    await expectPathname(view, "/workspace/b");
+
+    // Section switches add entries inside settings; closing still returns to the page under it.
+    act(() => latestRouter!.navigateToSettings("general"));
+    await expectPathname(view, "/settings/general");
+    act(() => latestRouter!.navigateToSettings("models"));
+    await expectPathname(view, "/settings/models");
+    act(() => latestRouter!.navigateFromSettings());
+    await expectPathname(view, "/workspace/b");
+
+    act(() => latestRouter!.navigateToAnalytics());
+    await expectPathname(view, "/analytics");
+    act(() => latestRouter!.navigateToSettings("general"));
+    await expectPathname(view, "/settings/general");
+    act(() => latestRouter!.navigateFromAnalytics());
+    await expectPathname(view, "/workspace/b");
+
+    act(() => window.history.back());
+    await expectPathname(view, "/workspace/a");
+  });
+
+  test("in-app back on the first app page stays in the app", async () => {
+    installWindow("https://mux.example.com/workspace/a");
+    const view = await renderRouter();
+    let leftApp = false;
+    window.history.go = () => {
+      leftApp = true;
+    };
+
+    act(() => latestRouter!.navigateBack());
+    await expectPathname(view, "/workspace/a");
+    expect(leftApp).toBe(false);
+  });
+
+  test("in-app forward moves through app pages but never past the newest app page", async () => {
+    installWindow("https://mux.example.com/workspace/a");
+    const view = await renderRouter();
+    act(() => latestRouter!.navigateToWorkspace("b"));
+    await expectPathname(view, "/workspace/b");
+    act(() => latestRouter!.navigateBack());
+    await expectPathname(view, "/workspace/a");
+
+    act(() => latestRouter!.navigateForward());
+    await expectPathname(view, "/workspace/b");
+
+    // The newest app page: the tab's next entry (if any) is not Xum, for example a site the user
+    // opened in this tab and came back from.
+    let leftApp = false;
+    window.history.go = () => {
+      leftApp = true;
+    };
+    act(() => latestRouter!.navigateForward());
+    expect(leftApp).toBe(false);
+  });
+
+  test("a startup redirect replaces the tab's entry instead of adding one", async () => {
+    installWindow("https://mux.example.com/");
+    setLaunchBehavior("last-workspace");
+    window.localStorage.setItem(
+      SELECTED_WORKSPACE_KEY,
+      JSON.stringify({ workspaceId: "saved" } satisfies Pick<WorkspaceSelection, "workspaceId">)
+    );
+    const lengthBefore = window.history.length;
+
+    const view = await renderRouter();
+    await expectPathname(view, "/workspace/saved");
+    expect(window.location.pathname).toBe("/workspace/saved");
+    expect(window.history.length).toBe(lengthBefore);
+  });
+
+  test("Electron served over http keeps navigation in memory", async () => {
+    // The desktop dev build loads the renderer from the Vite server, so the protocol alone does
+    // not identify a browser tab; window.api does.
+    installWindow("http://localhost:5173/workspace/a");
+    (window as unknown as { api: object }).api = {};
+    const view = await renderRouter();
+    const lengthBefore = window.history.length;
+
+    act(() => latestRouter!.navigateToWorkspace("b"));
+    await expectPathname(view, "/workspace/b");
+    expect(window.history.length).toBe(lengthBefore);
+
+    act(() => latestRouter!.navigateBack());
+    await expectPathname(view, "/workspace/a");
+  });
+});
+
+describe("desktop startup route restoration", () => {
+  beforeEach(saveDomGlobals);
+  afterEach(() => {
+    cleanup();
+    restoreDomGlobals();
   });
 
   test("restores the last visited route when Electron boots from file:///index.html", async () => {
@@ -245,7 +595,7 @@ describe("desktop startup route restoration", () => {
     };
 
     window.localStorage.setItem(LAST_VISITED_ROUTE_KEY, JSON.stringify("/"));
-    window.localStorage.setItem(LAUNCH_BEHAVIOR_KEY, JSON.stringify("last-workspace"));
+    setLaunchBehavior("last-workspace");
     window.localStorage.setItem(SELECTED_WORKSPACE_KEY, JSON.stringify(savedWorkspace));
 
     const view = render(
@@ -394,10 +744,10 @@ describe("desktop startup route restoration", () => {
 });
 
 describe("standalone PWA startup", () => {
+  beforeEach(saveDomGlobals);
   afterEach(() => {
     cleanup();
-    globalThis.window = undefined as unknown as Window & typeof globalThis;
-    globalThis.document = undefined as unknown as Document;
+    restoreDomGlobals();
   });
 
   test("shows the dashboard on cold launch even if the launch URL points at a workspace", async () => {
@@ -425,7 +775,7 @@ describe("standalone PWA startup", () => {
       projectName: "Test Project",
       namedWorkspacePath: "/tmp/project/workspace-123",
     };
-    window.localStorage.setItem(LAUNCH_BEHAVIOR_KEY, JSON.stringify("last-workspace"));
+    setLaunchBehavior("last-workspace");
     window.localStorage.setItem(SELECTED_WORKSPACE_KEY, JSON.stringify(savedWorkspace));
 
     const view = render(
@@ -468,5 +818,46 @@ describe("standalone PWA startup", () => {
     await waitFor(() => {
       expect(view.getByTestId("pathname").textContent).toBe("/workspace/reload-me");
     });
+  });
+});
+
+describe("embedded router (VS Code webview)", () => {
+  beforeEach(saveDomGlobals);
+  afterEach(() => {
+    cleanup();
+    restoreDomGlobals();
+  });
+
+  test("starts at / and keeps navigation in memory without touching the host URL or persisted route", async () => {
+    // A webview document URL is not an app route; the embedded host must neither route from it nor
+    // rewrite it (replaceState) or persist a route for a desktop relaunch.
+    installWindow("https://webview.example/index.html?id=panel-1");
+    let latestRouter: RouterContext | null = null;
+
+    function Observer() {
+      latestRouter = useRouter();
+      return <PathnameObserver />;
+    }
+
+    const view = render(
+      <RouterProvider embedded>
+        <Observer />
+      </RouterProvider>
+    );
+
+    await waitFor(() => {
+      expect(view.getByTestId("pathname").textContent).toBe("/");
+    });
+
+    act(() => {
+      latestRouter!.navigateToSettings("providers");
+    });
+
+    await waitFor(() => {
+      expect(view.getByTestId("pathname").textContent).toBe("/settings/providers");
+    });
+    expect(latestRouter!.currentSettingsSection).toBe("providers");
+    expect(window.location.pathname + window.location.search).toBe("/index.html?id=panel-1");
+    expect(window.localStorage.getItem(LAST_VISITED_ROUTE_KEY)).toBeNull();
   });
 });

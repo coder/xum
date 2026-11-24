@@ -26,9 +26,11 @@ import { cn } from "@/common/lib/utils";
 import { Button } from "../Button/Button";
 import { Tooltip, TooltipTrigger, TooltipContent } from "../Tooltip/Tooltip";
 import { ChatInputDecoration } from "@/browser/components/ChatPane/ChatInputDecoration";
+import { useChatActivityPanel } from "@/browser/components/ChatPane/chatActivityPanels";
 import type { Review } from "@/common/types/review";
 import { useReviews } from "@/browser/hooks/useReviews";
 import { formatRelativeTime } from "@/browser/utils/ui/dateTime";
+import { formatReviewLocationLabel } from "@/browser/utils/review/lineRange";
 import { DiffRenderer } from "@/browser/features/Shared/DiffRenderer";
 import { matchesKeybind, formatKeybind, KEYBINDS } from "@/browser/utils/ui/keybinds";
 
@@ -53,7 +55,12 @@ class BannerErrorBoundary extends Component<
   render() {
     if (this.state.hasError) {
       return (
-        <div className="border-border bg-surface-primary flex items-center gap-2 border-t px-3 py-1.5 text-xs">
+        // Sized and marked like a chip: it stands in for the reviews chip in the live line, which
+        // hides when no chip renders and would otherwise hide this way out too.
+        <div
+          data-activity-chip=""
+          className="border-border-light order-2 flex h-6 shrink-0 items-center gap-1.5 rounded-md border px-2 text-xs"
+        >
           <AlertTriangle className="text-warning size-3.5" />
           <span className="text-muted">Reviews data corrupted</span>
           <Button
@@ -185,7 +192,7 @@ const ReviewItem: React.FC<ReviewItemProps> = ({
             <Button
               variant="ghost"
               size="icon"
-              className={cn("size-5 shrink-0 [&_svg]:size-3", isChecked && "text-success")}
+              className={cn("size-5 shrink-0 [&_svg]:size-3", isChecked && "text-success-text")}
               onClick={isChecked ? onUncheck : onCheck}
             >
               {isChecked ? <Undo2 /> : <Check />}
@@ -218,7 +225,9 @@ const ReviewItem: React.FC<ReviewItemProps> = ({
           className="flex min-w-0 flex-1 items-center gap-2 text-left"
         >
           <span className="shrink-0 truncate font-mono text-[var(--color-review-accent)]">
-            {review.data.filePath}:{review.data.lineRange}
+            {review.data.artifact != null
+              ? formatReviewLocationLabel(review.data)
+              : `${review.data.filePath}:${review.data.lineRange}`}
           </span>
           {review.data.userNote && (
             <span className="text-secondary min-w-0 flex-1 truncate italic">
@@ -325,9 +334,51 @@ interface ReviewsBannerInnerProps {
   workspaceId: string;
 }
 
+function formatReviewsChipLabel(pendingCount: number, checkedCount: number): string {
+  const pending = `${pendingCount} pending review${pendingCount === 1 ? "" : "s"}`;
+  return checkedCount > 0 ? `${pending}, ${checkedCount} completed` : pending;
+}
+
+/** "2 pending · 3 done", the reviews panel heading's detail. */
+function formatReviewsPanelMeta(pendingCount: number, checkedCount: number): string {
+  const parts: string[] = [];
+  if (pendingCount > 0) parts.push(`${pendingCount} pending`);
+  if (checkedCount > 0) parts.push(`${checkedCount} done`);
+  return parts.length > 0 ? parts.join(" · ") : "No pending reviews";
+}
+
+/** The live line's reviews chip: pending reviews in the review accent, else the completed count. */
+function ReviewsChip(props: { pendingCount: number; checkedCount: number }) {
+  return props.pendingCount > 0 ? (
+    <>
+      <MessageSquare className="size-3.5 shrink-0 text-[var(--color-review-accent)]" />
+      <span className="counter-nums">{props.pendingCount}</span>
+    </>
+  ) : (
+    <>
+      <MessageSquare className="size-3.5 shrink-0" />
+      <Check className="size-3 shrink-0" />
+      <span className="counter-nums">{props.checkedCount}</span>
+    </>
+  );
+}
+
+/** The reviews tab in the phone activity sheet, counting what the chip counts. */
+function ReviewsTab(props: { pendingCount: number; checkedCount: number }) {
+  return (
+    <>
+      <MessageSquare className="size-4 shrink-0" />
+      <span>Reviews</span>
+      <span className="counter-nums text-muted">
+        {props.pendingCount > 0 ? props.pendingCount : props.checkedCount}
+      </span>
+    </>
+  );
+}
+
 const ReviewsBannerInner: React.FC<ReviewsBannerInnerProps> = ({ workspaceId }) => {
   const reviewsHook = useReviews(workspaceId);
-  const [isExpanded, setIsExpanded] = useState(false);
+  const [isExpanded, setIsExpanded] = useChatActivityPanel("reviews");
   const [showAllCompleted, setShowAllCompleted] = useState(false);
 
   const INITIAL_COMPLETED_COUNT = 3;
@@ -351,9 +402,7 @@ const ReviewsBannerInner: React.FC<ReviewsBannerInnerProps> = ({ workspaceId }) 
 
   const hiddenCompletedCount = completedList.length - INITIAL_COMPLETED_COUNT;
 
-  const handleToggle = useCallback(() => {
-    setIsExpanded((prev) => !prev);
-  }, []);
+  const handleToggle = () => setIsExpanded((prev) => !prev);
 
   const handleSendToChat = useCallback(
     (reviewId: string) => {
@@ -369,8 +418,9 @@ const ReviewsBannerInner: React.FC<ReviewsBannerInnerProps> = ({ workspaceId }) 
     [reviewsHook]
   );
 
-  // Don't show anything if no reviews
-  if (reviewsHook.reviews.length === 0) {
+  // Nothing to list: attached reviews show in the composer, not here, so a banner holding only
+  // those read "No pending reviews" (#5675).
+  if (pendingList.length === 0 && completedList.length === 0) {
     return null;
   }
 
@@ -379,6 +429,23 @@ const ReviewsBannerInner: React.FC<ReviewsBannerInnerProps> = ({ workspaceId }) 
       expanded={isExpanded}
       onToggle={handleToggle}
       contentClassName="max-h-80 space-y-3 overflow-y-auto py-2"
+      activityId="reviews"
+      chipLabel={formatReviewsChipLabel(reviewsHook.pendingCount, reviewsHook.checkedCount)}
+      chip={
+        <ReviewsChip
+          pendingCount={reviewsHook.pendingCount}
+          checkedCount={reviewsHook.checkedCount}
+        />
+      }
+      panelTitle="Reviews"
+      panelKeybind={KEYBINDS.OPEN_REVIEWS_PANEL}
+      panelMeta={formatReviewsPanelMeta(reviewsHook.pendingCount, reviewsHook.checkedCount)}
+      tab={
+        <ReviewsTab
+          pendingCount={reviewsHook.pendingCount}
+          checkedCount={reviewsHook.checkedCount}
+        />
+      }
       summary={
         <>
           <MessageSquare
@@ -474,11 +541,6 @@ const ReviewsBannerInner: React.FC<ReviewsBannerInnerProps> = ({ workspaceId }) 
                 </button>
               )}
             </div>
-          )}
-
-          {/* Empty state */}
-          {pendingList.length === 0 && completedList.length === 0 && (
-            <div className="text-muted py-3 text-center text-xs">No reviews yet</div>
           )}
         </>
       )}

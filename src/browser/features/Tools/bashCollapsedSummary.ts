@@ -49,8 +49,10 @@ export function buildBashCollapsedSummary(
     return { kind: "command", command };
   }
 
+  // typeof guard: kernel-mode nested reloads reconstruct partial results
+  // without wall_duration_ms; skip the label instead of rendering "for —".
   const durationLabel =
-    options.result && !options.isBackground
+    typeof options.result?.wall_duration_ms === "number" && !options.isBackground
       ? formatDuration(options.result.wall_duration_ms, "decimal")
       : undefined;
 

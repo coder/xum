@@ -5,8 +5,10 @@
  * and cycle logging so the pure layer stays side-effect free.
  */
 
+import type { ServiceTier } from "@/common/config/schemas/providersConfig";
 import type { ProvidersConfigMap } from "@/common/orpc/types";
 import type { AgentAiDefaults } from "@/common/types/agentAiDefaults";
+import type { AgentDefinitionScope } from "@/common/types/agentDefinition";
 import type {
   AgentAiAncestorLayer,
   AgentAiDefinitionDefaults,
@@ -19,19 +21,45 @@ import type {
   ParsedThinkingInput,
   ThinkingLevel,
 } from "@/common/types/thinking";
-import { resolveAgentAiSettings } from "@/common/utils/ai/resolveAgentAiSettings";
+import {
+  applySettingsBaseChain,
+  collectDefinitionLayers,
+  settingsBaseHop,
+} from "@/common/utils/ai/agentAncestorLayers";
+import type { AnthropicCacheTtl } from "@/common/utils/ai/cacheStrategy";
+import {
+  resolveAgentAiSettings,
+  resolveAgentCacheTtl,
+} from "@/common/utils/ai/resolveAgentAiSettings";
+import assert from "@/common/utils/assert";
 import { getErrorMessage } from "@/common/utils/errors";
-import type { Runtime } from "@/node/runtime/Runtime";
+import {
+  isRuntimeReadFailure,
+  isRuntimeTransportError,
+  type Runtime,
+} from "@/node/runtime/Runtime";
 import { log } from "@/node/services/log";
 
-import { readAgentDefinition } from "./agentDefinitionsService";
-import { resolveAgentInheritanceChain } from "./resolveAgentInheritanceChain";
+import {
+  computeBaseSkipScope,
+  readAgentDefinition,
+  type AgentDefinitionRequestCache,
+} from "./agentDefinitionsService";
+import {
+  resolveAgentInheritanceChain,
+  type AgentForInheritance,
+} from "./resolveAgentInheritanceChain";
+import type { RuntimeFactory } from "@/node/services/runtimeFactory/runtimeFactoryService";
 
 /** Checkout context for reading agent definitions; omit when unavailable. */
 export interface NodeAgentDefinitionContext {
   runtime: Runtime;
   workspacePath: string;
   workspaceId: string;
+  /** #6426: only `true` lets project plugin agents (and bases) load. */
+  projectPluginsTrusted?: boolean;
+  /** Builds the host-local runtimes of the definition reads. */
+  runtimeFactory: RuntimeFactory;
 }
 
 export interface ResolveNodeAgentAiSettingsParams {
@@ -46,8 +74,10 @@ export interface ResolveNodeAgentAiSettingsParams {
     model?: string;
     thinkingLevel?: ParsedThinkingInput;
     reasoningMode?: OpenAIReasoningMode;
+    serviceTier?: ServiceTier;
   };
   targetWorkspaceSettings?: AgentAiSettingsLayerValues;
+  parentWorkspaceExecSettings?: AgentAiSettingsLayerValues;
   parentRuntime?: AgentAiSettingsLayerValues;
   fallbacks?: readonly AgentAiSettingsLayerValues[];
   defaultModel?: string;
@@ -60,81 +90,120 @@ export interface ResolveNodeAgentAiSettingsParams {
   definitionContext?: NodeAgentDefinitionContext;
 }
 
-function toDefinitionDefaults(
-  ai: { model?: string; thinkingLevel?: ThinkingLevel } | undefined
-): AgentAiDefinitionDefaults | undefined {
-  if (!ai || (ai.model === undefined && ai.thinkingLevel === undefined)) {
-    return undefined;
-  }
-  return { model: ai.model, thinkingLevel: ai.thinkingLevel };
+/** The agent's prompt-cache TTL over its resolved inheritance chain (see resolveAgentCacheTtl). */
+export function resolveChainAgentCacheTtl(
+  agentId: string,
+  agentAiDefaults: AgentAiDefaults | undefined,
+  chain: Parameters<typeof collectDefinitionLayers>[1]
+): AnthropicCacheTtl | undefined {
+  return resolveAgentCacheTtl({
+    targetAgentId: agentId,
+    agentAiDefaults,
+    ...collectDefinitionLayers(agentId, chain),
+  })?.value;
 }
 
-/** Field-wise merge of definition layers; the closer scope/hop wins per field. */
-function mergeDefinitionDefaults(
-  closer: AgentAiDefinitionDefaults | undefined,
-  further: AgentAiDefinitionDefaults | undefined
-): AgentAiDefinitionDefaults | undefined {
-  if (!closer) return further;
-  if (!further) return closer;
-  return {
-    model: closer.model ?? further.model,
-    thinkingLevel: closer.thinkingLevel ?? further.thinkingLevel,
-  };
-}
+type SettingsBaseReadContext = NodeAgentDefinitionContext & {
+  cache?: AgentDefinitionRequestCache;
+  abortSignal?: AbortSignal;
+};
 
 /**
- * Map an inheritance chain (target first, as returned by
- * resolveAgentInheritanceChain) onto resolver layers. The chain may contain
- * multiple entries with the same agent ID distinguished by scope (e.g.
- * project `exec.md` with `base: exec` refining the global/built-in `exec`);
- * the shared resolver deduplicates ancestors by ID, so same-ID entries must
- * merge field-wise into one layer here instead of being dropped.
+ * The settings-base agent's chain, read as the inheritance walk reads a base: null when the agent
+ * is absent, and a throw when the read was aborted or failed (unreachable host, permission).
  */
-export function collectDefinitionLayers(
-  agentId: string,
-  chain: ReadonlyArray<{ id: string; ai?: { model?: string; thinkingLevel?: ThinkingLevel } }>
-): {
-  targetDefinitionAiDefaults?: AgentAiDefinitionDefaults;
-  ancestors: AgentAiAncestorLayer[];
-} {
-  const targetId = chain[0]?.id ?? agentId;
-  let targetDefinitionAiDefaults = toDefinitionDefaults(chain[0]?.ai);
-  const ancestorsById = new Map<string, AgentAiAncestorLayer>();
-  for (const entry of chain.slice(1)) {
-    const defaults = toDefinitionDefaults(entry.ai);
-    if (entry.id === targetId || entry.id === agentId) {
-      targetDefinitionAiDefaults = mergeDefinitionDefaults(targetDefinitionAiDefaults, defaults);
-      continue;
-    }
-    const existing = ancestorsById.get(entry.id);
-    if (existing) {
-      existing.definitionAiDefaults = mergeDefinitionDefaults(
-        existing.definitionAiDefaults,
-        defaults
-      );
-    } else {
-      ancestorsById.set(entry.id, { agentId: entry.id, definitionAiDefaults: defaults });
-    }
-  }
-  return { targetDefinitionAiDefaults, ancestors: [...ancestorsById.values()] };
-}
-
-async function loadDefinitionLayers(
-  agentId: string,
-  context: NodeAgentDefinitionContext | undefined
-): Promise<{
-  targetDefinitionAiDefaults?: AgentAiDefinitionDefaults;
-  ancestors: AgentAiAncestorLayer[];
-}> {
-  if (!context) {
-    return { ancestors: [] };
-  }
-
+async function readSettingsBaseChain(
+  settingsBase: string,
+  skipScopesAbove: AgentDefinitionScope | undefined,
+  context: SettingsBaseReadContext
+): Promise<AgentForInheritance[] | null> {
+  const readOptions = {
+    cache: context.cache,
+    projectPluginsTrusted: context.projectPluginsTrusted,
+    runtimeFactory: context.runtimeFactory,
+    abortSignal: context.abortSignal,
+  };
   try {
     const agentDefinition = await readAgentDefinition(
       context.runtime,
       context.workspacePath,
-      agentId
+      settingsBase,
+      { ...readOptions, skipScopesAbove }
+    );
+    return await resolveAgentInheritanceChain({
+      runtime: context.runtime,
+      workspacePath: context.workspacePath,
+      agentId: agentDefinition.id,
+      agentDefinition,
+      workspaceId: context.workspaceId,
+      ...readOptions,
+    });
+  } catch (error) {
+    if (context.abortSignal?.aborted === true || isRuntimeReadFailure(error)) throw error;
+    return null;
+  }
+}
+
+/**
+ * The chain an agent's AI settings resolve over (Cursor plugin RFC, D11): its inheritance chain
+ * with `ai.settingsBase` applied. Tool policy keeps the inheritance chain. An ignored settings
+ * base logs a warning and leaves the chain as it is (D26).
+ */
+export async function resolveAgentAiSettingsChain(
+  agentId: string,
+  chain: AgentForInheritance[],
+  context: SettingsBaseReadContext
+): Promise<AgentForInheritance[]> {
+  const hop = settingsBaseHop(chain);
+  const settingsBase = hop?.ai?.settingsBase;
+  if (hop == null || settingsBase == null) return chain;
+  // Read as the declaring hop's `base` would be, so a global agent's settings base skips project
+  // agents (computeBaseSkipScope).
+  const skipScopesAbove = computeBaseSkipScope(settingsBase, hop.id, hop.scope);
+  const result = applySettingsBaseChain(
+    agentId,
+    chain,
+    await readSettingsBaseChain(settingsBase, skipScopesAbove, context)
+  );
+  if (result.ignored != null) {
+    log.warn("settingsBase ignored", { agentId, settingsBase, reason: result.ignored });
+  }
+  return result.chain;
+}
+
+/** Definition-derived resolver layers for one agent (target defaults + declared ancestors). */
+export interface AgentDefinitionAiLayers {
+  targetDefinitionAiDefaults?: AgentAiDefinitionDefaults;
+  ancestors: AgentAiAncestorLayer[];
+}
+
+/**
+ * Reads the target definition and its declared base chain. Returns null when the
+ * chain is unavailable (missing/unreadable definition) or the read was aborted;
+ * callers decide the fallback. Rethrows a transport RuntimeError (unreachable
+ * host), so callers fail retryably instead of resolving without the chain. The abort signal is forwarded to the runtime
+ * reads so a timeout cancels underlying (e.g. SSH) work for runtimes that honor
+ * it, and settles this promise promptly even while a runtime call is still pending.
+ */
+export async function loadAgentDefinitionAiLayers(
+  agentId: string,
+  context: NodeAgentDefinitionContext,
+  options?: { abortSignal?: AbortSignal }
+): Promise<AgentDefinitionAiLayers | null> {
+  assert(agentId.length > 0, "loadAgentDefinitionAiLayers: agentId must be non-empty");
+  const abortSignal = options?.abortSignal;
+  if (abortSignal?.aborted) return null;
+
+  const load = async (): Promise<AgentDefinitionAiLayers> => {
+    const agentDefinition = await readAgentDefinition(
+      context.runtime,
+      context.workspacePath,
+      agentId,
+      {
+        ...(abortSignal != null ? { abortSignal } : {}),
+        projectPluginsTrusted: context.projectPluginsTrusted,
+        runtimeFactory: context.runtimeFactory,
+      }
     );
     const chain = await resolveAgentInheritanceChain({
       runtime: context.runtime,
@@ -142,37 +211,63 @@ async function loadDefinitionLayers(
       agentId: agentDefinition.id,
       agentDefinition,
       workspaceId: context.workspaceId,
+      ...(abortSignal != null ? { abortSignal } : {}),
+      projectPluginsTrusted: context.projectPluginsTrusted,
+      runtimeFactory: context.runtimeFactory,
     });
+    return collectDefinitionLayers(
+      agentId,
+      await resolveAgentAiSettingsChain(agentId, chain, { ...context, abortSignal })
+    );
+  };
 
-    return collectDefinitionLayers(agentId, chain);
+  let removeAbortListener: (() => void) | undefined;
+  try {
+    const work = load();
+    if (abortSignal == null) return await work;
+    // Some discovery steps (path resolution, candidate scans) take no signal; race
+    // them so an abort still settles this call. The loser's rejection is observed.
+    work.catch(() => undefined);
+    const aborted = new Promise<never>((_resolve, reject) => {
+      const onAbort = () => {
+        const reason: unknown = abortSignal.reason;
+        reject(reason instanceof Error ? reason : new Error("aborted"));
+      };
+      abortSignal.addEventListener("abort", onAbort, { once: true });
+      removeAbortListener = () => abortSignal.removeEventListener("abort", onAbort);
+    });
+    return await Promise.race([work, aborted]);
   } catch (error) {
-    // A missing or unreadable definition must not break resolution: fall back
-    // to the implicit base the resolver appends on its own.
+    // An unreachable host is not a missing definition: resolving without the
+    // definition layers would silently pick default AI settings (#4829). Aborts
+    // are checked first because SSH2 reports an aborted exec as "network".
+    if (abortSignal?.aborted !== true && isRuntimeTransportError(error)) throw error;
     log.debug("resolveNodeAgentAiSettings: definition chain unavailable", {
       agentId,
       workspaceId: context.workspaceId,
+      aborted: abortSignal?.aborted === true,
       error: getErrorMessage(error),
     });
-    return { ancestors: [] };
+    return null;
+  } finally {
+    removeAbortListener?.();
   }
 }
 
-export async function resolveNodeAgentAiSettings(
-  params: ResolveNodeAgentAiSettingsParams
-): Promise<ResolvedAgentAiSettings> {
-  const { targetDefinitionAiDefaults, ancestors } = await loadDefinitionLayers(
-    params.agentId,
-    params.definitionContext
-  );
-
+/** Synchronous resolution over already-loaded definition layers. */
+export function resolveNodeAgentAiSettingsWithLayers(
+  params: Omit<ResolveNodeAgentAiSettingsParams, "definitionContext">,
+  layers: AgentDefinitionAiLayers
+): ResolvedAgentAiSettings {
   const result = resolveAgentAiSettings({
     targetAgentId: params.agentId,
     profile: params.profile,
     explicit: params.explicit,
     targetWorkspaceSettings: params.targetWorkspaceSettings,
     agentAiDefaults: params.cfg.agentAiDefaults,
-    targetDefinitionAiDefaults,
-    ancestors,
+    targetDefinitionAiDefaults: layers.targetDefinitionAiDefaults,
+    ancestors: layers.ancestors,
+    parentWorkspaceExecSettings: params.parentWorkspaceExecSettings,
     parentRuntime: params.parentRuntime,
     fallbacks: params.fallbacks,
     defaultModel: params.defaultModel,
@@ -185,4 +280,17 @@ export async function resolveNodeAgentAiSettings(
   }
 
   return result;
+}
+
+export async function resolveNodeAgentAiSettings(
+  params: ResolveNodeAgentAiSettingsParams
+): Promise<ResolvedAgentAiSettings> {
+  // A missing or unreadable definition must not break resolution: fall back
+  // to the implicit base the resolver appends on its own. An unreachable host
+  // throws instead (see loadAgentDefinitionAiLayers).
+  const layers =
+    params.definitionContext != null
+      ? await loadAgentDefinitionAiLayers(params.agentId, params.definitionContext)
+      : null;
+  return resolveNodeAgentAiSettingsWithLayers(params, layers ?? { ancestors: [] });
 }

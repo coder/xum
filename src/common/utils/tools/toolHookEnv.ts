@@ -75,6 +75,15 @@ const LEGACY_ENV_ALIASES: ReadonlyArray<{ canonical: string; legacy: string }> =
 ];
 
 /**
+ * We intentionally do not truncate values. If an env var doesn't fit, omit it
+ * and let hooks use the JSON file (`XUM_TOOL_INPUT_PATH`/`XUM_TOOL_RESULT_PATH`).
+ * A NUL byte never fits: spawn rejects the whole env, so the hook would not run.
+ */
+function fitsInEnv(value: string, maxValueLength: number): boolean {
+  return value.length <= maxValueLength && !value.includes("\0");
+}
+
+/**
  * Flatten a tool input/result value into env vars.
  *
  * Example:
@@ -105,9 +114,7 @@ export function flattenToolHookValueToEnv(
   function trySet(key: string, rawValue: string): void {
     if (varCount >= maxVars) return;
 
-    // We intentionally do not truncate values. If an env var doesn't fit, omit it
-    // and let hooks use the JSON file (`XUM_TOOL_INPUT_PATH`/`XUM_TOOL_RESULT_PATH`).
-    if (rawValue.length > maxValueLength) return;
+    if (!fitsInEnv(rawValue, maxValueLength)) return;
 
     out[key] = rawValue;
     varCount += 1;

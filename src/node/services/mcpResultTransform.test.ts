@@ -3,7 +3,63 @@ import {
   MCP_TOOL_RESULT_MAX_TEXT_BYTES,
   MCP_TOOL_RESULT_MAX_TOTAL_BYTES,
 } from "@/common/constants/toolLimits";
-import { transformMCPResult, MAX_IMAGE_DATA_BYTES } from "./mcpResultTransform";
+import {
+  omitMCPProtocolMeta,
+  transformMCPResult,
+  MAX_IMAGE_DATA_BYTES,
+} from "./mcpResultTransform";
+
+describe("omitMCPProtocolMeta", () => {
+  it("removes result, content block, and embedded resource metadata only", () => {
+    const input = {
+      isError: true,
+      content: [
+        { type: "text", text: 'literal {"_meta": 1} stays', _meta: { trace: "block" } },
+        { type: "resource", resource: { uri: "x://r", text: "body", _meta: { s: "inner" } } },
+        { type: "resource", resource: { uri: "x://w", text: "w" }, _meta: { s: "wrapper" } },
+        { type: "image", data: "abc", mimeType: "image/png" },
+      ],
+      structuredContent: { _meta: "application data" },
+      _meta: { cursor: "page-2" },
+    };
+    const snapshot = structuredClone(input);
+
+    expect(omitMCPProtocolMeta(input)).toEqual({
+      isError: true,
+      content: [
+        { type: "text", text: 'literal {"_meta": 1} stays' },
+        { type: "resource", resource: { uri: "x://r", text: "body" } },
+        { type: "resource", resource: { uri: "x://w", text: "w" } },
+        { type: "image", data: "abc", mimeType: "image/png" },
+      ],
+      structuredContent: { _meta: "application data" },
+    });
+    // Copy-on-write: the raw result is never mutated.
+    expect(input).toEqual(snapshot);
+  });
+
+  it("strips root metadata even when content is not an array", () => {
+    const input = { content: "not-an-array", _meta: { trace: "root" } };
+    expect(omitMCPProtocolMeta(input)).toEqual({ content: "not-an-array" });
+  });
+
+  it.each([
+    { content: [{ type: "text", text: "ok" }] },
+    // `_meta` outside the protocol locations is application data.
+    { content: [{ type: "text", text: "ok" }], structuredContent: { _meta: { keep: true } } },
+    { toolResult: { _meta: { keep: true } } },
+    { content: [{ type: "text", text: "ok", resource: { _meta: { keep: true } } }] },
+    // Malformed shapes pass through untouched.
+    { _meta: ["invalid"] },
+    { content: [null, "raw", { type: "resource", resource: "not-an-object" }], _meta: null },
+  ])("returns the same reference when there is nothing to strip: %j", (input) => {
+    expect(omitMCPProtocolMeta(input)).toBe(input);
+  });
+
+  it.each([null, undefined, "text", 42, ["_meta"]])("passes non-objects through: %j", (input) => {
+    expect(omitMCPProtocolMeta(input)).toBe(input);
+  });
+});
 
 describe("transformMCPResult", () => {
   describe("image data overflow handling", () => {

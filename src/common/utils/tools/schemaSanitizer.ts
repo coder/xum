@@ -1,4 +1,5 @@
 import { type Tool } from "ai";
+import { isPlainObject } from "@/common/utils/isPlainObject";
 
 /**
  * JSON Schema properties that are not permitted by OpenAI's Responses API.
@@ -98,11 +99,160 @@ function stripUnsupportedProperties(schema: unknown): void {
 }
 
 /**
- * Return a sanitized clone of a JSON Schema for OpenAI Responses API compatibility.
+ * Whether a schema admits `null` under every constraint it declares (`type`,
+ * `enum`, `anyOf`/`oneOf`). A schema with none of those constraints reports
+ * false so that makeNullable and its inverse in mcpServerManager agree.
+ */
+export function schemaAcceptsNull(schema: unknown): boolean {
+  if (!isPlainObject(schema)) {
+    return false;
+  }
+  const checks: boolean[] = [];
+  if (schema.type !== undefined) {
+    checks.push(
+      schema.type === "null" || (Array.isArray(schema.type) && schema.type.includes("null"))
+    );
+  }
+  if (Array.isArray(schema.enum)) {
+    checks.push(schema.enum.includes(null));
+  }
+  for (const keyword of ["anyOf", "oneOf"] as const) {
+    const options = schema[keyword];
+    if (Array.isArray(options)) {
+      checks.push(options.some(schemaAcceptsNull));
+    }
+  }
+  return checks.length > 0 && checks.every(Boolean);
+}
+
+/**
+ * Widen a schema so it also admits `null`, mutating and returning it. Every
+ * declared constraint is widened together (e.g. `{ type: "string", enum }`
+ * needs both `"null"` in `type` and `null` in `enum`), otherwise strict-mode
+ * validation still rejects the null.
+ */
+export function makeNullable(schema: unknown): unknown {
+  if (schemaAcceptsNull(schema)) {
+    return schema;
+  }
+  if (!isPlainObject(schema)) {
+    return { anyOf: [schema, { type: "null" }] };
+  }
+  let widened = false;
+  const types: unknown[] | undefined = Array.isArray(schema.type) ? schema.type : undefined;
+  if (typeof schema.type === "string") {
+    schema.type = [schema.type, "null"];
+    widened = true;
+  } else if (types !== undefined && !types.includes("null")) {
+    schema.type = [...types, "null"];
+    widened = true;
+  }
+  const enumValues: unknown[] | undefined = Array.isArray(schema.enum) ? schema.enum : undefined;
+  if (enumValues !== undefined && !enumValues.includes(null)) {
+    schema.enum = [...enumValues, null];
+    widened = true;
+  }
+  for (const keyword of ["anyOf", "oneOf"] as const) {
+    const options: unknown[] | undefined = Array.isArray(schema[keyword])
+      ? schema[keyword]
+      : undefined;
+    if (options !== undefined && !options.some(schemaAcceptsNull)) {
+      schema[keyword] = [...options, { type: "null" }];
+      widened = true;
+    }
+  }
+  return widened ? schema : { anyOf: [schema, { type: "null" }] };
+}
+
+// Recurse only into subschemas: const, enum, default and examples hold data. Draft-07
+// `dependencies` is a map whose values are schemas or property-name lists; a list holds only
+// strings, which a rewrite leaves alone.
+const TOOL_SUBSCHEMA_KEY =
+  /^(items|prefixItems|additionalItems|contains|additionalProperties|propertyNames|not|if|then|else|anyOf|allOf|oneOf|unevaluatedItems|unevaluatedProperties)$/;
+const TOOL_SCHEMA_MAP_KEY =
+  /^(properties|patternProperties|\$defs|definitions|dependentSchemas|dependencies)$/;
+
+/** Rewrite every subschema of a JSON Schema bottom-up: children first, then the schema itself. */
+export function mapToolSubschemas(
+  node: unknown,
+  rewrite: (schema: Record<string, unknown>) => Record<string, unknown>
+): unknown {
+  if (Array.isArray(node)) return node.map((item) => mapToolSubschemas(item, rewrite));
+  if (!isPlainObject(node)) return node;
+  const out = Object.fromEntries(
+    Object.entries(node).map(([key, value]): [string, unknown] => {
+      if (TOOL_SUBSCHEMA_KEY.test(key)) return [key, mapToolSubschemas(value, rewrite)];
+      if (!TOOL_SCHEMA_MAP_KEY.test(key) || !isPlainObject(value)) return [key, value];
+      const schemas = Object.entries(value).map(([name, schema]): [string, unknown] => [
+        name,
+        mapToolSubschemas(schema, rewrite),
+      ]);
+      return [key, Object.fromEntries(schemas)];
+    })
+  );
+  return rewrite(out);
+}
+
+/** Property names an object schema requires, including those declared in `allOf` branches. */
+export function requiredPropertyNames(schema: unknown): Set<string> {
+  const required = new Set<string>();
+  if (!isPlainObject(schema)) {
+    return required;
+  }
+  if (Array.isArray(schema.required)) {
+    for (const key of schema.required) {
+      if (typeof key === "string") {
+        required.add(key);
+      }
+    }
+  }
+  if (Array.isArray(schema.allOf)) {
+    for (const subSchema of schema.allOf) {
+      for (const key of requiredPropertyNames(subSchema)) {
+        required.add(key);
+      }
+    }
+  }
+  return required;
+}
+
+/**
+ * Widen every optional property to accept `null`, recursing through nested
+ * object properties and array items. Mutates in place.
+ *
+ * OpenAI's Responses API normalizes function tools into strict mode, which
+ * forces every property into `required`; a model then has to fabricate a
+ * value for a parameter it would otherwise omit (an enum property gets an
+ * invented member, not an empty string). `null` as a type option is OpenAI's
+ * documented escape hatch, and mcpServerManager drops those nulls again
+ * before the call reaches the server. Composition branches (anyOf/oneOf/allOf)
+ * are left as-is because that inverse could not tell which branch the model
+ * chose.
+ */
+function widenOptionalProperties(schema: unknown): void {
+  if (!isPlainObject(schema)) {
+    return;
+  }
+  if (isPlainObject(schema.properties)) {
+    const required = requiredPropertyNames(schema);
+    for (const [name, propSchema] of Object.entries(schema.properties)) {
+      widenOptionalProperties(propSchema);
+      if (!required.has(name)) {
+        schema.properties[name] = makeNullable(propSchema);
+      }
+    }
+  }
+  widenOptionalProperties(schema.items);
+}
+
+/**
+ * Return a sanitized clone of a JSON Schema for OpenAI Responses API
+ * compatibility: unsupported keywords stripped, optional properties nullable.
  */
 export function sanitizeJsonSchemaForOpenAI<T>(schema: T): T {
   const clonedSchema = JSON.parse(JSON.stringify(schema)) as T;
   stripUnsupportedProperties(clonedSchema);
+  widenOptionalProperties(clonedSchema);
   return clonedSchema;
 }
 
@@ -136,68 +286,6 @@ export function sanitizeWorkflowAgentReportSchemaForOpenAI<T>(schema: T): T {
   const clonedSchema = JSON.parse(JSON.stringify(schema)) as T;
   sanitizeWorkflowAgentReportSchemaNode(clonedSchema);
   return clonedSchema;
-}
-
-function makeWorkflowReportPropertyNullable(schema: unknown): unknown {
-  if (typeof schema !== "object" || schema === null || Array.isArray(schema)) {
-    return { anyOf: [schema, { type: "null" }] };
-  }
-
-  const obj = schema as Record<string, unknown>;
-  if (Array.isArray(obj.enum)) {
-    const values: unknown[] = obj.enum;
-    if (!values.includes(null)) {
-      obj.enum = [...values, null];
-    }
-    return obj;
-  }
-  if (typeof obj.type === "string") {
-    if (obj.type !== "null") {
-      obj.type = [obj.type, "null"];
-    }
-    return obj;
-  }
-  if (Array.isArray(obj.type)) {
-    const types: unknown[] = obj.type;
-    if (!types.includes("null")) {
-      obj.type = [...types, "null"];
-    }
-    return obj;
-  }
-  if (Array.isArray(obj.anyOf)) {
-    const options: unknown[] = obj.anyOf;
-    const hasNullOption = options.some(
-      (option) =>
-        option != null &&
-        typeof option === "object" &&
-        !Array.isArray(option) &&
-        (option as { type?: unknown }).type === "null"
-    );
-    if (!hasNullOption) {
-      obj.anyOf = [...options, { type: "null" }];
-    }
-    return obj;
-  }
-  return { anyOf: [obj, { type: "null" }] };
-}
-
-function getWorkflowReportRequiredProperties(schema: Record<string, unknown>): Set<string> {
-  const required = new Set(
-    Array.isArray(schema.required)
-      ? schema.required.filter((key): key is string => typeof key === "string")
-      : []
-  );
-  if (Array.isArray(schema.allOf)) {
-    for (const subSchema of schema.allOf) {
-      if (subSchema == null || typeof subSchema !== "object" || Array.isArray(subSchema)) {
-        continue;
-      }
-      for (const key of getWorkflowReportRequiredProperties(subSchema as Record<string, unknown>)) {
-        required.add(key);
-      }
-    }
-  }
-  return required;
 }
 
 function mergeSchemaRecords(left: unknown, right: unknown): unknown {
@@ -246,7 +334,7 @@ function mergeAllOfObjectProperties(schema: Record<string, unknown>): void {
       }
     }
   }
-  const required = getWorkflowReportRequiredProperties(schema);
+  const required = requiredPropertyNames(schema);
   if (required.size > 0) {
     schema.required = [...required];
   }
@@ -259,7 +347,7 @@ function sanitizeWorkflowAgentReportSchemaNode(schema: unknown): void {
 
   const obj = schema as Record<string, unknown>;
   mergeAllOfObjectProperties(obj);
-  const requiredBeforeSanitizing = getWorkflowReportRequiredProperties(obj);
+  const requiredBeforeSanitizing = requiredPropertyNames(obj);
   for (const prop of OPENAI_WORKFLOW_REPORT_UNSUPPORTED_SCHEMA_PROPERTIES) {
     if (prop in obj) {
       delete obj[prop];
@@ -286,7 +374,7 @@ function sanitizeWorkflowAgentReportSchemaNode(schema: unknown): void {
     for (const [propertyName, propSchema] of Object.entries(properties)) {
       sanitizeWorkflowAgentReportSchemaNode(propSchema);
       if (!originallyRequired.has(propertyName)) {
-        properties[propertyName] = makeWorkflowReportPropertyNullable(propSchema);
+        properties[propertyName] = makeNullable(propSchema);
       }
     }
   } else if (obj.type === "object") {
@@ -381,6 +469,19 @@ export function sanitizeToolSchemaForOpenAI(tool: Tool): Tool {
 }
 
 /**
+ * The tool a sanitized copy came from. Hook rewrites are checked against its full schema: the
+ * sanitized one drops constraints (minLength, pattern, bounds) the MCP server still enforces.
+ * Enumerable, so descriptor clones and object spreads keep it.
+ */
+export const UNSANITIZED_TOOL = Symbol.for("xum.unsanitizedTool");
+
+/** The tool before sanitizeToolSchemaForOpenAI, or the tool itself. */
+export function unsanitizedTool(tool: unknown): unknown {
+  if (tool === null || typeof tool !== "object" || !(UNSANITIZED_TOOL in tool)) return tool;
+  return (tool as Record<symbol, unknown>)[UNSANITIZED_TOOL];
+}
+
+/**
  * Sanitize all MCP tools for OpenAI compatibility.
  *
  * @param mcpTools - Record of MCP tools to sanitize
@@ -389,7 +490,14 @@ export function sanitizeToolSchemaForOpenAI(tool: Tool): Tool {
 export function sanitizeMCPToolsForOpenAI(mcpTools: Record<string, Tool>): Record<string, Tool> {
   const sanitized: Record<string, Tool> = {};
   for (const [name, tool] of Object.entries(mcpTools)) {
-    sanitized[name] = sanitizeToolSchemaForOpenAI(tool);
+    const copy = sanitizeToolSchemaForOpenAI(tool);
+    if (copy !== tool) {
+      Object.defineProperty(copy, UNSANITIZED_TOOL, {
+        value: unsanitizedTool(tool),
+        enumerable: true,
+      });
+    }
+    sanitized[name] = copy;
   }
   return sanitized;
 }

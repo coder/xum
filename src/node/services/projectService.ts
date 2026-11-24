@@ -1,15 +1,23 @@
-import type { Config, ProjectConfig } from "@/node/config";
+import { SecretsStore, type Config, type ProjectConfig, type ProjectsConfig } from "@/node/config";
+import { clearRemoteProjectPluginSnapshots } from "@/node/services/agentPlugins/remoteProjectPlugins";
 import { formatSshEndpoint } from "@/common/utils/ssh/formatSshEndpoint";
 import { SSH_PROTOCOL_SCHEMES } from "@/constants/git";
 import { spawn } from "child_process";
 import { createHash, randomBytes } from "crypto";
 import {
   validateProjectPath,
+  resolvesToFilesystemRoot,
+  PROJECT_AT_FILESYSTEM_ROOT_ERROR,
   isGitRepository,
   isInsideGitRepository,
   stripTrailingSlashes,
 } from "@/node/utils/pathUtils";
-import { listLocalBranches, detectDefaultTrunkBranch } from "@/node/git";
+import {
+  listLocalBranches,
+  listRecentLocalBranches,
+  detectDefaultTrunkBranch,
+  detectRepositoryDefaultBranch,
+} from "@/node/git";
 import type { Result } from "@/common/types/result";
 import { Ok, Err } from "@/common/types/result";
 import type { Secret } from "@/common/types/secrets";
@@ -35,14 +43,38 @@ import {
 } from "./sshCloneFailure";
 import type { BranchListResult } from "@/common/orpc/types";
 import type { ProjectRemoveErrorSchema } from "@/common/orpc/schemas/errors";
+import type { RemovedCreationDraft } from "@/common/orpc/schemas/drafts";
 import type { FileTreeNode } from "@/common/utils/git/numstatParser";
 import * as path from "path";
 import { getXumProjectsDir } from "@/common/constants/paths";
 import { expandTilde } from "@/node/runtime/tildeExpansion";
 import { getErrorMessage } from "@/common/utils/errors";
 import { deriveProjectHierarchy, isPathDescendant } from "@/common/utils/subProjects";
-import { getProjectWorkspaceCounts } from "@/common/utils/projectRemoval";
+import {
+  getProjectWorkspaceCounts,
+  type ProjectWorkspaceCounts,
+} from "@/common/utils/projectRemoval";
+import { isWorkspaceArchived } from "@/common/utils/archive";
 import type { z } from "zod";
+import { ORPCError } from "@orpc/server";
+import {
+  CODE_WORKSPACE_EXTENSION,
+  managedRootsByProject,
+  syncProjectCodeWorkspace,
+} from "@/node/worktree/codeWorkspaceSync";
+import type { MCPServerManager } from "@/node/services/mcpServerManager";
+import {
+  type ProjectRegistrationLockHandle,
+  withProjectRegistrationFileLock,
+  withProjectRegistrationLock,
+} from "@/node/config/projectRegistrationLock";
+import { isProjectTrusted, isProjectTrustedIn, trustOwnerPathIn } from "@/node/utils/projectTrust";
+import { createRuntime } from "@/node/runtime/runtimeFactory";
+import {
+  applySshDirectoryTrust,
+  parseSshDirectoryTrustTarget,
+  TRUST_PROJECT_FIRST_ERROR,
+} from "@/common/utils/sshDirectoryTrust";
 
 function orderWorkspacesForCascadeRemoval(
   workspaces: ProjectConfig["workspaces"]
@@ -134,6 +166,10 @@ type ProjectRemoveError = z.infer<typeof ProjectRemoveErrorSchema>;
 
 interface WorkspaceRemover {
   remove(workspaceId: string, force?: boolean): Promise<Result<void>>;
+}
+
+interface WorkspaceMetadataRefresher {
+  refreshAndEmitMetadata(workspaceId: string): Promise<void>;
 }
 
 function isTildePrefixedPath(value: string): boolean {
@@ -376,19 +412,45 @@ export class ProjectService {
   private readonly fileCompletionsCache = new Map<string, FileCompletionsCacheEntry>();
   /** Canonical paths with git initialization in flight; see create() claim below. */
   private readonly activeGitInits = new Set<string>();
+  private activeClones = 0;
+  private shuttingDown = false;
   private directoryPicker?: (initialPath?: string | null) => Promise<string | null>;
   private readonly sshPromptService: SshPromptService | undefined;
   private workspaceService?: WorkspaceRemover;
+  private workspaceMetadataRefresher?: WorkspaceMetadataRefresher;
+  private mcpServerManager?: Pick<MCPServerManager, "applyProjectTrust" | "forgetProjectTrust">;
+  private draftCleaner?: { deleteProjectDrafts(projectPath: string): Promise<string[]> };
+  private unsubscribeProjectTrust?: () => void;
+  /** The effectively trusted project paths at the last config change (watchProjectTrust). */
+  private trustedProjectsKey?: string;
 
   constructor(
     private readonly config: Config,
-    sshPromptService?: SshPromptService
+    sshPromptService?: SshPromptService,
+    private readonly secretsStore: SecretsStore = new SecretsStore(config.rootDir)
   ) {
     this.sshPromptService = sshPromptService;
   }
 
   setWorkspaceService(workspaceService: WorkspaceRemover): void {
     this.workspaceService = workspaceService;
+  }
+
+  setWorkspaceMetadataRefresher(workspaceService: WorkspaceMetadataRefresher): void {
+    this.workspaceMetadataRefresher = workspaceService;
+  }
+
+  setMcpServerManager(
+    mcpServerManager: Pick<MCPServerManager, "applyProjectTrust" | "forgetProjectTrust">
+  ): void {
+    this.mcpServerManager = mcpServerManager;
+  }
+
+  /** Deletes a removed project's creation drafts (DraftService); wired by the service container. */
+  setDraftCleaner(draftCleaner: {
+    deleteProjectDrafts(projectPath: string): Promise<string[]>;
+  }): void {
+    this.draftCleaner = draftCleaner;
   }
 
   setDirectoryPicker(picker: (initialPath?: string | null) => Promise<string | null>) {
@@ -402,8 +464,46 @@ export class ProjectService {
 
   async create(
     projectPath: string,
-    options?: { initGit?: boolean }
+    options?: { initGit?: boolean; displayName?: string }
   ): Promise<Result<{ projectConfig: ProjectConfig; normalizedPath: string }>> {
+    // No registration lock around the validation: it stats, resolves, and reads git roots
+    // along the new path, which on a slow or unavailable filesystem can take as long as the
+    // lock's wait bound — and every config save in every process waits for that lock, so
+    // holding it here would stall unrelated workspace, task, and settings saves behind one
+    // stuck create. createUnlocked takes the lock itself around what mutates state (a git
+    // init, the registering write) and re-validates under it; withRegistrationLock callers
+    // pass the window they already hold.
+    return this.createUnlocked(projectPath, options, null);
+  }
+
+  /**
+   * Registration held stable — no project can be registered or removed underneath `fn` —
+   * with a `create` that registers inside that window and the lock's own ownership check.
+   * A backup import resolves its target's identity, registers it when needed, and writes its
+   * memory within one such window, so the project it wrote into is the project registered
+   * when it reports success.
+   */
+  withRegistrationLock<T>(
+    fn: (registrar: {
+      create: ProjectService["create"];
+      assertStillOwned: ProjectRegistrationLockHandle["assertStillOwned"];
+    }) => Promise<T>
+  ): Promise<T> {
+    return withProjectRegistrationLock(this.config.rootDir, (lock) =>
+      fn({
+        create: (projectPath, options) => this.createUnlocked(projectPath, options, lock),
+        assertStillOwned: () => lock.assertStillOwned(),
+      })
+    );
+  }
+
+  /** `lock`: the caller's registration window, or null to open one for the mutating steps. */
+  private async createUnlocked(
+    projectPath: string,
+    options: { initGit?: boolean; displayName?: string } | undefined,
+    lock: ProjectRegistrationLockHandle | null
+  ): Promise<Result<{ projectConfig: ProjectConfig; normalizedPath: string }>> {
+    if (this.shuttingDown) throw new Error("Server is shutting down");
     let gitInitClaimKey: string | null = null;
     try {
       // Validate input
@@ -421,7 +521,8 @@ export class ProjectService {
         !projectPath.includes("\\") &&
         !projectPath.startsWith("~");
 
-      const config = this.config.loadConfigOrDefault();
+      // Hierarchy validation replaces projects without mutating the shared config snapshot.
+      const config = { ...this.config.loadConfigOrDefault() };
       let normalizedPath: string;
       if (isBareProjectName) {
         // Bare project name - put in default projects directory
@@ -436,6 +537,11 @@ export class ProjectService {
         normalizedPath = path.resolve(expandTilde(projectPath));
       } else {
         normalizedPath = path.resolve(projectPath);
+      }
+      // File completions, git status and review scans would walk the whole disk (#5917). A
+      // symlink to the root counts as the root.
+      if (await resolvesToFilesystemRoot(normalizedPath)) {
+        return Err(PROJECT_AT_FILESYSTEM_ROOT_ERROR);
       }
 
       let existingStat: Stats | null = null;
@@ -586,132 +692,181 @@ export class ProjectService {
         }
       }
 
-      if (options?.initGit) {
-        // Exclusive per-canonical-path claim: two initGit creates targeting the same
-        // pre-existing empty directory would otherwise interleave git init and failure
-        // rollback, letting one call delete the .git the other just initialized.
-        if (this.activeGitInits.has(canonicalPath)) {
-          return Err("Another project creation is already initializing this directory");
-        }
-        this.activeGitInits.add(canonicalPath);
-        gitInitClaimKey = canonicalPath;
+      // From here on the request mutates state — a git init into the directory, the
+      // registering write — so it runs under the registration lock: the window a
+      // withRegistrationLock caller holds, or one opened here. The read-only validation above
+      // stayed outside it (see create).
+      const register = async (
+        lock: ProjectRegistrationLockHandle
+      ): Promise<Result<{ projectConfig: ProjectConfig; normalizedPath: string }>> => {
+        if (options?.initGit) {
+          // The project set as it is under the lock, before anything is written into the
+          // directory: registered meanwhile — a settings-backup import into this same empty
+          // directory, say — it is the winner's now, and this request fails as the duplicate
+          // it is without having initialized a repository inside the winner's checkout only
+          // to roll it back again.
+          const current = this.config.loadConfigOrDefault();
+          if (current.projects.has(normalizedPath) || current.projects.has(canonicalPath)) {
+            return Err("Project already exists");
+          }
+          // Exclusive per-canonical-path claim: two initGit creates targeting the same
+          // pre-existing empty directory would otherwise interleave git init and failure
+          // rollback, letting one call delete the .git the other just initialized.
+          if (this.activeGitInits.has(canonicalPath)) {
+            return Err("Another project creation is already initializing this directory");
+          }
+          this.activeGitInits.add(canonicalPath);
+          gitInitClaimKey = canonicalPath;
 
-        const gitInitResult = await this.initializeGitRepository(normalizedPath);
-        if (!gitInitResult.success) {
-          await cleanupCreatedDirectory();
-          return gitInitResult;
+          const gitInitResult = await this.initializeGitRepository(normalizedPath);
+          if (!gitInitResult.success) {
+            await cleanupCreatedDirectory();
+            return gitInitResult;
+          }
+          initializedGitDir = gitInitResult.data.initializedGitDir;
         }
-        initializedGitDir = gitInitResult.data.initializedGitDir;
-      }
 
-      // Register the project inside the serialized editConfig transform, re-checking for
-      // duplicates and re-deriving the hierarchy from FRESH config: persisting the pre-read
-      // snapshot would clobber concurrent config edits (lost-update race). The async
-      // validations above (git roots, sub-project depth) ran against the snapshot; the
-      // transform only re-resolves state that a concurrent edit could have changed.
-      let createResult: Result<{ projectConfig: ProjectConfig; normalizedPath: string }> =
-        Err("Project already exists");
-      // Distinguishes in-transform failures for directory cleanup: when a concurrent
-      // call registered this same path ("duplicate"), the directory belongs to that
-      // winner and must not be deleted; other rejections leave the directory ours.
-      let transformFailure:
-        | "duplicate"
-        | "depth"
-        | "hierarchy-changed"
-        | "hierarchy-changed-descendant"
-        | null = null;
-      await this.config.editConfig((freshConfig) => {
-        if (freshConfig.projects.has(normalizedPath) || freshConfig.projects.has(canonicalPath)) {
-          transformFailure = "duplicate";
-          createResult = Err("Project already exists");
+        // Register the project inside the serialized editConfig transform, re-checking for
+        // duplicates and re-deriving the hierarchy from FRESH config: persisting the pre-read
+        // snapshot would clobber concurrent config edits (lost-update race). The async
+        // validations above (git roots, sub-project depth) ran against the snapshot; the
+        // transform only re-resolves state that a concurrent edit could have changed.
+        let createResult: Result<{ projectConfig: ProjectConfig; normalizedPath: string }> =
+          Err("Project already exists");
+        // Distinguishes in-transform failures for directory cleanup: when a concurrent
+        // call registered this same path ("duplicate"), the directory belongs to that
+        // winner and must not be deleted; other rejections leave the directory ours.
+        let transformFailure:
+          | "duplicate"
+          | "depth"
+          | "hierarchy-changed"
+          | "hierarchy-changed-descendant"
+          | null = null;
+        // The .git this request initialized is never the winner's to keep (see below).
+        const removeInitializedGitDir = () =>
+          fsPromises
+            .rm(path.join(normalizedPath, ".git"), { recursive: true, force: true })
+            .catch((cleanupError: unknown) => {
+              log.error(`Failed to roll back git init in ${normalizedPath}:`, cleanupError);
+            });
+        const registerEdit = (freshConfig: ProjectsConfig): ProjectsConfig => {
+          if (freshConfig.projects.has(normalizedPath) || freshConfig.projects.has(canonicalPath)) {
+            transformFailure = "duplicate";
+            createResult = Err("Project already exists");
+            return freshConfig;
+          }
+          freshConfig.projects = deriveProjectHierarchy(freshConfig.projects);
+          // Re-run the sub-project depth check against FRESH hierarchy: a concurrent
+          // registration (e.g. /repo/pkg landing while /repo/pkg/api is validating)
+          // can introduce a sub-project ancestor that the snapshot-time check missed,
+          // which would persist a second-level sub-project.
+          if (hasRegisteredSubProjectAncestor(normalizedPath, freshConfig.projects)) {
+            transformFailure = "depth";
+            createResult = Err("Sub-projects can only be one level deep");
+            return freshConfig;
+          }
+          const freshParentProjectPath = findDeepestTopLevelParentProject(
+            normalizedPath,
+            freshConfig.projects
+          );
+          // The same-git-repository validations above ran against the snapshot hierarchy
+          // only, and this transform is synchronous so it cannot re-run readGitTopLevel.
+          // If a concurrent edit introduced a different parent or new descendants, those
+          // were never git-validated — reject instead of persisting an unvalidated
+          // hierarchy (e.g. a sub-project from a different git repository).
+          const freshDescendantProjectPaths = Array.from(freshConfig.projects.keys()).filter(
+            (candidatePath) => isPathDescendant(normalizedPath, candidatePath)
+          );
+          const hasNewDescendantProject = freshDescendantProjectPaths.some(
+            (candidatePath) => !descendantProjectPaths.includes(candidatePath)
+          );
+          // Re-check the canonical parent for initGit: the snapshot-time rejection above
+          // can miss a parent registered concurrently, and the lexical freshParent check
+          // below cannot see it when this path reaches the checkout through a symlink.
+          if (
+            options?.initGit &&
+            findDeepestTopLevelParentProject(canonicalPath, freshConfig.projects)
+          ) {
+            transformFailure = "hierarchy-changed";
+            createResult = Err("Project hierarchy changed concurrently; please retry");
+            return freshConfig;
+          }
+          if (freshParentProjectPath !== parentProjectPath || hasNewDescendantProject) {
+            // A new descendant registered under this path claims the directory tree we
+            // created: recursive cleanup would delete that project's checkout, so treat
+            // it like the duplicate case and leave the directory alone.
+            transformFailure = hasNewDescendantProject
+              ? "hierarchy-changed-descendant"
+              : "hierarchy-changed";
+            createResult = Err("Project hierarchy changed concurrently; please retry");
+            return freshConfig;
+          }
+          const projectConfig: ProjectConfig = {
+            workspaces: [],
+            parentProjectPath: freshParentProjectPath ?? undefined,
+            // Set in the same config write as the registration (a backup restore names
+            // imported projects) rather than as a second write and notification.
+            ...(options?.displayName !== undefined ? { displayName: options.displayName } : {}),
+          };
+          freshConfig.projects.set(normalizedPath, projectConfig);
+          freshConfig.projects = deriveProjectHierarchy(freshConfig.projects);
+          createResult = Ok({ projectConfig, normalizedPath });
           return freshConfig;
-        }
-        freshConfig.projects = deriveProjectHierarchy(freshConfig.projects);
-        // Re-run the sub-project depth check against FRESH hierarchy: a concurrent
-        // registration (e.g. /repo/pkg landing while /repo/pkg/api is validating)
-        // can introduce a sub-project ancestor that the snapshot-time check missed,
-        // which would persist a second-level sub-project.
-        if (hasRegisteredSubProjectAncestor(normalizedPath, freshConfig.projects)) {
-          transformFailure = "depth";
-          createResult = Err("Sub-projects can only be one level deep");
-          return freshConfig;
-        }
-        const freshParentProjectPath = findDeepestTopLevelParentProject(
-          normalizedPath,
-          freshConfig.projects
-        );
-        // The same-git-repository validations above ran against the snapshot hierarchy
-        // only, and this transform is synchronous so it cannot re-run readGitTopLevel.
-        // If a concurrent edit introduced a different parent or new descendants, those
-        // were never git-validated — reject instead of persisting an unvalidated
-        // hierarchy (e.g. a sub-project from a different git repository).
-        const freshDescendantProjectPaths = Array.from(freshConfig.projects.keys()).filter(
-          (candidatePath) => isPathDescendant(normalizedPath, candidatePath)
-        );
-        const hasNewDescendantProject = freshDescendantProjectPaths.some(
-          (candidatePath) => !descendantProjectPaths.includes(candidatePath)
-        );
-        // Re-check the canonical parent for initGit: the snapshot-time rejection above
-        // can miss a parent registered concurrently, and the lexical freshParent check
-        // below cannot see it when this path reaches the checkout through a symlink.
-        if (
-          options?.initGit &&
-          findDeepestTopLevelParentProject(canonicalPath, freshConfig.projects)
-        ) {
-          transformFailure = "hierarchy-changed";
-          createResult = Err("Project hierarchy changed concurrently; please retry");
-          return freshConfig;
-        }
-        if (freshParentProjectPath !== parentProjectPath || hasNewDescendantProject) {
-          // A new descendant registered under this path claims the directory tree we
-          // created: recursive cleanup would delete that project's checkout, so treat
-          // it like the duplicate case and leave the directory alone.
-          transformFailure = hasNewDescendantProject
-            ? "hierarchy-changed-descendant"
-            : "hierarchy-changed";
-          createResult = Err("Project hierarchy changed concurrently; please retry");
-          return freshConfig;
-        }
-        const projectConfig: ProjectConfig = {
-          workspaces: [],
-          parentProjectPath: freshParentProjectPath ?? undefined,
         };
-        freshConfig.projects.set(normalizedPath, projectConfig);
-        freshConfig.projects = deriveProjectHierarchy(freshConfig.projects);
-        createResult = Ok({ projectConfig, normalizedPath });
-        return freshConfig;
-      });
+        try {
+          await this.config.editConfig(registerEdit, { withinRegistrationLock: lock });
+        } catch (error) {
+          // The write itself was refused — most likely this process's hold was judged stale
+          // and reclaimed while git init ran (assertStillOwned). Whatever the request wrote
+          // into the directory must not stay behind unregistered: a leftover .git would fail
+          // every retry on the non-empty-directory check. A request that wrote nothing has
+          // nothing to roll back and no lock to wait for.
+          if (createdDirectory || initializedGitDir) {
+            await this.rollBackRefusedCreate(lock, normalizedPath, {
+              initializedGitDir,
+              cleanupCreatedDirectory,
+              removeInitializedGitDir,
+            });
+          }
+          throw error;
+        }
 
-      // Do NOT clean up the created directory when a concurrent registration claims
-      // it: a duplicate owns this exact path, and a new descendant project lives
-      // inside the tree we created — recursive removal would destroy the winner's
-      // checkout either way (including files created after its call returned). Only
-      // depth and parent-only hierarchy rejections leave the directory ours to remove.
-      if (transformFailure === "depth" || transformFailure === "hierarchy-changed") {
-        await cleanupCreatedDirectory();
-      } else if (
-        (transformFailure === "hierarchy-changed-descendant" || transformFailure === "duplicate") &&
-        initializedGitDir
-      ) {
-        // The winning registration owns the files (a duplicate winner registered this
-        // exact pre-existing directory; a descendant winner lives inside it), but the
-        // .git this losing request created would silently turn the winner's project
-        // into a repository it never asked for, or wrap its checkout in an
-        // unregistered outer repository that changes git discovery.
-        await fsPromises
-          .rm(path.join(normalizedPath, ".git"), { recursive: true, force: true })
-          .catch((cleanupError: unknown) => {
-            log.error(`Failed to roll back git init in ${normalizedPath}:`, cleanupError);
-          });
-      }
-      if (createResult.success && !this.config.loadConfigOrDefault().projects.has(normalizedPath)) {
-        // Config persistence (editConfig → private saveConfig) logs-and-continues on
-        // write failures. Without this check a git-initialized project would report
-        // success, vanish after restart, and block retries on the leftover .git.
-        await cleanupCreatedDirectory();
-        return Err("Failed to save project configuration");
-      }
-      return createResult;
+        // Do NOT clean up the created directory when a concurrent registration claims
+        // it: a duplicate owns this exact path, and a new descendant project lives
+        // inside the tree we created — recursive removal would destroy the winner's
+        // checkout either way (including files created after its call returned). Only
+        // depth and parent-only hierarchy rejections leave the directory ours to remove.
+        if (transformFailure === "depth" || transformFailure === "hierarchy-changed") {
+          await cleanupCreatedDirectory();
+        } else if (
+          (transformFailure === "hierarchy-changed-descendant" ||
+            transformFailure === "duplicate") &&
+          initializedGitDir
+        ) {
+          // The winning registration owns the files (a duplicate winner registered this
+          // exact pre-existing directory; a descendant winner lives inside it), but the
+          // .git this losing request created would silently turn the winner's project
+          // into a repository it never asked for, or wrap its checkout in an
+          // unregistered outer repository that changes git discovery.
+          await removeInitializedGitDir();
+        }
+        if (
+          createResult.success &&
+          !this.config.loadConfigOrDefault().projects.has(normalizedPath)
+        ) {
+          // editConfig rejects when the save fails (#4444); this check is belt and braces against a
+          // write another writer replaced. Without it a git-initialized project could report
+          // success, vanish after restart, and block retries on the leftover .git.
+          await cleanupCreatedDirectory();
+          return Err("Failed to save project configuration");
+        }
+        return createResult;
+      };
+      // A lock failure (a wait on another process timing out, an unwritable locks
+      // directory) is caught below like every other failure, so the Result contract holds.
+      return lock === null
+        ? await withProjectRegistrationLock(this.config.rootDir, register)
+        : await register(lock);
     } catch (error) {
       const message = getErrorMessage(error);
       return Err(`Failed to create project: ${message}`);
@@ -719,6 +874,43 @@ export class ProjectService {
       if (gitInitClaimKey) {
         this.activeGitInits.delete(gitInitClaimKey);
       }
+    }
+  }
+
+  /**
+   * Rollback for a create whose registering write threw after the request had mutated the
+   * directory. With the caller's hold still ours, nothing else can have registered anything
+   * (every registration takes the lock), so everything the request created goes. With the
+   * hold reclaimed, whoever reclaimed it may have registered this very directory meanwhile —
+   * under any spelling, so the registry's keys cannot prove it did not, and resolving every
+   * key's real path here would wait on the same unavailable mounts a restore is bounded
+   * against. The directory therefore stays (an empty one this request created is a harmless
+   * leftover a retry finds empty and uses); only the .git this request initialized goes,
+   * which is never a winner's to keep (see the duplicate case), under a fresh hold of the
+   * file lock so it cannot interleave with a winner's own git init. Best effort: a failure
+   * here is logged, and the create's own error is what the caller sees.
+   */
+  private async rollBackRefusedCreate(
+    lock: ProjectRegistrationLockHandle,
+    normalizedPath: string,
+    created: {
+      initializedGitDir: boolean;
+      cleanupCreatedDirectory: () => Promise<void>;
+      removeInitializedGitDir: () => Promise<void>;
+    }
+  ): Promise<void> {
+    try {
+      const stillOwned = await lock.assertStillOwned().then(
+        () => true,
+        () => false
+      );
+      if (stillOwned) {
+        await created.cleanupCreatedDirectory();
+      } else if (created.initializedGitDir) {
+        await withProjectRegistrationFileLock(this.config.rootDir, created.removeInitializedGitDir);
+      }
+    } catch (error) {
+      log.error(`Failed to roll back rejected project creation ${normalizedPath}:`, error);
     }
   }
 
@@ -775,7 +967,72 @@ export class ProjectService {
     }
   }
 
+  /** Clones and git inits in flight; a restart between them would leave a partial project. */
+  getMutationCount(): number {
+    return this.activeClones + this.activeGitInits.size;
+  }
+
+  /** A mutation admitted during teardown would be killed half-done by the exit that follows. */
+  beginShutdown(): void {
+    this.shuttingDown = true;
+    this.unsubscribeProjectTrust?.();
+    this.unsubscribeProjectTrust = undefined;
+  }
+
+  /**
+   * #7621: `xum trust` and other writers of config.json change trust without setTrust, so they
+   * reach this backend only as a config change. Drop the remote plugin snapshots when the set of
+   * effectively trusted projects changes, as setTrust does. Reads only the config snapshot that
+   * every config-change listener shares. The subscription keeps Config's config.json watch open
+   * until beginShutdown. Never throws: a startup step must not fail, and a throw in an own save's
+   * notification would reach that save's caller.
+   */
+  watchProjectTrust(): void {
+    if (this.unsubscribeProjectTrust) return;
+    try {
+      this.trustedProjectsKey = this.readTrustedProjectsKey();
+      this.unsubscribeProjectTrust = this.config.onConfigChanged(() => {
+        try {
+          const key = this.readTrustedProjectsKey();
+          if (key === this.trustedProjectsKey) return;
+          this.trustedProjectsKey = key;
+          clearRemoteProjectPluginSnapshots();
+        } catch (error) {
+          log.warn(`Project trust watch: config change not applied: ${getErrorMessage(error)}`);
+        }
+      });
+    } catch (error) {
+      log.warn(`Project trust watch: not started: ${getErrorMessage(error)}`);
+    }
+  }
+
+  private readTrustedProjectsKey(): string {
+    const projects = this.config.loadConfigOrDefault().projects;
+    const trusted = [...projects.keys()].filter((projectPath) =>
+      isProjectTrustedIn(projects, projectPath)
+    );
+    // Trusted SSH+None directories gate project plugins too, so a change to them counts.
+    return JSON.stringify(
+      trusted
+        .sort()
+        .map((projectPath) => [projectPath, projects.get(projectPath)?.trustedSshDirectories ?? []])
+    );
+  }
+
   async *cloneWithProgress(
+    input: CloneProjectParams,
+    signal?: AbortSignal
+  ): AsyncGenerator<CloneEvent> {
+    if (this.shuttingDown) throw new Error("Server is shutting down");
+    this.activeClones++;
+    try {
+      yield* this.cloneWithProgressTracked(input, signal);
+    } finally {
+      this.activeClones--;
+    }
+  }
+
+  private async *cloneWithProgressTracked(
     input: CloneProjectParams,
     signal?: AbortSignal
   ): AsyncGenerator<CloneEvent> {
@@ -942,18 +1199,26 @@ export class ProjectService {
       }
 
       const projectConfig: ProjectConfig = { workspaces: [] };
-      await this.config.editConfig((freshConfig) => {
-        if (freshConfig.projects.has(normalizedPath)) {
-          return freshConfig;
-        }
-        const updatedProjects = new Map(freshConfig.projects);
-        updatedProjects.set(normalizedPath, projectConfig);
-        return { ...freshConfig, projects: updatedProjects };
-      });
+      // A rejected write takes the same rollback as an unpersisted one (#4444): jumping to the
+      // outer catch would orphan the clone at the user's chosen path.
+      let persistError: unknown;
+      await this.config
+        .editConfig((freshConfig) => {
+          if (freshConfig.projects.has(normalizedPath)) {
+            return freshConfig;
+          }
+          const updatedProjects = new Map(freshConfig.projects);
+          updatedProjects.set(normalizedPath, projectConfig);
+          return { ...freshConfig, projects: updatedProjects };
+        })
+        .catch((error: unknown) => {
+          persistError = error;
+        });
 
+      // Decide from the fresh config, not the rejection: another backend may have registered
+      // this path meanwhile, and its checkout must not be deleted. The re-read is also belt and
+      // braces against a write another writer replaced.
       if (!this.config.loadConfigOrDefault().projects.has(normalizedPath)) {
-        // Config persistence (editConfig → private saveConfig) logs-and-continues on write
-        // failures, so verify persistence explicitly before reporting success.
         try {
           await fsPromises.rm(normalizedPath, { recursive: true, force: true });
         } catch {
@@ -962,7 +1227,10 @@ export class ProjectService {
         yield {
           type: "error",
           code: "clone_failed",
-          error: "Failed to persist cloned project configuration",
+          error:
+            persistError === undefined
+              ? "Failed to persist cloned project configuration"
+              : `Failed to persist cloned project configuration: ${getErrorMessage(persistError)}`,
         };
         return;
       }
@@ -1016,7 +1284,16 @@ export class ProjectService {
         : undefined;
 
     try {
-      const child = spawn("git", ["clone", "--progress", "--", cloneUrl, cloneWorkPath], {
+      // --no-local: for a source on this machine, git's local-clone shortcut hard-links or copies
+      // the source's `objects/` files one by one. A background repack of that repository (git
+      // starts one after a commit or fetch) removes loose objects mid-copy, so the clone fails
+      // ("failed to copy file to ...", "hardlink different from source", or a checkout that
+      // cannot read an object). The transport reads the source through `git upload-pack`, which
+      // git keeps safe against a concurrent repack. It costs a full pack write instead of hard
+      // links, and leaves a clone that does not depend on the source's object store. Git ignores
+      // the flag for a remote URL.
+      const cloneArgs = ["clone", "--progress", "--no-local", "--", cloneUrl, cloneWorkPath];
+      const child = spawn("git", cloneArgs, {
         stdio: ["ignore", "pipe", "pipe"],
         env: { ...process.env, GIT_TERMINAL_PROMPT: "0", ...(askpass?.env ?? {}) },
         // Detached children become process-group leaders on Unix so we can
@@ -1117,6 +1394,7 @@ export class ProjectService {
       try {
         while (!processEnded) {
           if (stderrChunks.length > 0) {
+            // eslint-disable-next-line @typescript-eslint/no-non-null-assertion -- legacy site from before the ban; remove when touching this line
             yield { type: "progress", line: stderrChunks.shift()! };
             continue;
           }
@@ -1133,6 +1411,7 @@ export class ProjectService {
       }
 
       while (stderrChunks.length > 0) {
+        // eslint-disable-next-line @typescript-eslint/no-non-null-assertion -- legacy site from before the ban; remove when touching this line
         yield { type: "progress", line: stderrChunks.shift()! };
       }
 
@@ -1189,11 +1468,11 @@ export class ProjectService {
     return Err("Clone did not return a completion event");
   }
 
-  /** Success carries every removed path (cascade included) so callers can drop per-path state. */
   async remove(
     projectPath: string,
     force = false
-  ): Promise<Result<{ removedProjectPaths: string[] }, ProjectRemoveError>> {
+  ): Promise<Result<{ removedCreationDrafts: RemovedCreationDraft[] }, ProjectRemoveError>> {
+    if (this.shuttingDown) throw new Error("Server is shutting down");
     try {
       const normalizedPath = stripTrailingSlashes(projectPath);
       let config = this.config.loadConfigOrDefault();
@@ -1204,11 +1483,6 @@ export class ProjectService {
       }
 
       if (projectConfig.parentProjectPath) {
-        try {
-          await this.config.updateProjectSecrets(normalizedPath, []);
-        } catch (error) {
-          log.error(`Failed to clean up secrets for sub-project ${normalizedPath}:`, error);
-        }
         // Mutate inside the serialized editConfig transform, re-resolving the sub-project
         // and its parent from FRESH config: persisting the pre-read snapshot would clobber
         // concurrent config edits (e.g. resurrect concurrently removed workspaces).
@@ -1226,7 +1500,17 @@ export class ProjectService {
           freshConfig.projects.delete(normalizedPath);
           return freshConfig;
         });
-        return Ok({ removedProjectPaths: [normalizedPath] });
+        // Delete secrets only after the config write lands (#4746): a rejected write
+        // must not leave the sub-project configured without its secrets. A failed
+        // delete here only orphans the secrets file entry.
+        try {
+          await this.secretsStore.updateProjectSecrets(normalizedPath, []);
+        } catch (error) {
+          log.error(`Failed to clean up secrets for sub-project ${normalizedPath}:`, error);
+        }
+        const removedCreationDrafts = await this.deleteCreationDrafts([normalizedPath]);
+        this.mcpServerManager?.forgetProjectTrust(normalizedPath);
+        return Ok({ removedCreationDrafts });
       }
 
       // Self-healing: purge workspace entries whose backing directories no longer exist.
@@ -1289,6 +1573,19 @@ export class ProjectService {
 
       const totalWorkspaces = counts.activeCount + counts.archivedCount;
       if (force && totalWorkspaces > 0) {
+        // Fail fast on cross-project references BEFORE the cascade: the force
+        // loop below only deletes this project's own bucket, so proceeding
+        // would permanently delete owned workspaces and then still fail on the
+        // external references, leaving a partially-deleted project behind.
+        const crossCounts = this.countCrossProjectReferences(config, normalizedPath);
+        if (crossCounts.activeCount + crossCounts.archivedCount > 0) {
+          return Err({
+            type: "workspace_blockers" as const,
+            activeCount: counts.activeCount + crossCounts.activeCount,
+            archivedCount: counts.archivedCount + crossCounts.archivedCount,
+          });
+        }
+
         if (!this.workspaceService) {
           return Err({
             type: "unknown" as const,
@@ -1308,6 +1605,9 @@ export class ProjectService {
           }
         }
 
+        // Each WorkspaceService.remove records its own removal durably before deleting
+        // (pendingRemoval marker) and drops its config row, so a later failure leaves the
+        // project configured with only the workspaces that still exist (#4746).
         for (const workspace of orderWorkspacesForCascadeRemoval(projectConfig.workspaces)) {
           // Legacy workspace entries can be missing `id`. Resolve through metadata so
           // WorkspaceService.remove() receives the canonical workspace ID (it cannot remove by path).
@@ -1336,35 +1636,12 @@ export class ProjectService {
         counts = getProjectWorkspaceCounts(projectConfig.workspaces);
       }
 
-      // Also count multi-project workspace references to this project from OTHER project buckets.
-      // Multi-project workspaces can be stored under _multi (interactive creation) or under
-      // any project bucket (task/fork creation via taskService).
-      let crossProjectActiveCount = 0;
-      let crossProjectArchivedCount = 0;
-      for (const [configKey, otherConfig] of config.projects) {
-        if (configKey === normalizedPath) {
-          // Project workspaces in this bucket are already counted above.
-          continue;
-        }
-
-        const referencingWorkspaces = otherConfig.workspaces.filter((workspace) =>
-          workspace.projects?.some(
-            (project) => stripTrailingSlashes(project.projectPath) === normalizedPath
-          )
-        );
-
-        if (referencingWorkspaces.length === 0) {
-          continue;
-        }
-
-        const referencingWorkspaceCounts = getProjectWorkspaceCounts(referencingWorkspaces);
-        crossProjectActiveCount += referencingWorkspaceCounts.activeCount;
-        crossProjectArchivedCount += referencingWorkspaceCounts.archivedCount;
-      }
-
+      // Also count multi-project workspace references to this project from OTHER
+      // project buckets (recomputed from the post-cascade config snapshot).
+      const crossProjectCounts = this.countCrossProjectReferences(config, normalizedPath);
       counts = {
-        activeCount: counts.activeCount + crossProjectActiveCount,
-        archivedCount: counts.archivedCount + crossProjectArchivedCount,
+        activeCount: counts.activeCount + crossProjectCounts.activeCount,
+        archivedCount: counts.archivedCount + crossProjectCounts.archivedCount,
       };
 
       if (counts.activeCount + counts.archivedCount > 0) {
@@ -1387,31 +1664,130 @@ export class ProjectService {
         return freshConfig;
       });
 
+      const removedCreationDrafts = await this.deleteCreationDrafts([
+        normalizedPath,
+        ...removedSubProjectPaths,
+      ]);
+
       for (const subProjectPath of removedSubProjectPaths) {
         try {
-          await this.config.updateProjectSecrets(subProjectPath, []);
+          await this.secretsStore.updateProjectSecrets(subProjectPath, []);
         } catch (error) {
           log.error(`Failed to clean up secrets for sub-project ${subProjectPath}:`, error);
         }
       }
 
       try {
-        await this.config.updateProjectSecrets(normalizedPath, []);
+        await this.secretsStore.updateProjectSecrets(normalizedPath, []);
       } catch (error) {
         log.error(`Failed to clean up secrets for project ${normalizedPath}:`, error);
       }
 
-      return Ok({ removedProjectPaths: [normalizedPath, ...removedSubProjectPaths] });
+      for (const removedPath of [normalizedPath, ...removedSubProjectPaths]) {
+        this.mcpServerManager?.forgetProjectTrust(removedPath);
+      }
+      return Ok({ removedCreationDrafts });
     } catch (error) {
       const message = getErrorMessage(error);
       return Err({ type: "unknown" as const, message: `Failed to remove project: ${message}` });
     }
   }
 
+  /**
+   * Delete the creation drafts whose project field is a removed project, server-side, so a
+   * removal from any client (or none mounted) leaves none behind. Best-effort like the secrets
+   * cleanup: a record this misses stays as an orphan file. Returns the deleted drafts.
+   */
+  private async deleteCreationDrafts(projectPaths: string[]): Promise<RemovedCreationDraft[]> {
+    const removed: RemovedCreationDraft[] = [];
+    for (const projectPath of projectPaths) {
+      try {
+        const draftIds = (await this.draftCleaner?.deleteProjectDrafts(projectPath)) ?? [];
+        for (const draftId of draftIds) removed.push({ projectPath, draftId });
+      } catch (error) {
+        log.error(`Failed to clean up drafts for project ${projectPath}:`, error);
+      }
+    }
+    return removed;
+  }
+
+  /**
+   * Count multi-project workspace references to this project stored in OTHER
+   * project buckets. Multi-project workspaces can live under _multi
+   * (interactive creation) or any project bucket (task/fork creation).
+   */
+  private countCrossProjectReferences(
+    config: { projects: Map<string, ProjectConfig> },
+    normalizedPath: string
+  ): ProjectWorkspaceCounts {
+    let activeCount = 0;
+    let archivedCount = 0;
+    for (const [configKey, otherConfig] of config.projects) {
+      if (configKey === normalizedPath) {
+        // Project workspaces in this bucket are counted by the caller.
+        continue;
+      }
+
+      const referencingWorkspaces = otherConfig.workspaces.filter((workspace) =>
+        workspace.projects?.some(
+          (project) => stripTrailingSlashes(project.projectPath) === normalizedPath
+        )
+      );
+
+      if (referencingWorkspaces.length === 0) {
+        continue;
+      }
+
+      const referencingWorkspaceCounts = getProjectWorkspaceCounts(referencingWorkspaces);
+      activeCount += referencingWorkspaceCounts.activeCount;
+      archivedCount += referencingWorkspaceCounts.archivedCount;
+    }
+    return { activeCount, archivedCount };
+  }
+
+  /**
+   * Read-only removal preflight: reports the same blocker counts remove()
+   * enforces (own bucket + cross-project references) WITHOUT remove()'s side
+   * effects (stale-entry pruning, deletion of empty projects). The delete
+   * confirmation dialog needs this because projects.list no longer carries
+   * archived workspaces to count client-side.
+   */
+  getRemovalBlockers(projectPath: string): ProjectWorkspaceCounts {
+    const normalizedPath = stripTrailingSlashes(projectPath);
+    const config = this.config.loadConfigOrDefault();
+    const projectConfig = config.projects.get(normalizedPath);
+    if (!projectConfig) {
+      return { activeCount: 0, archivedCount: 0 };
+    }
+    const ownCounts = getProjectWorkspaceCounts(projectConfig.workspaces);
+    const crossCounts = this.countCrossProjectReferences(config, normalizedPath);
+    return {
+      activeCount: ownCounts.activeCount + crossCounts.activeCount,
+      archivedCount: ownCounts.archivedCount + crossCounts.archivedCount,
+    };
+  }
+
   list(): Array<[string, ProjectConfig]> {
     try {
       const config = this.config.loadConfigOrDefault();
-      return Array.from(deriveProjectHierarchy(config.projects).entries());
+      // Read-side projection: exclude archived workspaces from the listing. On
+      // archive-heavy configs they dominate the payload (measured 84% of a
+      // 1.1 MB projects.list response re-fetched on every config change), and
+      // the UI loads archived workspaces on demand via
+      // workspace.list({ archived: true }). Build new arrays instead of
+      // mutating the loaded config: persisted config.json must keep archived
+      // entries (upgrade/downgrade safety).
+      return Array.from(deriveProjectHierarchy(config.projects).entries()).map(
+        ([projectPath, project]): [string, ProjectConfig] => [
+          projectPath,
+          {
+            ...project,
+            workspaces: project.workspaces.filter(
+              (workspace) => !isWorkspaceArchived(workspace.archivedAt, workspace.unarchivedAt)
+            ),
+          },
+        ]
+      );
     } catch (error) {
       log.error("Failed to list projects:", error);
       return [];
@@ -1427,6 +1803,7 @@ export class ProjectService {
       if (!validation.valid) {
         throw new Error(validation.error ?? "Invalid project path");
       }
+      // eslint-disable-next-line @typescript-eslint/no-non-null-assertion -- legacy site from before the ban; remove when touching this line
       const normalizedPath = validation.expandedPath!;
 
       // Non-git repos return empty branches - they're restricted to local runtime only.
@@ -1447,7 +1824,11 @@ export class ProjectService {
       }
 
       const recommendedTrunk = await detectDefaultTrunkBranch(normalizedPath, branches);
-      return { branches, recommendedTrunk };
+      // Recency only orders the picker, so a failure here must not fail the list (the list is
+      // the creation page's send barrier).
+      const recentBranches = await listRecentLocalBranches(normalizedPath).catch(() => []);
+      const defaultBranch = await detectRepositoryDefaultBranch(normalizedPath, branches);
+      return { branches, recommendedTrunk, defaultBranch, recentBranches };
     } catch (error) {
       log.error("Failed to list branches:", error);
       throw error instanceof Error ? error : new Error(String(error));
@@ -1490,6 +1871,11 @@ export class ProjectService {
           "user.name=mux",
           "-c",
           "user.email=mux@localhost",
+          // No `git maintenance run --auto --detach` after the commit: a repository with one
+          // empty commit needs none, and a failed create deletes this directory right after
+          // the commit, while that detached git would still be using it.
+          "-c",
+          "maintenance.auto=false",
           "commit",
           "--allow-empty",
           "-m",
@@ -1524,6 +1910,7 @@ export class ProjectService {
    * Also handles "unborn" repos (git init already run but no commits yet).
    */
   async gitInit(projectPath: string): Promise<Result<void>> {
+    if (this.shuttingDown) throw new Error("Server is shutting down");
     if (typeof projectPath !== "string" || projectPath.trim().length === 0) {
       return Err("Project path is required");
     }
@@ -1533,6 +1920,7 @@ export class ProjectService {
       if (!validation.valid) {
         return Err(validation.error ?? "Invalid project path");
       }
+      // eslint-disable-next-line @typescript-eslint/no-non-null-assertion -- legacy site from before the ban; remove when touching this line
       const normalizedPath = validation.expandedPath!;
       // Same exclusive claim as create(): concurrent initializations of one directory
       // could double-commit or let one call's failure rollback delete the other's .git.
@@ -1573,6 +1961,7 @@ export class ProjectService {
       return { paths: [] };
     }
 
+    // eslint-disable-next-line @typescript-eslint/no-non-null-assertion -- legacy site from before the ban; remove when touching this line
     const normalizedPath = validation.expandedPath!;
 
     let cacheEntry = this.fileCompletionsCache.get(normalizedPath);
@@ -1635,7 +2024,7 @@ export class ProjectService {
 
   getSecrets(projectPath: string): Secret[] {
     try {
-      return this.config.getProjectSecrets(projectPath);
+      return this.secretsStore.getProjectSecrets(projectPath);
     } catch (error) {
       log.error("Failed to get project secrets:", error);
       return [];
@@ -1675,7 +2064,7 @@ export class ProjectService {
 
   async updateSecrets(projectPath: string, secrets: Secret[]): Promise<Result<void>> {
     try {
-      await this.config.updateProjectSecrets(projectPath, secrets);
+      await this.secretsStore.updateProjectSecrets(projectPath, secrets);
       return Ok(undefined);
     } catch (error) {
       const message = getErrorMessage(error);
@@ -1722,6 +2111,225 @@ export class ProjectService {
     }
   }
 
+  async setTrust(projectPath: string, trusted: boolean): Promise<void> {
+    const normalizedPath = stripTrailingSlashes(projectPath);
+    // Checked on the unstripped path: a Windows drive root strips to a drive-relative spelling.
+    const isRootPath = await resolvesToFilesystemRoot(projectPath);
+    await this.config.editConfig((config) => {
+      let project = config.projects.get(normalizedPath);
+      if (!project) {
+        // Trust can create a project entry, but never a new one at the root (#5917). An existing
+        // root project (from an older config) can still change its trust.
+        if (isRootPath) throw new Error(PROJECT_AT_FILESYSTEM_ROOT_ERROR);
+        project = { workspaces: [] };
+        config.projects.set(normalizedPath, project);
+      }
+      project.trusted = trusted;
+      return config;
+    });
+
+    this.publishProjectTrust(normalizedPath);
+  }
+
+  /**
+   * Publish the trust of `projectPath` and its sub-projects to the MCP manager. Each update
+   * carries the owner's trusted SSH directories so the manager computes per-workspace trust (an
+   * SSH+None workspace also needs its directory trusted) instead of applying the project-wide bit.
+   */
+  private publishProjectTrust(projectPath: string): void {
+    const projects = this.config.loadConfigOrDefault().projects;
+    // Directory trust lives on the trust owner (a sub-project's parent).
+    const trustedSshDirectories = projects.get(
+      trustOwnerPathIn(projects, projectPath)
+    )?.trustedSshDirectories;
+    const affectedPaths = [projectPath];
+    for (const [candidatePath, project] of projects) {
+      if (
+        project.parentProjectPath !== undefined &&
+        stripTrailingSlashes(project.parentProjectPath) === projectPath
+      ) {
+        affectedPaths.push(candidatePath);
+      }
+    }
+    try {
+      this.mcpServerManager?.applyProjectTrust(
+        affectedPaths.map((candidatePath) => ({
+          projectPath: candidatePath,
+          trusted: isProjectTrustedIn(projects, candidatePath),
+          trustedSshDirectories,
+        }))
+      );
+    } finally {
+      // #6426: snapshots of remote project plugins exist only for trusted projects. After the
+      // trust change is published, even when the MCP update throws; synchronous, never throws.
+      clearRemoteProjectPluginSnapshots();
+    }
+  }
+
+  /**
+   * Trust or untrust one SSH+None directory for a project. The directory is not the local
+   * project, so project trust alone does not cover it (isWorkspaceDirTrusted); this grant does,
+   * and only while the project itself stays trusted. Granting requires a trusted project.
+   *
+   * projectDir is stored as SSH+None workspaces persist it: absolute, resolved on the host the
+   * way workspace creation resolves it (~ and relative paths need the host). Returns the stored
+   * projectDir.
+   */
+  async setSshDirectoryTrust(input: {
+    projectPath: string;
+    host: string;
+    port?: number | null;
+    projectDir: string;
+    trusted: boolean;
+  }): Promise<Result<{ projectDir: string }, string>> {
+    const target = parseSshDirectoryTrustTarget(input);
+    if (!target.success) {
+      return Err(target.error);
+    }
+    const rawDirectory = target.data;
+    const trustOwnerPath = trustOwnerPathIn(
+      this.config.loadConfigOrDefault().projects,
+      input.projectPath
+    );
+    if (input.trusted && !isProjectTrusted(this.config, trustOwnerPath)) {
+      return Err(TRUST_PROJECT_FIRST_ERROR);
+    }
+
+    let projectDir = rawDirectory.projectDir;
+    if (!projectDir.startsWith("/")) {
+      try {
+        projectDir = await createRuntime({
+          type: "ssh",
+          ...rawDirectory,
+          // Unused by resolvePath; any valid value.
+          srcBaseDir: "~/mux",
+          workspaceIsolation: "none",
+        }).resolvePath(rawDirectory.projectDir);
+      } catch (error) {
+        return Err(
+          `Failed to resolve ${rawDirectory.projectDir} on ${rawDirectory.host}: ${getErrorMessage(error)}`
+        );
+      }
+    }
+    const directory = { ...rawDirectory, projectDir };
+
+    try {
+      await this.config.editConfig((config) => {
+        // Re-checks project trust under the config lock: it may have been revoked meanwhile.
+        applySshDirectoryTrust(
+          config.projects.get(trustOwnerPath),
+          trustOwnerPath,
+          directory,
+          input.trusted
+        );
+        return config;
+      });
+    } catch (error) {
+      return Err(getErrorMessage(error));
+    }
+
+    this.publishProjectTrust(trustOwnerPath);
+    return Ok({ projectDir });
+  }
+
+  async setDisplayName(projectPath: string, displayName: string | null | undefined): Promise<void> {
+    const normalizedPath = stripTrailingSlashes(projectPath);
+    await this.config.editConfig((config) => {
+      const project = config.projects.get(normalizedPath);
+      if (!project) {
+        throw new Error(`Project not found: ${normalizedPath}`);
+      }
+      project.displayName = displayName ?? undefined;
+      return config;
+    });
+  }
+
+  async setColor(projectPath: string, color: string | null | undefined): Promise<void> {
+    const normalizedPath = stripTrailingSlashes(projectPath);
+    await this.config.editConfig((config) => {
+      const project = config.projects.get(normalizedPath);
+      if (!project) {
+        throw new Error(`Project not found: ${normalizedPath}`);
+      }
+      project.color = color ?? undefined;
+      return config;
+    });
+  }
+
+  async setIcon(projectPath: string, icon: string | null | undefined): Promise<void> {
+    const normalizedPath = stripTrailingSlashes(projectPath);
+    await this.config.editConfig((config) => {
+      const project = config.projects.get(normalizedPath);
+      if (!project) {
+        throw new Error(`Project not found: ${normalizedPath}`);
+      }
+      project.icon = icon ?? undefined;
+      return config;
+    });
+  }
+
+  async setCustomInstructions(
+    projectPath: string,
+    customInstructions: string | null | undefined
+  ): Promise<void> {
+    const normalizedPath = stripTrailingSlashes(projectPath);
+    await this.config.editConfig((config) => {
+      const project = config.projects.get(normalizedPath);
+      if (!project) {
+        throw new Error(`Project not found: ${normalizedPath}`);
+      }
+      project.customInstructions = customInstructions?.trim() ? customInstructions : undefined;
+      return config;
+    });
+  }
+
+  async setCodeWorkspaceSyncPath(
+    projectPath: string,
+    codeWorkspaceSyncPath: string | null | undefined
+  ): Promise<void> {
+    const normalizedPath = stripTrailingSlashes(projectPath);
+    const trimmed = codeWorkspaceSyncPath?.trim() ?? "";
+    if (trimmed && !trimmed.endsWith(CODE_WORKSPACE_EXTENSION)) {
+      throw new ORPCError("BAD_REQUEST", {
+        message: `Path must end with ${CODE_WORKSPACE_EXTENSION}`,
+      });
+    }
+
+    let previousValue: string | undefined;
+    await this.config.editConfig((config) => {
+      const project = config.projects.get(normalizedPath);
+      if (!project) {
+        throw new Error(`Project not found: ${normalizedPath}`);
+      }
+      previousValue = project.codeWorkspaceSyncPath;
+      project.codeWorkspaceSyncPath = trimmed || undefined;
+      return config;
+    });
+
+    if (!trimmed) {
+      return;
+    }
+    const result = await syncProjectCodeWorkspace(this.config, normalizedPath);
+    if (result.ok) {
+      return;
+    }
+    // Best effort (#4748): a failed rollback must not replace the sync error the user needs.
+    await this.config
+      .editConfig((config) => {
+        const project = config.projects.get(normalizedPath);
+        if (project?.codeWorkspaceSyncPath === trimmed) {
+          project.codeWorkspaceSyncPath = previousValue;
+        }
+        return config;
+      })
+      .catch((rollbackError: unknown) => {
+        log.warn("Failed to roll back the code workspace sync path", {
+          projectPath: normalizedPath,
+          error: getErrorMessage(rollbackError),
+        });
+      });
+    throw new ORPCError("BAD_REQUEST", { message: result.error });
+  }
   // ─────────────────────────────────────────────────────────────────────────────
   // Section Management
   // ─────────────────────────────────────────────────────────────────────────────
@@ -1792,5 +2400,39 @@ export class ProjectService {
       const message = getErrorMessage(error);
       return Err(`Failed to assign workspace to sub-project: ${message}`);
     }
+  }
+
+  async assignWorkspaceToSubProjectAndSync(
+    projectPath: string,
+    workspaceId: string,
+    subProjectPath: string | null
+  ): Promise<Result<void>> {
+    const previousMetadata = (await this.config.getAllWorkspaceMetadata()).find(
+      (metadata) => metadata.id === workspaceId
+    );
+    const result = await this.assignWorkspaceToSubProject(projectPath, workspaceId, subProjectPath);
+    if (!result.success) {
+      return result;
+    }
+
+    await this.workspaceMetadataRefresher?.refreshAndEmitMetadata(workspaceId);
+    if (subProjectPath !== null) {
+      await syncProjectCodeWorkspace(this.config, subProjectPath);
+    }
+    const previousSubProjectPath =
+      previousMetadata?.subProjectPath != null
+        ? stripTrailingSlashes(previousMetadata.subProjectPath)
+        : null;
+    const newSubProjectPath = subProjectPath !== null ? stripTrailingSlashes(subProjectPath) : null;
+    if (
+      previousMetadata &&
+      previousSubProjectPath !== null &&
+      previousSubProjectPath !== newSubProjectPath
+    ) {
+      await syncProjectCodeWorkspace(this.config, previousSubProjectPath, {
+        extraManagedRootDirs: managedRootsByProject(previousMetadata).get(previousSubProjectPath),
+      });
+    }
+    return result;
   }
 }

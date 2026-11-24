@@ -13,9 +13,9 @@ import {
   parseXumHomeLegacyFallbackDirName,
   resolveLegacyMuxBuiltInSkillName,
   resolveXumEnvironmentValue,
-  SUPPORTED_XUM_PROTOCOL_SCHEMES,
   withLegacyMuxEnvironmentAliases,
 } from "./legacyMux";
+import { resolveXumEnvironmentEntry } from "./xumEnv";
 
 describe("legacy mux environment compatibility", () => {
   test("promotes legacy values to canonical XUM names", () => {
@@ -34,6 +34,20 @@ describe("legacy mux environment compatibility", () => {
     expect(env.XUM_ROOT).toBe("/canonical");
     expect(env.MUX_ROOT).toBe("/canonical");
     expect(resolveXumEnvironmentValue("ROOT", env)).toBe("/canonical");
+  });
+
+  test("names the variable that supplied the resolved value", () => {
+    expect(
+      resolveXumEnvironmentEntry("ROOT", { XUM_ROOT: "/canonical", MUX_ROOT: "/legacy" })
+    ).toEqual({
+      name: "XUM_ROOT",
+      value: "/canonical",
+    });
+    expect(resolveXumEnvironmentEntry("ROOT", { MUX_ROOT: "/legacy" })).toEqual({
+      name: "MUX_ROOT",
+      value: "/legacy",
+    });
+    expect(resolveXumEnvironmentEntry("ROOT", {})).toBeUndefined();
   });
 
   test("keeps the pre-mux multiple-instance spelling synchronized", () => {
@@ -120,11 +134,5 @@ describe("local product-home tilde prefixes", () => {
     expect(getLocalProductHomeTildeSuffix(`~/${XUM_HOME_DIR_NAME}-dev`)).toBeUndefined();
     expect(getLocalProductHomeTildeSuffix(`~/${LEGACY_MUX_HOME_DIR_NAME}rc`)).toBeUndefined();
     expect(getLocalProductHomeTildeSuffix("~/projects")).toBeUndefined();
-  });
-});
-
-describe("deep-link protocol compatibility", () => {
-  test("prefers xum while retaining mux as an accepted alias", () => {
-    expect(SUPPORTED_XUM_PROTOCOL_SCHEMES).toEqual(["xum", "mux"]);
   });
 });

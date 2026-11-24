@@ -1,19 +1,26 @@
+import { resolveToolPolicyForAgent } from "./agentDefinitions/resolveToolPolicy";
+import { isSessionHistoryDisabled } from "@/common/utils/tools/toolPolicy";
+import { resolveAgentFrontmatter } from "./agentDefinitions/agentDefinitionsService";
+import { LocalRuntime } from "@/node/runtime/LocalRuntime";
+import { ToolBridge } from "./ptc/toolBridge";
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import * as fsPromises from "node:fs/promises";
 import * as path from "node:path";
 import { z } from "zod";
 import type { Tool } from "ai";
 
-import {
-  applyToolPolicyAndExperiments,
-  reconcileHookReplacedCodeExecution,
-  resolveBackendGatedPtcExperiments,
-} from "./toolAssembly";
+import { applyToolPolicyAndExperiments } from "./toolAssembly";
 import { buildToolsetManifest } from "./turnEnvelope";
 import { sandboxHostService } from "@/node/services/sandbox/sandboxHostService";
 import { DisposableTempDir } from "@/node/services/tempDir";
 import { appendRefinementEvent } from "@/node/services/refinement/refinementJournal";
 import { listRefinements } from "@/node/services/refinement/refinementRollback";
+import { createFileEditInsertTool } from "./tools/file_edit_insert";
+import { createFileEditReplaceStringTool } from "./tools/file_edit_replace_string";
+import { getTestDeps } from "./tools/testHelpers";
+// The Node layer: these tests read through host runtimes.
+import { nodeRuntimeFactory as runtimeFactory } from "@/node/services/runtimeFactory/nodeRuntimeFactory";
+import { nodeSessionLocks } from "@/node/services/sessionLocks/nodeSessionLocks";
 
 function executableTool(description: string): Tool {
   return {
@@ -24,14 +31,112 @@ function executableTool(description: string): Tool {
 }
 
 describe("applyToolPolicyAndExperiments", () => {
-  test("exclusive PTC mode keeps mcp_prompt_get directly visible", async () => {
+  test("PTC keeps literal file edits direct without duplicating them in the sandbox", async () => {
+    using tmp = new DisposableTempDir("ptc-direct-file-edits");
+    const deps = {
+      sessionLocks: nodeSessionLocks,
+      ...getTestDeps(),
+      cwd: tmp.path,
+      runtime: new LocalRuntime(tmp.path),
+      runtimeTempDir: tmp.path,
+    };
+    const tools = await applyToolPolicyAndExperiments({
+      allTools: {
+        file_edit_insert: createFileEditInsertTool(deps),
+        file_edit_replace_string: createFileEditReplaceStringTool(deps),
+        bash: executableTool("Run a command"),
+      },
+      effectiveToolPolicy: undefined,
+      experiments: { programmaticToolCalling: true },
+      emitNestedToolEvent: () => undefined,
+    });
+    expect(Object.keys(tools).sort()).toEqual([
+      "code_execution",
+      "file_edit_insert",
+      "file_edit_replace_string",
+    ]);
+
+    // JSON, shell substitutions, and Markdown fences are literal document data,
+    // not source to be repaired by a JavaScript parser.
+    const content = [
+      "# Handoff",
+      'HTTP 200 `{"status":"ok"}`',
+      '`${String(key)}:${version}` and "quoted" text',
+      "```sh",
+      "printf '%s\\n' \"${HOME}\"",
+      "```",
+      "",
+    ].join("\n");
+    const options = { toolCallId: "direct-edit", messages: [], context: undefined };
+    const filePath = path.join(tmp.path, "handoff.md");
+    expect(
+      await tools.file_edit_insert.execute!({ path: filePath, content }, options)
+    ).toMatchObject({ success: true });
+    expect(await fsPromises.readFile(filePath, "utf8")).toBe(content);
+
+    const oldString = '{"status":"ok"}';
+    const newString = '{"status":"ready","note":"it\'s literal"}';
+    expect(
+      await tools.file_edit_replace_string.execute!(
+        { path: filePath, old_string: oldString, new_string: newString },
+        options
+      )
+    ).toMatchObject({ success: true });
+    expect(await fsPromises.readFile(filePath, "utf8")).toBe(content.replace(oldString, newString));
+
+    // A duplicate bridge would bypass request.assemble filters/wrappers.
+    const evaluated: unknown = await tools.code_execution.execute!(
+      {
+        code: "return [typeof xum.file_edit_insert, typeof xum.file_edit_replace_string, typeof xum.bash];",
+      },
+      options
+    );
+    expect(evaluated).toMatchObject({
+      success: true,
+      result: ["undefined", "undefined", "function"],
+    });
+  });
+
+  test.each(["policy", "grants"] as const)(
+    "PTC direct file edits still obey %s",
+    async (ceiling) => {
+      const tools = await applyToolPolicyAndExperiments({
+        allTools: {
+          file_edit_insert: executableTool("Insert text"),
+          file_edit_replace_string: executableTool("Replace text"),
+          bash: executableTool("Run a command"),
+        },
+        effectiveToolPolicy:
+          ceiling === "policy" ? [{ regex_match: "file_edit_.*", action: "disable" }] : undefined,
+        capabilityGrants:
+          ceiling === "grants"
+            ? {
+                version: 1,
+                bridgeTools: { allow: ["bash"] },
+                vars: false,
+                hostEvents: false,
+              }
+            : undefined,
+        experiments: { programmaticToolCalling: true },
+        emitNestedToolEvent: () => undefined,
+      });
+      expect(Object.keys(tools)).toEqual(["code_execution"]);
+      const evaluated: unknown = await tools.code_execution.execute!(
+        { code: "return [typeof xum.file_edit_insert, typeof xum.file_edit_replace_string];" },
+        { toolCallId: "denied-edit", messages: [], context: undefined }
+      );
+      expect(evaluated).toMatchObject({ success: true, result: ["undefined", "undefined"] });
+    }
+  );
+
+  test("PTC keeps mcp_prompt_get directly visible", async () => {
     const result = await applyToolPolicyAndExperiments({
       allTools: {
         bash: executableTool("Run a command"),
         mcp_prompt_get: executableTool("Fetch a prompt\n\nAvailable MCP prompts:\n- mcp__s__p"),
       },
       effectiveToolPolicy: undefined,
-      experiments: { programmaticToolCallingExclusive: true },
+      experiments: { programmaticToolCalling: true },
       emitNestedToolEvent: () => undefined,
     });
 
@@ -42,6 +147,100 @@ describe("applyToolPolicyAndExperiments", () => {
     // hide the prompt catalog.
     expect(names).toContain("mcp_prompt_get");
     expect(result.mcp_prompt_get.description).toContain("mcp__s__p");
+
+    // Promoted tools must not ALSO stay bridged: request.assemble hooks see
+    // only top-level tools, and a bridged duplicate would keep dispatching
+    // the pre-hook implementation behind a hook's filter or wrapper.
+    const evalResult = (await result.code_execution.execute!(
+      { code: "return typeof mux.mcp_prompt_get;" },
+      { toolCallId: "test-call-id", messages: [], context: undefined }
+    )) as { success: boolean; result?: unknown };
+    expect(evalResult.success).toBe(true);
+    expect(evalResult.result).toBe("undefined");
+  });
+
+  test("context-coupled tools stay model-visible under PTC; media tools bridge", async () => {
+    // memory: AIService keys system-prompt context (memory index and
+    // guidance) off their top-level presence. attach_file /
+    // desktop_screenshot are bridgeable instead: the ToolBridge strips their
+    // base64 from sandbox-visible values and the code_execution attachments
+    // carrier delivers the real bytes to request-time extraction, so nested
+    // media reaches the model without a top-level tool slot.
+    const result = await applyToolPolicyAndExperiments({
+      allTools: {
+        bash: executableTool("Run a command"),
+        memory: executableTool("Memory"),
+        attach_file: executableTool("Attach"),
+        desktop_screenshot: executableTool("Screenshot"),
+      },
+      effectiveToolPolicy: undefined,
+      experiments: { programmaticToolCalling: true },
+      emitNestedToolEvent: () => undefined,
+    });
+    expect(Object.keys(result).sort()).toEqual(["code_execution", "memory"]);
+
+    // The media tools must actually be reachable inside the sandbox; hidden
+    // from the model-visible set but not dropped.
+    const evalResult = (await result.code_execution.execute!(
+      { code: "return [typeof mux.attach_file, typeof mux.desktop_screenshot];" },
+      { toolCallId: "test-call-id", messages: [], context: undefined }
+    )) as { success: boolean; result?: unknown };
+    expect(evalResult.success).toBe(true);
+    expect(evalResult.result).toEqual(["function", "function"]);
+  });
+
+  test("a disable-all policy yields no tools at all (no code_execution)", async () => {
+    // Auto-compaction inherits the original send's experiment flags and sets a
+    // `.*` disable policy: that no-tools contract must win over the exclusive
+    // posture's otherwise-mandatory code_execution.
+    const result = await applyToolPolicyAndExperiments({
+      allTools: { bash: executableTool("Run a command"), todo_write: executableTool("Todos") },
+      effectiveToolPolicy: [{ regex_match: ".*", action: "disable" }],
+      experiments: { programmaticToolCalling: true },
+      emitNestedToolEvent: () => undefined,
+    });
+    expect(Object.keys(result)).toEqual([]);
+  });
+
+  test("an allowlist that re-enables code_execution keeps the exclusive entry point", async () => {
+    // [disable .*, enable code_execution] empties the base-tool record, but
+    // the last matching rule explicitly enables the synthesized entry point —
+    // it must not be misread as a no-tools contract.
+    const result = await applyToolPolicyAndExperiments({
+      allTools: { bash: executableTool("Run a command") },
+      effectiveToolPolicy: [
+        { regex_match: ".*", action: "disable" },
+        { regex_match: "code_execution", action: "enable" },
+      ],
+      experiments: { programmaticToolCalling: true },
+      emitNestedToolEvent: () => undefined,
+    });
+    expect(Object.keys(result)).toEqual(["code_execution"]);
+  });
+
+  test("policy-required bridgeable tools stay model-visible in the exclusive set", async () => {
+    // "require" gates run completion on a TOP-LEVEL toolResult for that name
+    // (StreamManager.createStopWhenCondition); a nested xum.* call never
+    // satisfies it, so the required tool must not be bridged away.
+    const result = await applyToolPolicyAndExperiments({
+      allTools: {
+        bash: executableTool("Run a command"),
+        file_read: executableTool("Read a file"),
+      },
+      effectiveToolPolicy: [{ regex_match: "bash", action: "require" }],
+      experiments: { programmaticToolCalling: true },
+      emitNestedToolEvent: () => undefined,
+    });
+    expect(Object.keys(result).sort()).toEqual(["bash", "code_execution"]);
+
+    // The promoted tool leaves the bridge entirely (no duplicated dispatch
+    // path that assemble hooks cannot see); other bridgeable tools remain.
+    const evalResult = (await result.code_execution.execute!(
+      { code: "return [typeof mux.bash, typeof mux.file_read];" },
+      { toolCallId: "test-call-id", messages: [], context: undefined }
+    )) as { success: boolean; result?: unknown };
+    expect(evalResult.success).toBe(true);
+    expect(evalResult.result).toEqual(["undefined", "function"]);
   });
 
   test("grant-denied tools are hidden from the model but stubbed in the sandbox", async () => {
@@ -75,6 +274,297 @@ describe("applyToolPolicyAndExperiments", () => {
     expect(evalResult.success).toBe(true);
     expect(evalResult.result).toBe("Capability denied: xum.bash is not granted for this sandbox");
   });
+});
+
+describe("one tool set across agent-mode switches (#5253)", () => {
+  // Allowlists list code_execution so the PTC cases keep PTC (#7028).
+  const planPolicy = [
+    { regex_match: ".*", action: "disable" as const },
+    { regex_match: "file_read|code_execution", action: "enable" as const },
+  ];
+  const execPolicy = [
+    { regex_match: ".*", action: "disable" as const },
+    { regex_match: "file_read|mutate|code_execution", action: "enable" as const },
+  ];
+
+  function toolsWithSideEffect() {
+    const calls: unknown[] = [];
+    const allTools: Record<string, Tool> = {
+      mutate: {
+        description: "Change something",
+        inputSchema: z.object({}),
+        execute: (input: unknown) => {
+          calls.push(input);
+          return Promise.resolve({ success: true });
+        },
+      } as unknown as Tool,
+      file_read: executableTool("Read a file"),
+      secret_admin: executableTool("Allowed by no switchable agent"),
+    };
+    return { allTools, calls };
+  }
+
+  const assemble = (
+    allTools: Record<string, Tool>,
+    active: typeof planPolicy,
+    activeAgentId: string,
+    programmaticToolCalling = false
+  ) =>
+    applyToolPolicyAndExperiments({
+      allTools,
+      effectiveToolPolicy: active,
+      switchableAgentToolPolicies: [active, planPolicy, execPolicy],
+      activeAgentId,
+      experiments: { programmaticToolCalling },
+      emitNestedToolEvent: () => undefined,
+    });
+
+  test("advertises the same tools in every mode and refuses the active mode's denied tools", async () => {
+    const { allTools, calls } = toolsWithSideEffect();
+    const inPlan = await assemble(allTools, planPolicy, "plan");
+    const inExec = await assemble(allTools, execPolicy, "exec");
+
+    const shape = (tools: Record<string, Tool>) =>
+      JSON.stringify(Object.entries(tools).map(([name, tool]) => [name, tool.description]));
+    expect(shape(inPlan)).toBe(shape(inExec));
+    // Tools no switchable agent allows stay out, as before.
+    expect(Object.keys(inPlan)).toEqual(["mutate", "file_read"]);
+
+    const options = { toolCallId: "call-1", messages: [], context: undefined };
+    expect(await inPlan.mutate.execute!({}, options)).toEqual({
+      success: false,
+      error: "Tool 'mutate' is not allowed in plan mode. Switch agents to use it.",
+    });
+    expect(calls).toEqual([]);
+    expect(await inExec.mutate.execute!({}, options)).toEqual({ success: true });
+    expect(calls).toHaveLength(1);
+  });
+
+  test("a denied provider-executed tool stays absent instead of getting a local refusal", async () => {
+    const { allTools } = toolsWithSideEffect();
+    // Provider-executed: the provider runs it server-side, never a local execute.
+    allTools.native_search = { type: "provider", id: "test.search", args: {} } as unknown as Tool;
+    const nativePolicy = [
+      ...execPolicy,
+      { regex_match: "native_search", action: "enable" as const },
+    ];
+    const tools = await applyToolPolicyAndExperiments({
+      allTools,
+      effectiveToolPolicy: planPolicy,
+      switchableAgentToolPolicies: [planPolicy, nativePolicy],
+      activeAgentId: "plan",
+      emitNestedToolEvent: () => undefined,
+    });
+    expect(tools.native_search).toBeUndefined();
+    expect(tools.mutate).toBeDefined();
+  });
+
+  test("an active deny-all policy gets no code_execution even if another mode allows tools", async () => {
+    const { allTools } = toolsWithSideEffect();
+    const denyAll = [{ regex_match: ".*", action: "disable" as const }];
+    const tools = await applyToolPolicyAndExperiments({
+      allTools,
+      effectiveToolPolicy: denyAll,
+      switchableAgentToolPolicies: [denyAll, execPolicy],
+      activeAgentId: "quiet",
+      experiments: { programmaticToolCalling: true },
+      emitNestedToolEvent: () => undefined,
+    });
+    expect(tools.code_execution).toBeUndefined();
+  });
+
+  test("PTC promotes required tools the same way in every mode", async () => {
+    const requirePlan = [...planPolicy, { regex_match: "mutate", action: "require" as const }];
+    const shapes = await Promise.all(
+      [requirePlan, execPolicy].map(async (active) => {
+        const { allTools } = toolsWithSideEffect();
+        const tools = await applyToolPolicyAndExperiments({
+          allTools,
+          effectiveToolPolicy: active,
+          switchableAgentToolPolicies: [requirePlan, execPolicy],
+          activeAgentId: "x",
+          experiments: { programmaticToolCalling: true },
+          emitNestedToolEvent: () => undefined,
+        });
+        return JSON.stringify(
+          Object.entries(tools).map(([name, tool]) => [name, tool.description])
+        );
+      })
+    );
+    expect(shapes[1]).toBe(shapes[0]);
+  });
+
+  test("a caller deny keeps the tool block and refuses with the caller's text", async () => {
+    const { allTools, calls } = toolsWithSideEffect();
+    const callerDeny = [{ regex_match: "mutate", action: "disable" as const }];
+    // Agent resolution keeps the caller's disable rules out of the union (#5253).
+    const assembleWithCaller = (callerToolPolicy?: typeof callerDeny) =>
+      applyToolPolicyAndExperiments({
+        allTools,
+        effectiveToolPolicy: [...execPolicy, ...(callerToolPolicy ?? [])],
+        switchableAgentToolPolicies: [execPolicy, planPolicy],
+        callerToolPolicy,
+        activeAgentId: "exec",
+        emitNestedToolEvent: () => undefined,
+      });
+    const plain = await assembleWithCaller();
+    const denied = await assembleWithCaller(callerDeny);
+
+    const shape = (tools: Record<string, Tool>) =>
+      JSON.stringify(Object.entries(tools).map(([name, tool]) => [name, tool.description]));
+    expect(shape(denied)).toBe(shape(plain));
+    const options = { toolCallId: "call-1", messages: [], context: undefined };
+    expect(await denied.mutate.execute!({}, options)).toEqual({
+      success: false,
+      error: "Tool 'mutate' is disabled for this turn.",
+    });
+    expect(calls).toEqual([]);
+  });
+
+  test("a refused tool_catalog_search stays absent, so MCP tools are not deferred behind it", async () => {
+    const { allTools } = toolsWithSideEffect();
+    allTools.tool_catalog_search = executableTool("Search the tool catalog");
+    const denySearch = [{ regex_match: "tool_catalog_search", action: "disable" as const }];
+    const tools = await applyToolPolicyAndExperiments({
+      allTools,
+      effectiveToolPolicy: denySearch,
+      switchableAgentToolPolicies: [[]],
+      callerToolPolicy: denySearch,
+      activeAgentId: "exec",
+      emitNestedToolEvent: () => undefined,
+    });
+    expect(tools.tool_catalog_search).toBeUndefined();
+    expect(tools.mutate).toBeDefined();
+  });
+
+  test("a caller policy that leaves no tools sends no tools, not refusal stubs", async () => {
+    const { allTools } = toolsWithSideEffect();
+    const denyAll = [{ regex_match: ".*", action: "disable" as const }];
+    const tools = await applyToolPolicyAndExperiments({
+      allTools,
+      effectiveToolPolicy: [...execPolicy, ...denyAll],
+      switchableAgentToolPolicies: [execPolicy, planPolicy],
+      callerToolPolicy: denyAll,
+      activeAgentId: "exec",
+      experiments: { programmaticToolCalling: true },
+      emitNestedToolEvent: () => undefined,
+    });
+    expect(Object.keys(tools)).toEqual([]);
+  });
+
+  test("PTC code_execution gets the same refusal without the side effect", async () => {
+    const { allTools, calls } = toolsWithSideEffect();
+    const tools = await assemble(allTools, planPolicy, "plan", true);
+    const evalResult = (await tools.code_execution.execute!(
+      { code: "return mux.mutate({});" },
+      { toolCallId: "test-call-id", messages: [], context: undefined }
+    )) as { success: boolean; result?: unknown };
+    expect(evalResult.result).toEqual({
+      success: false,
+      error: "Tool 'mutate' is not allowed in plan mode. Switch agents to use it.",
+    });
+    expect(calls).toEqual([]);
+  });
+});
+
+// #7028: a caller or agent deny of code_execution must also stop programmatic
+// tool calling (PTC). Before, the PTC branch synthesized a working
+// code_execution whatever the policy said about that name.
+describe("a policy that denies code_execution stops PTC (#7028)", () => {
+  const denyCodeExecution = [{ regex_match: "code_execution", action: "disable" as const }];
+  const options = { toolCallId: "call-1", messages: [], context: undefined };
+
+  function toolsWithSideEffect() {
+    const calls: unknown[] = [];
+    const allTools: Record<string, Tool> = {
+      mutate: {
+        description: "Change something",
+        inputSchema: z.object({}),
+        execute: (input: unknown) => {
+          calls.push(input);
+          return Promise.resolve({ success: true });
+        },
+      } as unknown as Tool,
+      file_read: executableTool("Read a file"),
+    };
+    return { allTools, calls };
+  }
+
+  test("with no agent allowing it, the model gets the policy-filtered flat tools", async () => {
+    const { allTools } = toolsWithSideEffect();
+    const tools = await applyToolPolicyAndExperiments({
+      allTools,
+      effectiveToolPolicy: denyCodeExecution,
+      callerToolPolicy: denyCodeExecution,
+      experiments: { programmaticToolCalling: true },
+      emitNestedToolEvent: () => undefined,
+    });
+    expect(Object.keys(tools)).toEqual(["mutate", "file_read"]);
+  });
+
+  // Grants are a ceiling that stubs bridged tools; they must not be read as a
+  // code_execution deny, or a least-privilege sandbox would lose PTC.
+  test("a grants ceiling that omits code_execution keeps it as the entry point", async () => {
+    const { allTools, calls } = toolsWithSideEffect();
+    const tools = await applyToolPolicyAndExperiments({
+      allTools,
+      effectiveToolPolicy: undefined,
+      capabilityGrants: {
+        version: 1,
+        bridgeTools: { allow: ["mutate"] },
+        vars: false,
+        hostEvents: false,
+      },
+      experiments: { programmaticToolCalling: true },
+      emitNestedToolEvent: () => undefined,
+    });
+    expect(Object.keys(tools)).toEqual(["code_execution"]);
+    expect(
+      await tools.code_execution.execute!({ code: "return mux.mutate({});" }, options)
+    ).toMatchObject({ success: true, result: { success: true } });
+    expect(calls).toHaveLength(1);
+  });
+
+  // Custom agents whose frontmatter lists tools without `.*` deny the name too.
+  test("an allowlist that does not list code_execution stops PTC", async () => {
+    const { allTools } = toolsWithSideEffect();
+    const tools = await applyToolPolicyAndExperiments({
+      allTools,
+      effectiveToolPolicy: [
+        { regex_match: ".*", action: "disable" },
+        { regex_match: "file_read", action: "enable" },
+      ],
+      experiments: { programmaticToolCalling: true },
+      emitNestedToolEvent: () => undefined,
+    });
+    expect(Object.keys(tools)).toEqual(["file_read"]);
+  });
+
+  // Exclusive PTC moves bridgeable tools behind code_execution, so a refused
+  // code_execution would also hide the allowed tools behind it. An active deny
+  // therefore gives flat tools even when another switchable agent allows
+  // code_execution: one cache miss on that switch is the price (#5253).
+  test.each([
+    ["the active agent", undefined],
+    ["the caller", denyCodeExecution],
+  ] as const)(
+    "a deny by %s gives flat tools even when another agent allows code_execution",
+    async (_label, callerToolPolicy) => {
+      const { allTools, calls } = toolsWithSideEffect();
+      const tools = await applyToolPolicyAndExperiments({
+        allTools,
+        effectiveToolPolicy: denyCodeExecution,
+        switchableAgentToolPolicies: [callerToolPolicy ? [] : denyCodeExecution, []],
+        callerToolPolicy,
+        activeAgentId: "quiet",
+        experiments: { programmaticToolCalling: true },
+        emitNestedToolEvent: () => undefined,
+      });
+      expect(Object.keys(tools)).toEqual(["mutate", "file_read"]);
+      expect(await tools.mutate.execute!({}, options)).toEqual({ success: true });
+      expect(calls).toHaveLength(1);
+    }
+  );
 });
 
 describe("persistent kernel graduation (RLM mode)", () => {
@@ -134,6 +624,43 @@ describe("persistent kernel graduation (RLM mode)", () => {
       expect(second.result).toBe(42);
     } finally {
       await sandboxHostService.disposeScope(scopeKey);
+    }
+  });
+
+  test("a refused file_read leaves no mux.load", async () => {
+    using tmp = new DisposableTempDir("tool-assembly-rlm-load-refused");
+    const loaded: string[] = [];
+    const kernelFileLoader = (args: { path: string }) => {
+      loaded.push(args.path);
+      return Promise.resolve({ content: "secret", bytes: 6, lines: 1, preview: "secret" });
+    };
+    const denyFileRead = [{ regex_match: "file_read", action: "disable" as const }];
+    const assembleLoad = async (scopeKey: string, callerToolPolicy?: typeof denyFileRead) => {
+      const tools = await applyToolPolicyAndExperiments({
+        allTools: { file_read: executableTool("Read a file") },
+        effectiveToolPolicy: callerToolPolicy,
+        // The union still allows file_read, so the refused tool stays bridged as a stub.
+        switchableAgentToolPolicies: [[]],
+        callerToolPolicy,
+        activeAgentId: "exec",
+        experiments: { programmaticToolCalling: true, rlm: true },
+        emitNestedToolEvent: () => undefined,
+        sandbox: { workspaceId: scopeKey, sessionDir: tmp.path, kernelFileLoader },
+      });
+      return tools.code_execution;
+    };
+    const allowedKey = "ws-tool-assembly-rlm-load-allowed";
+    const refusedKey = "ws-tool-assembly-rlm-load-refused";
+    try {
+      const allowed = await assembleLoad(allowedKey);
+      expect((await run(allowed, "return typeof mux.load;")).result).toBe("function");
+
+      const refused = await assembleLoad(refusedKey, denyFileRead);
+      expect((await run(refused, "return typeof mux.load;")).result).toBe("undefined");
+      expect(loaded).toEqual([]);
+    } finally {
+      await sandboxHostService.disposeScope(allowedKey);
+      await sandboxHostService.disposeScope(refusedKey);
     }
   });
 
@@ -245,7 +772,7 @@ describe("persistent kernel graduation (RLM mode)", () => {
   });
 });
 
-describe("toolset composition (PTC × RLM × exclusive)", () => {
+describe("toolset composition (PTC × RLM)", () => {
   const originalEnv = process.env.MUX_SANDBOX_PERSISTENT_MOUNTS;
 
   beforeEach(() => {
@@ -277,7 +804,6 @@ describe("toolset composition (PTC × RLM × exclusive)", () => {
     sessionDir: string,
     experiments: {
       programmaticToolCalling?: boolean;
-      programmaticToolCallingExclusive?: boolean;
       rlm?: boolean;
     },
     capabilityGrants?: Parameters<typeof applyToolPolicyAndExperiments>[0]["capabilityGrants"]
@@ -291,15 +817,6 @@ describe("toolset composition (PTC × RLM × exclusive)", () => {
       capabilityGrants,
     });
 
-  const SUPPLEMENT_NAMES = [
-    "agent_report",
-    "ask_user_question",
-    "bash",
-    "code_execution",
-    "file_read",
-    "mcp_prompt_get",
-    "todo_write",
-  ];
   // Exclusive: bridgeable tools reachable only via code_execution; the
   // interaction tools and mcp_prompt_get stay model-visible.
   const EXCLUSIVE_NAMES = [
@@ -310,48 +827,19 @@ describe("toolset composition (PTC × RLM × exclusive)", () => {
     "todo_write",
   ];
 
-  test("PTC only: supplement set, no kernel surfaces", async () => {
+  test("PTC only: exclusive narrowed set, no kernel surfaces", async () => {
     using tmp = new DisposableTempDir("compose-ptc");
     const tools = await assemble("ws-compose-ptc", tmp.path, { programmaticToolCalling: true });
-    expect(Object.keys(tools).sort()).toEqual(SUPPLEMENT_NAMES);
-    expect(tools.code_execution.description).not.toContain("Persistent kernel");
-    expect(tools.code_execution.description).not.toContain("Kernel-first");
-  });
-
-  test("PTC + RLM: exclusive-only — RLM forces the kernel-first narrowed set", async () => {
-    // RLM is exclusive-only: supplement-mode RLM measured ~2x flat tokens/cost
-    // (flat schemas + kernel defs shipped while models took the flat path), so
-    // the rlm flag implies the exclusive posture even without the exclusive
-    // experiment. This pins the removal of supplement-mode RLM.
-    using tmp = new DisposableTempDir("compose-ptc-rlm");
-    try {
-      const tools = await assemble("ws-compose-ptc-rlm", tmp.path, {
-        programmaticToolCalling: true,
-        rlm: true,
-      });
-      expect(Object.keys(tools).sort()).toEqual([...EXCLUSIVE_NAMES, "refinement_rollback"].sort());
-      expect(tools.code_execution.description).toContain("Persistent kernel");
-      expect(tools.code_execution.description).toContain("Kernel-first");
-    } finally {
-      await sandboxHostService.disposeScope("ws-compose-ptc-rlm");
-    }
-  });
-
-  test("exclusive only: narrowed set, descriptions unchanged (no kernel surfaces)", async () => {
-    using tmp = new DisposableTempDir("compose-excl");
-    const tools = await assemble("ws-compose-excl", tmp.path, {
-      programmaticToolCallingExclusive: true,
-    });
     expect(Object.keys(tools).sort()).toEqual(EXCLUSIVE_NAMES);
     expect(tools.code_execution.description).not.toContain("Persistent kernel");
     expect(tools.code_execution.description).not.toContain("Kernel-first");
   });
 
-  test("exclusive + RLM: single-kernel posture — narrowed set + rollback + kernel-first preamble", async () => {
-    using tmp = new DisposableTempDir("compose-excl-rlm");
+  test("PTC + RLM: kernel-first narrowed set + rollback + kernel-first preamble", async () => {
+    using tmp = new DisposableTempDir("compose-ptc-rlm");
     try {
-      const tools = await assemble("ws-compose-excl-rlm", tmp.path, {
-        programmaticToolCallingExclusive: true,
+      const tools = await assemble("ws-compose-ptc-rlm", tmp.path, {
+        programmaticToolCalling: true,
         rlm: true,
       });
       expect(Object.keys(tools).sort()).toEqual([...EXCLUSIVE_NAMES, "refinement_rollback"].sort());
@@ -361,17 +849,17 @@ describe("toolset composition (PTC × RLM × exclusive)", () => {
       expect(desc.startsWith("**Kernel-first workflow:**")).toBe(true);
       expect(desc).toContain("Persistent kernel");
     } finally {
-      await sandboxHostService.disposeScope("ws-compose-excl-rlm");
+      await sandboxHostService.disposeScope("ws-compose-ptc-rlm");
     }
   });
 
-  test("exclusive + RLM re-applies the grants ceiling to non-bridgeable tools and refinement_rollback", async () => {
+  test("PTC + RLM re-applies the grants ceiling to non-bridgeable tools and refinement_rollback", async () => {
     using tmp = new DisposableTempDir("compose-excl-rlm-grants");
     try {
       const tools = await assemble(
         "ws-compose-excl-rlm-grants",
         tmp.path,
-        { programmaticToolCallingExclusive: true, rlm: true },
+        { programmaticToolCalling: true, rlm: true },
         {
           version: 1,
           bridgeTools: { allow: ["file_read"] },
@@ -430,11 +918,11 @@ describe("toolset composition (PTC × RLM × exclusive)", () => {
     }
   });
 
-  test("turn-envelope manifest fingerprints the narrowed exclusive + RLM toolset", async () => {
+  test("turn-envelope manifest fingerprints the narrowed PTC + RLM toolset", async () => {
     using tmp = new DisposableTempDir("compose-envelope");
     try {
       const tools = await assemble("ws-compose-envelope", tmp.path, {
-        programmaticToolCallingExclusive: true,
+        programmaticToolCalling: true,
         rlm: true,
       });
       const manifest = buildToolsetManifest(tools);
@@ -457,63 +945,161 @@ describe("toolset composition (PTC × RLM × exclusive)", () => {
   });
 });
 
-describe("reconcileHookReplacedCodeExecution", () => {
-  test("spread-style wrapper gets the rebuilt description but keeps its execute", () => {
-    const preHook = executableTool("defs: function bash; function file_read");
-    // Middleware wrapped by spreading the pre-hook tool: same description,
-    // new execute.
-    const wrappedExecute = () => Promise.resolve({ success: true, audited: true });
-    const hookReplacement: Tool = { ...preHook, execute: wrappedExecute };
-    const rebuilt = executableTool("defs: function file_read");
-
-    const result = reconcileHookReplacedCodeExecution(preHook, hookReplacement, rebuilt);
-
-    // Model-facing metadata follows the rebuilt toolset (bash removed)...
-    expect(result.description).toBe("defs: function file_read");
-    // ...while the middleware's execution wrapper is preserved.
-    expect(result.execute).toBe(wrappedExecute);
+describe("token budget history policy", () => {
+  test.each([
+    { add: [], allowed: false },
+    { add: ["file_read"], allowed: false },
+    { add: ["session_history"], allowed: true },
+    { add: ["session_.*"], allowed: true },
+    { add: [".*"], allowed: true },
+  ])("recovery follows the agent allowlist: $add", async ({ add, allowed }) => {
+    const policy = resolveToolPolicyForAgent({
+      agents: [{ tools: { add } }],
+      isSubagent: false,
+      disableTaskToolsForDepth: false,
+    });
+    expect(isSessionHistoryDisabled(policy)).toBe(!allowed);
+    const history = executableTool("History");
+    const result = await applyToolPolicyAndExperiments({
+      allTools: { session_history: history, file_read: executableTool("Read") },
+      effectiveToolPolicy: policy,
+      experiments: { tokenBudget: true },
+      emitNestedToolEvent: () => undefined,
+    });
+    if (allowed) {
+      expect(result.session_history).toBe(history);
+    } else {
+      expect(result.session_history).toBeUndefined();
+    }
   });
 
-  test("middleware-authored description is preserved", () => {
-    const preHook = executableTool("defs: function bash; function file_read");
-    const hookReplacement = executableTool("audited code execution");
-    const rebuilt = executableTool("defs: function file_read");
+  test.each(["exec", "plan", "explore"])(
+    "%s retains recovery through its built-in inherited policy",
+    async (agentId) => {
+      using tempDir = new DisposableTempDir("history-policy");
+      const agent = await resolveAgentFrontmatter(
+        new LocalRuntime(tempDir.path),
+        tempDir.path,
+        agentId,
+        { runtimeFactory }
+      );
+      const policy = resolveToolPolicyForAgent({
+        agents: [agent],
+        isSubagent: agentId === "explore",
+        disableTaskToolsForDepth: false,
+      });
+      const history = executableTool("History");
+      const result = await applyToolPolicyAndExperiments({
+        allTools: { session_history: history },
+        effectiveToolPolicy: policy,
+        experiments: { tokenBudget: true },
+        emitNestedToolEvent: () => undefined,
+      });
+      expect(isSessionHistoryDisabled(policy)).toBe(false);
+      expect(result.session_history).toBe(history);
+    }
+  );
 
-    const result = reconcileHookReplacedCodeExecution(preHook, hookReplacement, rebuilt);
+  test.each(["session_history", "^session_history$", "session_.*", ".*"])(
+    "explicit %s disable blocks assembly and rollover gate",
+    async (name) => {
+      const policy = resolveToolPolicyForAgent({
+        agents: [{ tools: { remove: [name] } }, { tools: { add: [".*"] } }],
+        isSubagent: false,
+        disableTaskToolsForDepth: false,
+      });
+      expect(isSessionHistoryDisabled(policy)).toBe(true);
+      const result = await applyToolPolicyAndExperiments({
+        allTools: { session_history: executableTool("History") },
+        effectiveToolPolicy: policy,
+        experiments: { tokenBudget: true },
+        emitNestedToolEvent: () => undefined,
+      });
+      expect(result.session_history).toBeUndefined();
+    }
+  );
 
-    // Middleware took ownership of the model-facing contract; return it as-is.
-    expect(result).toBe(hookReplacement);
+  test("the last matching regex rule controls history access", async () => {
+    const policy = [
+      { regex_match: "session_history", action: "disable" as const },
+      { regex_match: ".*", action: "enable" as const },
+    ];
+    const assemble = (effectiveToolPolicy: typeof policy) =>
+      applyToolPolicyAndExperiments({
+        allTools: { session_history: executableTool("History") },
+        effectiveToolPolicy,
+        experiments: { tokenBudget: true },
+        emitNestedToolEvent: () => undefined,
+      });
+    expect(isSessionHistoryDisabled(policy)).toBe(false);
+    expect((await assemble(policy)).session_history).toBeDefined();
+    const disabledAgain = [...policy, { regex_match: "session_.*", action: "disable" as const }];
+    expect(isSessionHistoryDisabled(disabledAgain)).toBe(true);
+    expect((await assemble(disabledAgain)).session_history).toBeUndefined();
+  });
+
+  test("PTC leaves recovery direct and does not offer it inside the sandbox", async () => {
+    const history = executableTool("History");
+    const bridge = new ToolBridge({ session_history: history });
+    expect(bridge.getNonBridgeableTools().session_history).toBe(history);
+    const result = await applyToolPolicyAndExperiments({
+      allTools: { session_history: history, file_read: executableTool("Read") },
+      effectiveToolPolicy: [
+        { regex_match: ".*", action: "disable" },
+        { regex_match: "file_read", action: "enable" },
+        { regex_match: "session_history", action: "enable" },
+        // An allowlist must list code_execution to keep PTC (#7028).
+        { regex_match: "code_execution", action: "enable" },
+      ],
+      experiments: { tokenBudget: true, programmaticToolCalling: true },
+      emitNestedToolEvent: () => undefined,
+    });
+    expect(result.session_history).toBe(history);
+    const execution = (await result.code_execution.execute!(
+      { code: "return typeof mux.session_history;" },
+      { toolCallId: "history-ptc", messages: [], context: undefined }
+    )) as { success: boolean; result?: unknown };
+    expect(execution).toMatchObject({ success: true, result: "undefined" });
   });
 });
 
-describe("resolveBackendGatedPtcExperiments", () => {
-  const backendEnabled = new Set(["rlm-mode", "programmatic-tool-calling"]);
-  const isEnabled = (id: string) => backendEnabled.has(id);
-
-  test("backfills undefined flags from the backend override", () => {
-    // A renderer with no origin-local override sends undefined; the persisted
-    // backend override must win or tool assembly diverges from the effective
-    // UI / refine gate.
-    const resolved = resolveBackendGatedPtcExperiments(undefined, isEnabled);
-    expect(resolved.rlm).toBe(true);
-    expect(resolved.programmaticToolCalling).toBe(true);
-    expect(resolved.programmaticToolCallingExclusive).toBe(false);
-  });
-
-  test("explicit renderer values (true or false) win over the backend", () => {
-    const resolved = resolveBackendGatedPtcExperiments(
-      { rlm: false, programmaticToolCallingExclusive: true },
-      isEnabled
-    );
-    // Explicit false is NOT backfilled to the backend's true.
-    expect(resolved.rlm).toBe(false);
-    expect(resolved.programmaticToolCallingExclusive).toBe(true);
-    // Undefined still backfills.
-    expect(resolved.programmaticToolCalling).toBe(true);
-  });
-
-  test("preserves unrelated experiment flags untouched", () => {
-    const resolved = resolveBackendGatedPtcExperiments({ memory: true }, isEnabled);
-    expect(resolved.memory).toBe(true);
-  });
+describe("models_list exposure", () => {
+  // Built-in agents use `tools.add: [".*"]` with explicit removes, so the read-only
+  // catalog must survive every built-in policy, the sub-agent hard-deny and the
+  // depth-limit denial (which covers task* only).
+  test.each([
+    { agentId: "exec", isSubagent: false, disableTaskToolsForDepth: false },
+    { agentId: "plan", isSubagent: false, disableTaskToolsForDepth: false },
+    { agentId: "explore", isSubagent: true, disableTaskToolsForDepth: false },
+    { agentId: "explore", isSubagent: true, disableTaskToolsForDepth: true },
+  ])(
+    "$agentId (subagent=$isSubagent, depthDenied=$disableTaskToolsForDepth) keeps models_list",
+    async ({ agentId, isSubagent, disableTaskToolsForDepth }) => {
+      using tempDir = new DisposableTempDir("models-list-policy");
+      const agent = await resolveAgentFrontmatter(
+        new LocalRuntime(tempDir.path),
+        tempDir.path,
+        agentId,
+        { runtimeFactory }
+      );
+      const policy = resolveToolPolicyForAgent({
+        agents: [agent],
+        isSubagent,
+        disableTaskToolsForDepth,
+      });
+      const modelsList = executableTool("List models");
+      const result = await applyToolPolicyAndExperiments({
+        allTools: { models_list: modelsList, ask_user_question: executableTool("Ask") },
+        effectiveToolPolicy: policy,
+        experiments: {},
+        emitNestedToolEvent: () => undefined,
+      });
+      expect(result.models_list).toBe(modelsList);
+      // Sanity: the sub-agent hard-deny is active in the sub-agent rows (exec removes
+      // ask_user_question through its own definition, so only assert where the deny applies).
+      if (isSubagent) {
+        expect(result.ask_user_question).toBeUndefined();
+      }
+    }
+  );
 });

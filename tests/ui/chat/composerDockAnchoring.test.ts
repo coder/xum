@@ -15,7 +15,7 @@ import { mockScrollMetrics as mockScrollportMetrics } from "../scrollMetrics";
 
 function getMessageWindow(container: HTMLElement): HTMLDivElement {
   const element = container.querySelector('[data-testid="message-window"]');
-  if (!element || element.tagName !== "DIV") {
+  if (element?.tagName !== "DIV") {
     throw new Error("Message window not found");
   }
   return element as HTMLDivElement;

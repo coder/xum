@@ -40,12 +40,27 @@ function getGitHubRepo(): { owner: string; repo: string } {
 // exposing low-level electron-updater stack traces in the About dialog.
 const MISSING_UPDATE_METADATA_MESSAGE =
   "Update metadata isn't available yet. The latest release may still be publishing; please try again in a few minutes.";
+const UPDATE_SERVER_UNREACHABLE_MESSAGE =
+  "The update server didn't respond. This is usually a temporary GitHub problem; please try again in a few minutes.";
 const MAX_USER_VISIBLE_UPDATE_ERROR_LENGTH = 240;
+
+/**
+ * GitHub's own front end answers release-metadata requests with a gateway
+ * error (502/503/504 and an HTML body) whenever its repository/release route
+ * is degraded. The install itself is fine then, so treat it as retryable.
+ * Match only the failed request's status: a raw HttpError message starts with
+ * it, and GitHubProvider's wrapped error keeps it as "HttpError: <code>". A
+ * bare 50x token can also be a nightly tag or header value in the message.
+ */
+function isGatewayUpdateError(error: Error): boolean {
+  return /^50[234]\b|\bHttpError: 50[234]\b/.test(error.message);
+}
 
 /**
  * Detect transient errors that should trigger silent backoff rather than
  * surfacing an error to the user. Covers:
  * - 404 (latest.yml not yet uploaded for a new release)
+ * - Gateway errors from GitHub while its release route is degraded
  * - Network errors (offline, DNS, timeout)
  * - GitHub rate-limiting (explicit rate-limit signatures only — bare 403s
  *   may indicate persistent auth/config issues and should remain visible)
@@ -53,6 +68,7 @@ const MAX_USER_VISIBLE_UPDATE_ERROR_LENGTH = 240;
 function isTransientUpdateError(error: Error): boolean {
   const msg = error.message;
   return (
+    isGatewayUpdateError(error) ||
     /404|Not Found/i.test(msg) ||
     /ENOTFOUND|ECONNREFUSED|ECONNRESET|ETIMEDOUT|EAI_AGAIN/i.test(msg) ||
     /network|socket hang up/i.test(msg) ||
@@ -83,6 +99,10 @@ function getUserVisibleCheckErrorMessage(error: Error): string {
     return MISSING_UPDATE_METADATA_MESSAGE;
   }
 
+  if (isGatewayUpdateError(error)) {
+    return UPDATE_SERVER_UNREACHABLE_MESSAGE;
+  }
+
   return sanitizeUpdateCheckErrorMessage(error.message);
 }
 
@@ -94,6 +114,7 @@ export type UpdateStatus =
   | { type: "up-to-date" } // Explicitly checked, no updates available
   | { type: "downloading"; percent: number }
   | { type: "downloaded"; info: UpdateInfo }
+  | { type: "restarting"; info: UpdateInfo }
   | { type: "error"; phase: "check" | "download" | "install"; message: string };
 
 /**
@@ -116,6 +137,8 @@ export class UpdaterService {
     install: 0,
   };
   private checkSource: "auto" | "manual" = "auto";
+  // Kept so an install retry after an install error still knows which version is restarting.
+  private downloadedInfo: UpdateInfo | null = null;
   private subscribers = new Set<(status: UpdateStatus) => void>();
   private currentChannel: UpdateChannel = "stable";
 
@@ -124,11 +147,11 @@ export class UpdaterService {
     autoUpdater.autoDownload = false; // Wait for user confirmation
     autoUpdater.autoInstallOnAppQuit = true;
 
-    // Set up event handlers
     this.setupEventHandlers();
 
-    this.currentChannel = initialChannel;
-    this.applyChannel(initialChannel);
+    // A shared config may carry the server-only npm preference.
+    this.currentChannel = initialChannel === "npm" ? "stable" : initialChannel;
+    this.applyChannel(this.currentChannel);
 
     // Parse DEBUG_UPDATER for dev mode and optional fake version/fail phase
     const debugConfig = parseDebugUpdater(
@@ -222,6 +245,7 @@ export class UpdaterService {
 
     autoUpdater.on("update-downloaded", (info: UpdateInfo) => {
       log.info("Update downloaded:", info.version);
+      this.downloadedInfo = info;
       this.updateStatus = { type: "downloaded", info };
       this.notifyRenderer();
     });
@@ -258,10 +282,12 @@ export class UpdaterService {
         return;
       }
 
+      // quitAndInstall() can also fail through this event (missing installer, native updater
+      // error); that is an install failure the user may retry, not a check failure.
       const phase =
         this.updateStatus.type === "downloading"
           ? "download"
-          : this.updateStatus.type === "downloaded"
+          : this.updateStatus.type === "downloaded" || this.updateStatus.type === "restarting"
             ? "install"
             : this.updateStatus.type === "error"
               ? this.updateStatus.phase
@@ -305,7 +331,7 @@ export class UpdaterService {
     // Skip when a check/download is already in progress or an update
     // is ready to install — the 4-hour interval fires unconditionally,
     // and we don't want it clobbering active states.
-    const dominated = ["checking", "downloading", "downloaded"] as const;
+    const dominated = ["checking", "downloading", "downloaded", "restarting"] as const;
     if ((dominated as readonly string[]).includes(this.updateStatus.type)) {
       // If a check is already in flight and the user explicitly triggers a manual
       // check, upgrade the source so transient failures surface to the user.
@@ -470,6 +496,7 @@ export class UpdaterService {
       // Mark as downloaded
       const version = this.fakeVersion;
       const fakeDownloadedInfo = { version } satisfies Partial<UpdateInfo> as UpdateInfo;
+      this.downloadedInfo = fakeDownloadedInfo;
       this.updateStatus = {
         type: "downloaded",
         info: fakeDownloadedInfo,
@@ -491,9 +518,11 @@ export class UpdaterService {
    * Install a downloaded update and restart the app
    */
   installUpdate(): void {
+    const info = this.downloadedInfo;
     if (
-      this.updateStatus.type !== "downloaded" &&
-      !(this.updateStatus.type === "error" && this.updateStatus.phase === "install")
+      info === null ||
+      (this.updateStatus.type !== "downloaded" &&
+        !(this.updateStatus.type === "error" && this.updateStatus.phase === "install"))
     ) {
       throw new Error("No update downloaded to install");
     }
@@ -514,6 +543,11 @@ export class UpdaterService {
       return;
     }
 
+    // The renderer must swap to the restart screen before quitAndInstall(), which can block for
+    // seconds (Squirrel on macOS) or spawn an installer while the window is still visible.
+    this.updateStatus = { type: "restarting", info };
+    this.notifyRenderer();
+
     try {
       markUpdateInstallInProgress();
       autoUpdater.quitAndInstall();
@@ -530,14 +564,17 @@ export class UpdaterService {
   }
 
   setChannel(channel: UpdateChannel): void {
+    if (channel === "npm") throw new Error("The npm update channel is server-only");
     if (this.currentChannel === channel) {
       return;
     }
 
-    const blockedStates = ["checking", "downloading", "downloaded"] as const;
+    // "restarting" is blocked too: resetting to idle here would drop the renderer's restart
+    // screen while quitAndInstall() is still in flight.
+    const blockedStates = ["checking", "downloading", "downloaded", "restarting"] as const;
     if ((blockedStates as readonly string[]).includes(this.updateStatus.type)) {
       throw new Error(
-        `Cannot switch update channel while ${this.updateStatus.type === "checking" ? "checking for updates" : this.updateStatus.type === "downloading" ? "downloading an update" : "an update is ready to install"}`
+        `Cannot switch update channel while ${this.updateStatus.type === "checking" ? "checking for updates" : this.updateStatus.type === "downloading" ? "downloading an update" : this.updateStatus.type === "restarting" ? "an update is installing" : "an update is ready to install"}`
       );
     }
 

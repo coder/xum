@@ -1,12 +1,14 @@
 import type { Meta, StoryObj } from "@storybook/react-vite";
-import { waitFor } from "@storybook/test";
-import type { ReactNode } from "react";
+import { expect, userEvent, waitFor, within } from "storybook/test";
+import { useState, type ReactNode } from "react";
+import { APIContext } from "@/browser/contexts/API";
 import { BackgroundBashProvider } from "@/browser/contexts/BackgroundBashContext";
 import { BashBackgroundListToolCall } from "@/browser/features/Tools/BashBackgroundListToolCall";
 import { BashBackgroundTerminateToolCall } from "@/browser/features/Tools/BashBackgroundTerminateToolCall";
 import { BashOutputToolCall } from "@/browser/features/Tools/BashOutputToolCall";
 import { BashToolCall } from "@/browser/features/Tools/BashToolCall";
-import { lightweightMeta } from "@/browser/stories/meta.js";
+import { SandboxApprovalCard } from "@/browser/features/Tools/SandboxApprovalCard";
+import { lightweightMeta, PIXEL_DISABLED } from "@/browser/stories/meta.js";
 
 const meta = {
   ...lightweightMeta,
@@ -370,4 +372,132 @@ export const OverflowNotice: Story = {
       />
     </ToolStoryShell>
   ),
+};
+
+/**
+ * A tool_pre or plugin tool.execute.before hook blocked the call: the result is `{ error }`
+ * without `success` (#6044). The expanded card shows the hook's reason, at phone width too.
+ */
+/** A long unbroken token (no spaces or hyphens): it must wrap inside the error box at phone width. */
+const LONG_POLICY_PATH =
+  "/home/runner/work/acme_monorepo/acme_monorepo/.xum/hooks/policies/protected_branches/force_push_guard/main_branch_protection_policy.sh";
+
+export const HookBlockedPhone: Story = {
+  parameters: { pixel: { matrix: { themes: ["dark"], viewports: ["phone"] } } },
+  globals: { viewport: { value: "mobile1", isRotated: false } },
+  render: () => (
+    <ToolStoryShell>
+      {/* Fixed phone width: the test runner ignores viewport globals (AGENTS.md). */}
+      <div style={{ width: 390, maxWidth: "100%" }} data-testid="phone-frame">
+        <BashToolCall
+          workspaceId={STORYBOOK_WORKSPACE_ID}
+          toolCallId="hook-blocked"
+          args={{
+            script: "rm -rf ./build && git push --force origin main",
+            run_in_background: false,
+            timeout_secs: 30,
+            display_name: "Force push",
+          }}
+          // The runtime shape a blocking hook returns; the static result type omits it.
+          result={
+            {
+              error: `Blocked by hook: force-pushing to main is not allowed in this repository. Open a pull request instead. Policy: ${LONG_POLICY_PATH}`,
+            } as unknown as NonNullable<Parameters<typeof BashToolCall>[0]["result"]>
+          }
+          status="failed"
+        />
+      </div>
+    </ToolStoryShell>
+  ),
+  play: async ({ canvasElement }) => {
+    const canvas = within(canvasElement);
+    await userEvent.click(canvas.getByText("rm -rf ./build && git push --force origin main"));
+    await expect(await canvas.findByText(/^Blocked by hook: force-pushing/)).toBeVisible();
+    // No horizontal overflow, the long unbroken path included.
+    const frame = canvas.getByTestId("phone-frame");
+    await expect(frame.scrollWidth).toBeLessThanOrEqual(frame.clientWidth + 1);
+    const reason = canvas.getByText(/^Blocked by hook: force-pushing/);
+    await expect(reason.scrollWidth).toBeLessThanOrEqual(reason.clientWidth + 1);
+    await expect(reason.getBoundingClientRect().right).toBeLessThanOrEqual(
+      frame.getBoundingClientRect().right + 1
+    );
+  },
+};
+
+/** A command the sandbox blocked: the header badge and the footer name the first denial. */
+export const SandboxDenied: Story = {
+  parameters: { pixel: PIXEL_DISABLED },
+  render: () => (
+    <ToolStoryShell>
+      <BashToolCall
+        workspaceId={STORYBOOK_WORKSPACE_ID}
+        toolCallId="sandbox-denied"
+        args={{
+          script: "echo 'export PATH=$HOME/bin:$PATH' >> ~/.zshrc",
+          run_in_background: false,
+          timeout_secs: 10,
+          display_name: "Update shell profile",
+        }}
+        result={{
+          success: false,
+          output: "zsh: operation not permitted: /Users/me/.zshrc",
+          error: "Command exited with code 1",
+          exitCode: 1,
+          wall_duration_ms: 42,
+          sandboxDenials: ["write /Users/me/.zshrc"],
+        }}
+        status="failed"
+      />
+    </ToolStoryShell>
+  ),
+};
+
+/** The card shown while a call waits for the user; the buttons answer this call once. */
+function SandboxApprovalStory() {
+  const [answer, setAnswer] = useState<string>("none");
+  const api = {
+    workspace: {
+      answerSandboxApproval: (input: { approved: boolean }) => {
+        setAnswer(input.approved ? "run outside once" : "deny");
+        return Promise.resolve({ success: true, data: undefined });
+      },
+    },
+  };
+  return (
+    <APIContext.Provider
+      value={{
+        status: "connected",
+        api: api as never,
+        error: null,
+        authenticate: () => undefined,
+        retry: () => undefined,
+      }}
+    >
+      <ToolStoryShell>
+        <SandboxApprovalCard
+          approval={{
+            workspaceId: STORYBOOK_WORKSPACE_ID,
+            toolCallId: "sandbox-approval",
+            script: "git push origin HEAD",
+            reason: "git push over SSH needs the ssh-agent socket, which the sandbox closes.",
+            timestamp: 1,
+          }}
+          isLatest
+        />
+        <div className="text-muted text-xs" aria-live="polite">
+          Last answer: {answer}
+        </div>
+      </ToolStoryShell>
+    </APIContext.Provider>
+  );
+}
+
+export const SandboxApproval: Story = {
+  parameters: { pixel: PIXEL_DISABLED },
+  render: () => <SandboxApprovalStory />,
+  play: async ({ canvasElement }) => {
+    const canvas = within(canvasElement);
+    await userEvent.click(await canvas.findByRole("button", { name: /^Run outside once/ }));
+    await canvas.findByText("Last answer: run outside once");
+  },
 };

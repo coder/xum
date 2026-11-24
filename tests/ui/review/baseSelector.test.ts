@@ -9,6 +9,7 @@ import "../dom";
 import { fireEvent, waitFor } from "@testing-library/react";
 
 import { shouldRunIntegrationTests } from "../../testUtils";
+import type { TestEnvironment } from "../../ipc/setup";
 import {
   cleanupSharedRepo,
   configureTestRetries,
@@ -20,8 +21,11 @@ import { installDom } from "../dom";
 import { renderReviewPanel, type RenderedApp } from "../renderReviewPanel";
 import { cleanupView, setupWorkspaceView } from "../helpers";
 import type { FrontendWorkspaceMetadata } from "@/common/types/workspace";
-import { STORAGE_KEYS, WORKSPACE_DEFAULTS } from "@/constants/workspaceDefaults";
-import { updatePersistedState } from "@/browser/hooks/usePersistedState";
+import { STORAGE_KEYS } from "@/constants/workspaceDefaults";
+import { readPersistedState, updatePersistedState } from "@/browser/hooks/usePersistedState";
+import type { APIClient } from "@/browser/contexts/API";
+import { getAppConfigStore } from "@/browser/stores/AppConfigStore";
+import { trackApiCalls, type ApiCallTracker } from "../apiCallTracker";
 
 configureTestRetries(2);
 
@@ -54,20 +58,57 @@ async function setupReviewPanel(
 }
 
 /**
- * Open the base selector dropdown by clicking the trigger button.
- * The component uses conditional rendering (not portal), so dropdown is inside container.
+ * Wait until trunk detection has set the workspace's first base. A base that lands while the
+ * dropdown is open replaces its search text, and that text then filters HEAD out (#6143).
  */
-async function openBaseSelectorDropdown(container: HTMLElement): Promise<void> {
+async function waitForInitialBase(
+  view: RenderedApp,
+  env: TestEnvironment,
+  metadata: FrontendWorkspaceMetadata
+): Promise<void> {
+  const branchResult = await env.orpc.projects.listBranches({ projectPath: metadata.projectPath });
+  // The shared repo has no origin remote, so origin/<trunk> does not exist: the default is
+  // the local trunk, not a ref that fails every diff (#5682).
+  const expectedInitialBase = branchResult.recommendedTrunk?.trim();
+  expect(expectedInitialBase).toBeTruthy();
+  await waitFor(() => expect(getDisplayedBase(view.container)).toBe(expectedInitialBase), {
+    timeout: 5_000,
+  });
+}
+
+/**
+ * Track the dropdown's existence check: it lists HEAD and the other refs only once its
+ * executeBash call answers, and that call waits for workspace init (#6143). ReviewPanel's own
+ * trunk check never includes HEAD, so the filter matches the dropdown's check alone.
+ */
+function trackRevisionChecks(): ApiCallTracker {
+  return trackApiCalls("workspace", "executeBash", (input) =>
+    input.script.includes("'HEAD^{commit}'")
+  );
+}
+
+/**
+ * Open the base selector dropdown by clicking the trigger button and wait for its existence
+ * check to answer. The component uses conditional rendering (not portal), so dropdown is
+ * inside container.
+ */
+async function openBaseSelectorDropdown(
+  container: HTMLElement,
+  revisionChecks: ApiCallTracker
+): Promise<void> {
   const trigger = await waitFor(
     () => {
-      const btn = container.querySelector('[data-testid="review-base-value"]') as HTMLElement;
+      const btn = container.querySelector('[data-testid="review-base-value"]')!;
       if (!btn) throw new Error("Base selector trigger not found");
       return btn;
     },
     { timeout: 5_000 }
   );
 
+  // Every open re-checks; await this open's check rather than race it with a deadline.
+  const checked = revisionChecks.nextSettled();
   fireEvent.click(trigger);
+  await checked;
 
   // Wait for dropdown to appear with input field
   await waitFor(
@@ -85,7 +126,7 @@ async function openBaseSelectorDropdown(container: HTMLElement): Promise<void> {
 async function selectBaseSuggestion(container: HTMLElement, base: string): Promise<void> {
   const button = await waitFor(
     () => {
-      const btn = container.querySelector(`[data-testid="base-suggestion-${base}"]`) as HTMLElement;
+      const btn = container.querySelector(`[data-testid="base-suggestion-${base}"]`)!;
       if (!btn) throw new Error(`Base suggestion "${base}" not found`);
       return btn;
     },
@@ -132,43 +173,29 @@ describeIntegration("ReviewPanel base selector", () => {
     await withSharedWorkspace("anthropic", async ({ env, workspaceId, metadata }) => {
       const cleanupDom = installDom();
 
-      // Reset persisted review-base keys so this test validates trunk auto-detection
+      // Reset the persisted workspace review base so this test validates trunk auto-detection
       // rather than inheriting state from prior tests in the same browser storage.
-      updatePersistedState(STORAGE_KEYS.reviewDefaultBase(metadata.projectPath), null);
       updatePersistedState(STORAGE_KEYS.reviewDiffBase(workspaceId), null);
 
+      const revisionChecks = trackRevisionChecks();
       const view = renderReviewPanel({
-        apiClient: env.orpc,
+        apiClient: revisionChecks.wrap(env.orpc),
         metadata,
       });
 
       try {
         await setupReviewPanel(view, metadata, workspaceId);
+        await waitForInitialBase(view, env, metadata);
 
-        const branchResult = await env.orpc.projects.listBranches({
-          projectPath: metadata.projectPath,
-        });
-        const expectedInitialBase =
-          branchResult.recommendedTrunk && branchResult.recommendedTrunk.trim().length > 0
-            ? `origin/${branchResult.recommendedTrunk.trim()}`
-            : WORKSPACE_DEFAULTS.reviewBase;
-
-        await waitFor(
-          () => {
-            expect(getDisplayedBase(view.container)).toBe(expectedInitialBase);
-          },
-          { timeout: 5_000 }
-        );
-
-        // Open dropdown and click HEAD~1
-        await openBaseSelectorDropdown(view.container);
-        await selectBaseSuggestion(view.container, "HEAD~1");
+        // Open dropdown and click HEAD
+        await openBaseSelectorDropdown(view.container, revisionChecks);
+        await selectBaseSuggestion(view.container, "HEAD");
         await waitForDropdownClose(view.container);
 
         // Verify the displayed value updated
         await waitFor(
           () => {
-            expect(getDisplayedBase(view.container)).toBe("HEAD~1");
+            expect(getDisplayedBase(view.container)).toBe("HEAD");
           },
           { timeout: 5_000 }
         );
@@ -182,19 +209,21 @@ describeIntegration("ReviewPanel base selector", () => {
     await withSharedWorkspace("anthropic", async ({ env, workspaceId, metadata }) => {
       const cleanupDom = installDom();
 
+      const revisionChecks = trackRevisionChecks();
       const view = renderReviewPanel({
-        apiClient: env.orpc,
+        apiClient: revisionChecks.wrap(env.orpc),
         metadata,
       });
 
       try {
         await setupReviewPanel(view, metadata, workspaceId);
+        await waitForInitialBase(view, env, metadata);
 
         // Click through multiple suggestions
-        const selections = ["HEAD~1", "main", "origin/main"];
+        const selections = ["HEAD", "--staged", "HEAD"];
 
         for (const base of selections) {
-          await openBaseSelectorDropdown(view.container);
+          await openBaseSelectorDropdown(view.container, revisionChecks);
           await selectBaseSuggestion(view.container, base);
           await waitForDropdownClose(view.container);
 
@@ -207,9 +236,99 @@ describeIntegration("ReviewPanel base selector", () => {
         }
 
         // Final verification
-        expect(getDisplayedBase(view.container)).toBe("origin/main");
+        expect(getDisplayedBase(view.container)).toBe("HEAD");
       } finally {
         await cleanupView(view, cleanupDom);
+      }
+    });
+  }, 90_000);
+
+  // #5682: the list offered origin/main and other refs that do not exist in this repo.
+  test("offers only suggestions that exist in the repository", async () => {
+    await withSharedWorkspace("anthropic", async ({ env, workspaceId, metadata }) => {
+      const cleanupDom = installDom();
+      const revisionChecks = trackRevisionChecks();
+      const view = renderReviewPanel({ apiClient: revisionChecks.wrap(env.orpc), metadata });
+
+      try {
+        await setupReviewPanel(view, metadata, workspaceId);
+        await waitForInitialBase(view, env, metadata);
+        await openBaseSelectorDropdown(view.container, revisionChecks);
+        // HEAD exists in any repo with a commit; the existence check has answered.
+        await waitFor(() => {
+          if (!view.container.querySelector('[data-testid="base-suggestion-HEAD"]')) {
+            throw new Error("HEAD suggestion not shown yet");
+          }
+        });
+        // No origin remote, and the repo has a single commit.
+        for (const missing of ["origin/main", "origin/develop", "develop", "HEAD~1", "HEAD~2"]) {
+          expect(
+            view.container.querySelector(`[data-testid="base-suggestion-${missing}"]`)
+          ).toBeNull();
+        }
+        expect(
+          view.container.querySelector('[data-testid="base-suggestion---staged"]')
+        ).not.toBeNull();
+      } finally {
+        await cleanupView(view, cleanupDom);
+      }
+    });
+  }, 90_000);
+
+  test("a project default that loads after the startup gate wins over trunk detection", async () => {
+    await withSharedWorkspace("anthropic", async ({ env, workspaceId, metadata }) => {
+      const cleanupDom = installDom();
+      const projectPath = metadata.projectPath;
+      const baseKey = STORAGE_KEYS.reviewDiffBase(workspaceId);
+      const setProjectBase = (base: string | null) =>
+        env.orpc.config.updateUserPreferences({
+          patches: [{ review: { defaultBaseByProject: { [projectPath]: base } } }],
+        });
+      await setProjectBase("HEAD");
+      updatePersistedState(baseKey, null);
+      // A fresh app has no snapshot; the store keeps the previous test's.
+      getAppConfigStore().clearCachedState();
+
+      let releaseConfigRead!: () => void;
+      const configReadReleased = new Promise<void>((resolve) => (releaseConfigRead = resolve));
+      const heldConfig = new Proxy(env.orpc.config, {
+        get(target, prop, receiver) {
+          if (prop !== "getConfig") return Reflect.get(target, prop, receiver) as unknown;
+          return async (...args: Parameters<APIClient["config"]["getConfig"]>) => {
+            await configReadReleased;
+            return target.getConfig(...args);
+          };
+        },
+      });
+      const apiClient = new Proxy(env.orpc, {
+        get: (target, prop, receiver) =>
+          prop === "config" ? heldConfig : (Reflect.get(target, prop, receiver) as unknown),
+      });
+      const view = renderReviewPanel({ apiClient, metadata });
+
+      try {
+        await setupReviewPanel(view, metadata, workspaceId);
+        // Trunk detection would persist a base within this window if it ran unguarded.
+        await expect(
+          waitFor(
+            () => {
+              if (readPersistedState<string | null>(baseKey, null) === null) {
+                throw new Error("workspace base not written");
+              }
+            },
+            { timeout: 3_000 }
+          )
+        ).rejects.toThrow("workspace base not written");
+
+        releaseConfigRead();
+        await waitFor(() => expect(getDisplayedBase(view.container)).toBe("HEAD"), {
+          timeout: 10_000,
+        });
+        expect(readPersistedState<string | null>(baseKey, null)).toBeNull();
+      } finally {
+        releaseConfigRead();
+        await cleanupView(view, cleanupDom);
+        await setProjectBase(null);
       }
     });
   }, 90_000);

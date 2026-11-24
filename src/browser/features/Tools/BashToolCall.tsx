@@ -15,17 +15,25 @@ import {
   ErrorBox,
   ExitCodeBadge,
 } from "./Shared/ToolPrimitives";
-import { useToolExpansion, getStatusDisplay, type ToolStatus } from "./Shared/toolUtils";
+import {
+  useToolExpansion,
+  getStatusDisplay,
+  normalizeToolResultForRendering,
+  type ToolStatus,
+} from "./Shared/toolUtils";
 import { formatDuration } from "@/common/utils/formatDuration";
 import { cn } from "@/common/lib/utils";
 import { ElapsedTimeDisplay } from "./Shared/ElapsedTimeDisplay";
-import { useBashToolLiveOutput } from "@/browser/stores/WorkspaceStore";
+import { useBashSandboxApproval, useBashToolLiveOutput } from "@/browser/stores/WorkspaceStore";
 import { useForegroundBashToolCallIds } from "@/browser/stores/BackgroundBashStore";
 import { useBackgroundBashActions } from "@/browser/contexts/BackgroundBashContext";
+import { useChatHostContext } from "@/browser/contexts/ChatHostContext";
 import { Tooltip, TooltipTrigger, TooltipContent } from "@/browser/components/Tooltip/Tooltip";
 import { buildBashCollapsedSummary } from "./bashCollapsedSummary";
 import { useBashCollapsedSummaryMode } from "./BashCollapsedSummaryModeContext";
 import { BackgroundBashOutputDialog } from "@/browser/components/BackgroundBashOutputDialog/BackgroundBashOutputDialog";
+import { SandboxApprovalCard, SandboxBadge } from "./SandboxApprovalCard";
+import { describeSandboxDenials } from "./sandboxDenialSummary";
 
 interface BashToolCallProps {
   workspaceId?: string;
@@ -44,6 +52,34 @@ const EMPTY_LIVE_OUTPUT: BashLiveOutputView = {
   combined: "",
   truncated: false,
 };
+
+/**
+ * A blocking tool_pre or plugin tool.execute.before hook returns `{ error }` without `success`
+ * (#6044): that shape is model-visible and replayed, so the card reads the reason from any
+ * non-empty `error` instead of requiring `success: false`. The shared normalizer unwraps the SDK
+ * JSON container (`{ type: "json", value }`); the object check keeps a primitive result (0,
+ * false) from throwing in the `in` check below.
+ */
+function getResultErrorText(result: BashToolResult | undefined): string | null {
+  const normalizedResult: unknown = normalizeToolResultForRendering(result);
+  const errorText: unknown =
+    typeof normalizedResult === "object" && normalizedResult !== null && "error" in normalizedResult
+      ? normalizedResult.error
+      : undefined;
+  return typeof errorText === "string" && errorText.length > 0 ? errorText : null;
+}
+
+function SandboxDenialBadge(props: { summary: string | null }) {
+  return props.summary === null ? null : <SandboxBadge label="Sandbox" className="ml-2" />;
+}
+
+/** Shown collapsed too: it explains the badge and why the command failed. */
+function SandboxDenialFooter(props: { summary: string | null }) {
+  if (props.summary === null) return null;
+  return (
+    <div className="text-warning mt-1 font-sans text-[11px] wrap-anywhere">{props.summary}</div>
+  );
+}
 
 export const BashToolCall: React.FC<BashToolCallProps> = ({
   workspaceId,
@@ -71,6 +107,15 @@ export const BashToolCall: React.FC<BashToolCallProps> = ({
     status === "executing" ? workspaceId : undefined
   );
   const { sendToBackground } = useBackgroundBashActions();
+  // Hosts that cannot send a foreground bash to the background (the VS Code webview) hide the
+  // control instead of offering an action their bridge refuses.
+  const { uiSupport } = useChatHostContext();
+  const canHostSendToBackground = uiSupport.bashForegroundControls === "supported";
+  // Hosts without the output dialog hide its button.
+  const canViewOutput = uiSupport.backgroundBashOutput === "supported";
+
+  // Set while the backend waits for the user to let this call run once outside the sandbox.
+  const sandboxApproval = useBashSandboxApproval(workspaceId, toolCallId);
 
   const liveOutput = useBashToolLiveOutput(
     shouldTrackLiveBashState ? workspaceId : undefined,
@@ -87,6 +132,8 @@ export const BashToolCall: React.FC<BashToolCallProps> = ({
 
   const liveOutputView = liveOutput ?? EMPTY_LIVE_OUTPUT;
   const combinedLiveOutput = liveOutputView.combined;
+
+  const resultError = getResultErrorText(result);
 
   const isPending = status === "executing" || status === "pending";
   const backgroundProcessId =
@@ -121,7 +168,7 @@ export const BashToolCall: React.FC<BashToolCallProps> = ({
     toolCallId && workspaceId && foregroundBashToolCallIds.has(toolCallId)
   );
   const handleSendToBackground =
-    toolCallId && workspaceId
+    canHostSendToBackground && toolCallId && workspaceId
       ? () => {
           sendToBackground(toolCallId);
         }
@@ -133,6 +180,12 @@ export const BashToolCall: React.FC<BashToolCallProps> = ({
   const completedOutput = isBackgroundResult ? undefined : result?.output;
   const completedHasOutput = typeof completedOutput === "string" && completedOutput.length > 0;
   const showCompletedOutputSection = !isBackgroundResult && (completedHasOutput || Boolean(note));
+  const sandboxDenialSummary = describeSandboxDenials(result);
+
+  if (sandboxApproval) {
+    // The script the backend runs, which a plugin hook may have rewritten: not args.script.
+    return <SandboxApprovalCard {...sandboxApproval} />;
+  }
 
   return (
     <ToolContainer expanded={expanded}>
@@ -176,7 +229,7 @@ export const BashToolCall: React.FC<BashToolCallProps> = ({
             {bashCollapsedSummary.command}
           </span>
         )}
-        {isBackground && backgroundProcessId && workspaceId && (
+        {isBackground && backgroundProcessId && workspaceId && canViewOutput && (
           <Tooltip>
             <TooltipTrigger asChild>
               <button
@@ -185,6 +238,7 @@ export const BashToolCall: React.FC<BashToolCallProps> = ({
                   e.stopPropagation();
                   setOutputDialogOpen(true);
                 }}
+                aria-label="View output"
                 className="text-muted hover:text-secondary ml-2 rounded p-1 transition-colors"
               >
                 <FileText size={12} />
@@ -209,11 +263,18 @@ export const BashToolCall: React.FC<BashToolCallProps> = ({
             )}
           >
             timeout: {args.timeout_secs ?? BASH_DEFAULT_TIMEOUT_SECS}s
-            {result && ` • took ${formatDuration(result.wall_duration_ms)}`}
+            {/* Kernel-mode nested reloads reconstruct partial results without
+                wall_duration_ms/exitCode; skip those fields instead of
+                rendering "took —" and an empty exit-code pill. */}
+            {typeof result?.wall_duration_ms === "number" &&
+              ` • took ${formatDuration(result.wall_duration_ms)}`}
             {!result && <ElapsedTimeDisplay startedAt={startedAt} isActive={isPending} />}
           </span>
         )}
-        {!isBackground && result && <ExitCodeBadge exitCode={result.exitCode} className="ml-2" />}
+        {!isBackground && typeof result?.exitCode === "number" && (
+          <ExitCodeBadge exitCode={result.exitCode} className="ml-2" />
+        )}
+        <SandboxDenialBadge summary={sandboxDenialSummary} />
         <StatusIndicator status={effectiveStatus}>
           {getStatusDisplay(effectiveStatus)}
         </StatusIndicator>
@@ -224,6 +285,7 @@ export const BashToolCall: React.FC<BashToolCallProps> = ({
             <TooltipTrigger asChild>
               <button
                 type="button"
+                aria-label="Send to background"
                 onClick={(e) => {
                   e.stopPropagation(); // Don't toggle expand
                   handleSendToBackground();
@@ -268,7 +330,9 @@ export const BashToolCall: React.FC<BashToolCallProps> = ({
           )}
           <DetailSection>
             <DetailLabel>Script</DetailLabel>
-            <DetailContent className="px-2 py-1.5">{args.script}</DetailContent>
+            {/* Capped at the block's max height; the bottom edge fades while more of the command
+                is below the cut, since phones hide the scrollbar (#5769). */}
+            <DetailContent className="scroll-fade-y px-2 py-1.5">{args.script}</DetailContent>
           </DetailSection>
 
           {/* Truncation notices */}
@@ -280,10 +344,11 @@ export const BashToolCall: React.FC<BashToolCallProps> = ({
 
           {result && (
             <>
-              {result.success === false && result.error && (
+              {resultError !== null && (
                 <DetailSection>
                   <DetailLabel>Error</DetailLabel>
-                  <ErrorBox>{result.error}</ErrorBox>
+                  {/* Hook reasons can carry long unbroken paths: wrap them at phone width. */}
+                  <ErrorBox className="wrap-anywhere whitespace-pre-wrap">{resultError}</ErrorBox>
                 </DetailSection>
               )}
 
@@ -356,6 +421,7 @@ export const BashToolCall: React.FC<BashToolCallProps> = ({
           )}
         </ToolDetails>
       )}
+      <SandboxDenialFooter summary={sandboxDenialSummary} />
     </ToolContainer>
   );
 };

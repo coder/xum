@@ -1,6 +1,8 @@
-import { describe, expect, test } from "bun:test";
+import { afterEach, describe, expect, mock, spyOn, test } from "bun:test";
 
-import type { MuxMessage } from "@/common/types/message";
+import { createMuxMessage, type MuxMessage } from "@/common/types/message";
+import { EventLoopYielder } from "@/node/utils/concurrency/eventLoopYielder";
+import * as tokenizerModule from "@/node/utils/main/tokenizer";
 import type { LanguageModelV2Usage } from "@ai-sdk/provider";
 import {
   collectUniqueToolNames,
@@ -11,8 +13,106 @@ import {
   getConsumerInfoForToolCall,
   isEncryptedWebSearch,
   mergeResults,
+  calculateTokenStats,
   type TokenCountJob,
 } from "./tokenStatsCalculator";
+import { getTotalCost } from "./usageAggregator";
+import { accumulateStepsProviderMetadata, addUsage } from "./usageHelpers";
+
+describe("calculateTokenStats", () => {
+  afterEach(() => {
+    mock.restore();
+  });
+
+  // #4643: a 1.24M-row epoch submitted every message for counting in one synchronous loop and
+  // blocked the whole server (pings, heartbeats, other subscriptions) for 10+ s.
+  test("lets due timers run while it submits a long history for counting", async () => {
+    let submissions = 0;
+    let submissionsWhenTimerRan: number | undefined;
+    const tokenizer: tokenizerModule.Tokenizer = {
+      encoding: "test",
+      countTokens: () => {
+        submissions++;
+        // Arm the timer mid-loop: a single yield before the loop would also let a timer armed
+        // up front run, without un-blocking the loop itself.
+        if (submissions === 1) {
+          setTimeout(() => {
+            submissionsWhenTimerRan = submissions;
+          }, 0);
+        }
+        return Promise.resolve(1);
+      },
+    };
+    spyOn(tokenizerModule, "getTokenizerForModel").mockResolvedValue(tokenizer);
+    // Report every budget as spent so the check does not depend on how fast this machine is.
+    spyOn(EventLoopYielder.prototype, "isDue").mockReturnValue(true);
+    const messages = Array.from({ length: 4 }, (_, i) =>
+      createMuxMessage(`m${i}`, i % 2 === 0 ? "user" : "assistant", `message ${i}`)
+    );
+
+    const stats = await calculateTokenStats(messages, "anthropic:claude-sonnet-4-5", null, {
+      enableAgentReport: false,
+    });
+
+    expect(submissionsWhenTimerRan).toBeDefined();
+    expect(submissionsWhenTimerRan!).toBeLessThan(messages.length);
+    expect(submissions).toBe(messages.length);
+    expect(stats.totalTokens).toBe(messages.length);
+  });
+
+  // Server mode treats an unhandled rejection as fatal, so a count that fails while the loop is
+  // yielding must reach the caller, not the process (bun fails the test on an unhandled one).
+  test("rejects with a count failure that happens while it yields", async () => {
+    let calls = 0;
+    const tokenizer: tokenizerModule.Tokenizer = {
+      encoding: "test",
+      countTokens: () =>
+        ++calls === 1 ? Promise.reject(new Error("worker died")) : Promise.resolve(1),
+    };
+    spyOn(tokenizerModule, "getTokenizerForModel").mockResolvedValue(tokenizer);
+    spyOn(EventLoopYielder.prototype, "isDue").mockReturnValue(true);
+    const messages = Array.from({ length: 4 }, (_, i) =>
+      createMuxMessage(`m${i}`, "user", `message ${i}`)
+    );
+
+    const failure = await calculateTokenStats(messages, "anthropic:claude-sonnet-4-5", null, {
+      enableAgentReport: false,
+    }).then(
+      () => null,
+      (error: unknown) => error
+    );
+    expect(failure).toBeInstanceOf(Error);
+    expect((failure as Error).message).toBe("worker died");
+    expect(calls).toBe(messages.length);
+  });
+
+  // #4653: counts are collected per yield slice and concatenated, so a slice flattened out of
+  // order or a dropped final slice would hand counts to the wrong consumers.
+  test("per-consumer totals stay correct when counts span several yield slices", async () => {
+    const tokenizer: tokenizerModule.Tokenizer = {
+      encoding: "test",
+      countTokens: (text) => Promise.resolve(text.startsWith("assistant") ? 1000 : 1),
+    };
+    spyOn(tokenizerModule, "getTokenizerForModel").mockResolvedValue(tokenizer);
+    // A slice ends on every third message; 11 messages leave a partial final slice. Assistant
+    // messages (every fourth) fall at different offsets in each slice, so reordering slices
+    // moves counts between consumers.
+    let isDueCalls = 0;
+    spyOn(EventLoopYielder.prototype, "isDue").mockImplementation(() => ++isDueCalls % 3 === 0);
+    const messages = Array.from({ length: 11 }, (_, i) => {
+      const role = i % 4 === 0 ? "assistant" : "user";
+      return createMuxMessage(`m${i}`, role, `${role} ${i}`);
+    });
+
+    const stats = await calculateTokenStats(messages, "anthropic:claude-sonnet-4-5", null, {
+      enableAgentReport: false,
+    });
+
+    const tokensFor = (name: string) => stats.consumers.find((c) => c.name === name)?.tokens;
+    expect(tokensFor("Assistant")).toBe(3 * 1000);
+    expect(tokensFor("User")).toBe(8);
+  });
+});
 
 describe("createDisplayUsage", () => {
   test("uses usage.reasoningTokens when available", () => {
@@ -360,6 +460,50 @@ test("resolves mapped metadata model for usage history costs", () => {
   expect(result.usageHistory.length).toBe(1);
   expect(result.usageHistory[0].input.cost_usd).not.toBeUndefined();
   expect(result.usageHistory[0].input.cost_usd).toBeGreaterThan(0);
+});
+
+test("keeps a recorded long-context share only under a model with the same threshold", () => {
+  const recordingModel = "anthropic:claude-haiku-5-5"; // 100K threshold
+  const priceUnder = (mappedToModel: string, prompts: number[]) => {
+    const steps = prompts.map((inputTokens) => ({
+      usage: { inputTokens, outputTokens: 500, totalTokens: inputTokens + 500 },
+    }));
+    const usage = steps.reduce<LanguageModelV2Usage | undefined>(
+      (sum, step) => addUsage(sum, step.usage),
+      undefined
+    )!;
+    const message: MuxMessage = {
+      id: "1",
+      role: "assistant",
+      parts: [],
+      metadata: {
+        usage,
+        model: "ollama:custom",
+        metadataModel: recordingModel,
+        providerMetadata: accumulateStepsProviderMetadata(steps, recordingModel),
+      },
+    };
+    const providersConfig = {
+      ollama: {
+        apiKeySet: false,
+        isEnabled: true,
+        isConfigured: true,
+        models: [{ id: "custom", mappedToModel }],
+      },
+    };
+    const [priced] = extractSyncMetadata([message], "ollama:custom", providersConfig).usageHistory;
+    return { priced: getTotalCost(priced), usage };
+  };
+  const oneRequest = (usage: LanguageModelV2Usage, model: string) =>
+    getTotalCost(createDisplayUsage(usage, "ollama:custom", undefined, model));
+
+  // Two 75K requests, each under the threshold, still price at base rates.
+  const sameThreshold = priceUnder(recordingModel, [75_000, 75_000]);
+  expect(sameThreshold.priced).toBeLessThan(oneRequest(sameThreshold.usage, recordingModel)!);
+
+  // A 150K request classified long under Haiku 5.5 is under GPT-6 Sol's 272K threshold.
+  const remapped = priceUnder("openai:gpt-6-sol", [150_000]);
+  expect(remapped.priced).toBeCloseTo(oneRequest(remapped.usage, "openai:gpt-6-sol")!, 12);
 });
 
 describe("getConsumerInfoForToolCall", () => {

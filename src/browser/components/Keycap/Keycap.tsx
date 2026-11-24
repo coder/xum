@@ -21,6 +21,7 @@ const KEY_DISPLAY_MAP: Record<string, string> = {
   ArrowRight: "→",
   Escape: "Esc",
   Enter: "↵",
+  Backspace: "⌫",
   Shift: "⇧",
   " ": "Space",
 };
@@ -35,12 +36,10 @@ const WIN_KEY_MAP: Record<string, string> = {
   Cmd: "Ctrl",
 };
 
-/**
- * Single key cap (styled <kbd>)
- */
-export const Keycap: React.FC<KeycapProps> = (props) => {
+/** The glyph or short name a key label displays as (e.g. "ArrowUp" as an arrow, "Ctrl" as ⌘ on Mac). */
+export function formatKeyLabel(key: string): string {
   const onMac = isMac();
-  let label = props.children;
+  let label = key;
 
   // Apply platform-specific mappings first
   if (onMac && label in MAC_KEY_MAP) {
@@ -58,6 +57,14 @@ export const Keycap: React.FC<KeycapProps> = (props) => {
   if (label.length === 1 && /[a-z]/.test(label)) {
     label = label.toUpperCase();
   }
+  return label;
+}
+
+/**
+ * Single key cap (styled <kbd>)
+ */
+export const Keycap: React.FC<KeycapProps> = (props) => {
+  const label = formatKeyLabel(props.children);
 
   return (
     <kbd

@@ -1,6 +1,15 @@
 import { useCallback, useEffect, useState } from "react";
+import {
+  SETTINGS_GROUP_HEADING_CLASS,
+  SettingsAnchor,
+  SettingsMark,
+} from "../Components/SettingsLayout";
+import { ConfigurableBindUrlControls } from "./ExperimentsSection";
+import { useExperimentValue } from "@/browser/hooks/useExperiments";
+import { EXPERIMENT_IDS } from "@/common/constants/experiments";
 import { Button } from "@/browser/components/Button/Button";
-import { useAPI } from "@/browser/contexts/API";
+import { useAPI, useLiveAPI } from "@/browser/contexts/API";
+import { isConnectionLostError } from "@/browser/contexts/connectionLink";
 import type { ServerAuthSession } from "@/common/orpc/types";
 import { getErrorMessage } from "@/common/utils/errors";
 
@@ -33,8 +42,43 @@ function formatRelativeTime(timestampMs: number): string {
   return `${Math.floor(deltaMs / dayMs)}d ago`;
 }
 
+function SessionRow(props: {
+  session: ServerAuthSession;
+  disabled: boolean;
+  revoking: boolean;
+  onRevoke: () => void;
+}) {
+  const session = props.session;
+  return (
+    <div className="flex items-center justify-between gap-3 px-3 py-2">
+      <div className="min-w-0 flex-1">
+        <div className="text-foreground truncate text-sm font-medium">
+          {session.label}
+          {session.isCurrent ? " (Current)" : ""}
+        </div>
+        <div className="text-muted text-xs">
+          Last active {formatRelativeTime(session.lastUsedAtMs)} · Created{" "}
+          {formatTimestamp(session.createdAtMs)}
+        </div>
+      </div>
+
+      <Button
+        variant={session.isCurrent ? "destructive" : "ghost"}
+        size="sm"
+        onClick={props.onRevoke}
+        disabled={props.disabled || props.revoking}
+      >
+        {props.revoking ? "Revoking..." : session.isCurrent ? "Log out" : "Revoke"}
+      </Button>
+    </div>
+  );
+}
+
 export function ServerAccessSection() {
   const { api, retry } = useAPI();
+  // Offline, the kept sessions stay on screen, but every action is disabled: it could not reach
+  // the server, and a click must not look like it did something.
+  const offline = useLiveAPI() == null;
   const [sessions, setSessions] = useState<ServerAuthSession[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
@@ -43,7 +87,7 @@ export function ServerAccessSection() {
 
   const refreshSessions = useCallback(async () => {
     if (!api) {
-      setSessions([]);
+      // Offline, keep the shown sessions: the reconnect reloads them.
       setLoading(false);
       return;
     }
@@ -55,6 +99,8 @@ export function ServerAccessSection() {
       const nextSessions = await api.serverAuth.listSessions();
       setSessions(nextSessions);
     } catch (refreshError) {
+      // A lost connection is no load failure: keep the shown sessions for the reconnect.
+      if (isConnectionLostError(refreshError)) return;
       const message = getErrorMessage(refreshError);
       setError(message);
       setSessions([]);
@@ -126,6 +172,7 @@ export function ServerAccessSection() {
   return (
     <div className="space-y-4">
       <div>
+        <SettingsMark id="server-sessions" />
         <h3 className="text-foreground text-sm font-medium">Server access sessions</h3>
         <p className="text-muted mt-1 text-xs">
           Manage browser sessions for this server. Revoke devices you no longer trust.
@@ -137,7 +184,7 @@ export function ServerAccessSection() {
           variant="secondary"
           size="sm"
           onClick={() => void refreshSessions()}
-          disabled={loading}
+          disabled={loading || offline}
         >
           Refresh
         </Button>
@@ -147,7 +194,7 @@ export function ServerAccessSection() {
           onClick={() => {
             void handleRevokeOthers();
           }}
-          disabled={loading || revokingOthers || !canRevokeOtherSessions}
+          disabled={loading || offline || revokingOthers || !canRevokeOtherSessions}
         >
           {revokingOthers ? "Revoking..." : "Revoke other sessions"}
         </Button>
@@ -155,41 +202,24 @@ export function ServerAccessSection() {
 
       {error ? <div className="text-destructive text-xs">{error}</div> : null}
 
-      {loading ? (
+      {/* A reload (Refresh, reconnect) keeps the shown sessions: "Loading" only replaces an empty list. */}
+      {loading && sessions.length === 0 ? (
         <div className="text-muted text-xs">Loading sessions...</div>
       ) : sessions.length === 0 ? (
         <div className="text-muted text-xs">No active sessions found.</div>
       ) : (
         <div className="border-border-light divide-border-light divide-y rounded-md border">
-          {sessions.map((session) => {
-            const revokingThisSession = revokingSessionId === session.id;
-
-            return (
-              <div key={session.id} className="flex items-center justify-between gap-3 px-3 py-2">
-                <div className="min-w-0 flex-1">
-                  <div className="text-foreground truncate text-sm font-medium">
-                    {session.label}
-                    {session.isCurrent ? " (Current)" : ""}
-                  </div>
-                  <div className="text-muted text-xs">
-                    Last active {formatRelativeTime(session.lastUsedAtMs)} · Created{" "}
-                    {formatTimestamp(session.createdAtMs)}
-                  </div>
-                </div>
-
-                <Button
-                  variant={session.isCurrent ? "destructive" : "ghost"}
-                  size="sm"
-                  onClick={() => {
-                    void handleRevokeSession(session);
-                  }}
-                  disabled={loading || revokingThisSession}
-                >
-                  {revokingThisSession ? "Revoking..." : session.isCurrent ? "Log out" : "Revoke"}
-                </Button>
-              </div>
-            );
-          })}
+          {sessions.map((session) => (
+            <SessionRow
+              key={session.id}
+              session={session}
+              disabled={loading || offline}
+              revoking={revokingSessionId === session.id}
+              onRevoke={() => {
+                void handleRevokeSession(session);
+              }}
+            />
+          ))}
         </div>
       )}
 
@@ -198,6 +228,29 @@ export function ServerAccessSection() {
           Current session last active {formatRelativeTime(currentSession.lastUsedAtMs)}.
         </p>
       ) : null}
+
+      <LanAccessGroup />
     </div>
+  );
+}
+/** Server access → LAN / VPN access: shown while "Expose API server on LAN/VPN" is on. */
+export function LanAccessGroup() {
+  const enabled = useExperimentValue(EXPERIMENT_IDS.CONFIGURABLE_BIND_URL);
+  if (!enabled) return null;
+  return (
+    <section className="space-y-2 pt-4">
+      <div className="px-1">
+        <h3 className={SETTINGS_GROUP_HEADING_CLASS}>LAN / VPN access</h3>
+        <div className="text-content-secondary mt-1 text-xs">
+          Bind host, port and web UI for the API server (experimental).
+        </div>
+      </div>
+      <SettingsAnchor
+        id="lan-bind"
+        className="border-border-light overflow-hidden rounded-lg border"
+      >
+        <ConfigurableBindUrlControls />
+      </SettingsAnchor>
+    </section>
   );
 }

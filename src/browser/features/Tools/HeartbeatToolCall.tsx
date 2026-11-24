@@ -65,7 +65,7 @@ type BadgeTone = "enabled" | "disabled" | "cleared";
 // same across tool cards; amber means "kept but won't progress" (paused);
 // muted means "not scheduled" (cleared / not set).
 const BADGE_CLASSES: Record<BadgeTone, string> = {
-  enabled: "bg-success/10 text-success border-success/40",
+  enabled: "bg-success/10 text-success-text border-success/40",
   disabled: "bg-warning-overlay text-warning border-warning/40",
   cleared: "bg-white/5 text-secondary border-white/10",
 };
@@ -224,7 +224,14 @@ export const HeartbeatToolCall: React.FC<HeartbeatToolCallProps> = (props) => {
     badge = { tone: "cleared", label: "Cleared" };
   } else if (settings) {
     badge = settings.enabled
-      ? { tone: "enabled", label: `Every ${formatHeartbeatIntervalShort(settings.intervalMs)}` }
+      ? {
+          tone: "enabled",
+          // The tool reports the effective interval; an absent one means the global default.
+          label:
+            settings.intervalMs != null
+              ? `Every ${formatHeartbeatIntervalShort(settings.intervalMs)}`
+              : "Enabled",
+        }
       : { tone: "disabled", label: "Paused" };
   } else if (success?.action === "get") {
     badge = { tone: "cleared", label: "Not set" };
@@ -261,7 +268,7 @@ export const HeartbeatToolCall: React.FC<HeartbeatToolCallProps> = (props) => {
                 <HeartbeatStat
                   label="State"
                   value={
-                    <span className={live ? "text-success" : "text-warning"}>
+                    <span className={live ? "text-success-text" : "text-warning"}>
                       {live ? "Enabled" : "Paused"}
                     </span>
                   }
@@ -269,9 +276,13 @@ export const HeartbeatToolCall: React.FC<HeartbeatToolCallProps> = (props) => {
                 <HeartbeatStat
                   label="Cadence"
                   value={
-                    <span className="counter-nums">
-                      every {formatHeartbeatInterval(settings.intervalMs)}
-                    </span>
+                    settings.intervalMs != null ? (
+                      <span className="counter-nums">
+                        every {formatHeartbeatInterval(settings.intervalMs)}
+                      </span>
+                    ) : (
+                      "global default"
+                    )
                   }
                 />
                 <HeartbeatStat label="Context" value={ctx.label} />

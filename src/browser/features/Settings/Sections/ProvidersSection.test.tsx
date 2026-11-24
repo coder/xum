@@ -1,36 +1,33 @@
 import type React from "react";
 import { cleanup, fireEvent, render, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
-import { afterEach, beforeEach, describe, expect, mock, spyOn, test } from "bun:test";
+import { afterAll, afterEach, beforeEach, describe, expect, mock, spyOn, test } from "bun:test";
 import { installDom } from "../../../../../tests/ui/dom";
 import { createSelectPrimitiveDouble } from "../../../../../tests/ui/selectPrimitiveDouble";
-import type { APIClient } from "@/browser/contexts/API";
+import { APIContext, type APIClient } from "@/browser/contexts/API";
 import * as ActualSelectPrimitiveModule from "@/browser/components/SelectPrimitive/SelectPrimitive";
+import * as ActualProvidersConfigModule from "@/browser/hooks/useProvidersConfig";
+import * as ActualModelPreferenceRepairModule from "@/browser/utils/modelPreferenceRepair";
+import * as ActualRoutingModule from "@/browser/hooks/useRouting";
 import * as SettingsContextModule from "@/browser/contexts/SettingsContext";
-import type * as WorkspaceStoreModule from "@/browser/stores/WorkspaceStore";
-import type * as WorkspaceContextModule from "@/browser/contexts/WorkspaceContext";
+import * as ActualWorkspaceContextModule from "@/browser/contexts/WorkspaceContext";
+import { restoreModulesAfterSuite } from "../../../../../tests/ui/moduleMocks";
 import type {
   AddCustomProviderInput,
   ProviderConfigInfo,
   ProvidersConfigMap,
 } from "@/common/orpc/types";
 
-function installTestDoubles() {
-  // Bun mock.module registrations are global across files, so keep this test
-  // insulated from incomplete WorkspaceStore mocks registered by earlier files.
-  /* eslint-disable @typescript-eslint/no-require-imports */
-  const actualWorkspaceStore =
-    require("@/browser/stores/WorkspaceStore?real=1") as typeof WorkspaceStoreModule;
-  /* eslint-enable @typescript-eslint/no-require-imports */
+let repairRemovedProviderMock = mock((_provider: string) => undefined);
 
-  void mock.module("@/browser/stores/WorkspaceStore", () => ({
-    ...actualWorkspaceStore,
-  }));
-}
-
-let repairRemovedProviderMock = mock(
-  (_provider: string, _workspaceIds: Iterable<string>) => undefined
-);
+// Snapshot the real exports before any mock below replaces them: the namespace import is a live
+// binding, so restoring from it would republish the mock into later test files.
+const actualSelectPrimitiveModule = { ...ActualSelectPrimitiveModule };
+restoreModulesAfterSuite([
+  ["@/browser/components/SelectPrimitive/SelectPrimitive", actualSelectPrimitiveModule],
+  ["@/browser/utils/modelPreferenceRepair", { ...ActualModelPreferenceRepairModule }],
+  ["@/browser/hooks/useProvidersConfig", { ...ActualProvidersConfigModule }],
+]);
 
 // Radix Select portals its dropdown content, which happy-dom cannot render;
 // swap in the conditional-rendering double so option clicks work.
@@ -39,14 +36,11 @@ void mock.module("@/browser/components/SelectPrimitive/SelectPrimitive", () =>
 );
 
 void mock.module("@/browser/utils/modelPreferenceRepair", () => ({
-  repairLocalModelPreferencesForRemovedProvider: (
-    provider: string,
-    workspaceIds: Iterable<string>
-  ) => repairRemovedProviderMock(provider, workspaceIds),
+  repairLocalModelPreferencesForRemovedProvider: (provider: string) =>
+    repairRemovedProviderMock(provider),
 }));
 
 let providersConfigMock: ProvidersConfigMap | null = null;
-let apiMock: APIClient | null = null;
 const providersRefreshMock = mock(() => Promise.resolve());
 const updateOptimisticallyMock = mock((provider: string, updates: Partial<ProviderConfigInfo>) => {
   if (!providersConfigMock?.[provider]) {
@@ -64,11 +58,17 @@ void mock.module("@/browser/hooks/useProvidersConfig", () => ({
   }),
 }));
 
+const actualRoutingModule = { ...ActualRoutingModule };
+afterAll(async () => {
+  await mock.module("@/browser/hooks/useRouting", () => actualRoutingModule);
+});
+
 void mock.module("@/browser/hooks/useRouting", () => ({
   useRouting: () => ({
     routePriority: ["direct"],
     routeOverrides: {},
     resolveRoute: () => ({ route: "direct", isAuto: true, displayName: "Direct" }),
+    resolveEffectiveRoute: () => "direct",
     availableRoutes: () => [],
     setRoutePreferences: () => undefined,
     setRoutePriority: () => undefined,
@@ -76,21 +76,16 @@ void mock.module("@/browser/hooks/useRouting", () => ({
   }),
 }));
 
-void mock.module("@/browser/contexts/API", () => ({
-  useAPI: () => ({ api: apiMock }),
-}));
+// Restore the real context after this suite; the stubs below would otherwise leak into later
+// suites that render the real WorkspaceProvider (AgentContext tests).
+restoreModulesAfterSuite([
+  ["@/browser/contexts/WorkspaceContext", { ...ActualWorkspaceContextModule }],
+]);
 
-void mock.module("@/browser/contexts/PolicyContext", () => ({
-  usePolicy: () => ({
-    status: { state: "disabled" as const },
-    policy: null,
-  }),
-}));
-
-/* eslint-disable @typescript-eslint/no-require-imports */
-const actualWorkspaceContext =
-  require("@/browser/contexts/WorkspaceContext?real=1") as typeof WorkspaceContextModule;
-/* eslint-enable @typescript-eslint/no-require-imports */
+// Snapshot the real exports before the mock below. Do not load a second copy with
+// require("...?real=1"): Bun's LCOV keeps only the last-loaded copy of a file, so the copy would
+// replace WorkspaceContext.test.tsx's coverage of WorkspaceContext.tsx in the shard.
+const actualWorkspaceContext = { ...ActualWorkspaceContextModule };
 
 void mock.module("@/browser/contexts/WorkspaceContext", () => ({
   ...actualWorkspaceContext,
@@ -194,11 +189,10 @@ function patchProviderMethods(client: APIClient, providersConfig: ProvidersConfi
   };
 }
 
-function renderProvidersSection() {
-  const providersConfig = createProvidersConfig();
+function renderProvidersSection(extraProviders: ProvidersConfigMap = {}) {
+  const providersConfig = { ...createProvidersConfig(), ...extraProviders };
   providersConfigMock = providersConfig;
   const client = setupSettingsStory({ providersConfig: {} });
-  apiMock = client;
   const providerMocks = patchProviderMethods(client, providersConfig);
   const view = render(
     <SettingsSectionStory setup={() => client}>
@@ -207,6 +201,30 @@ function renderProvidersSection() {
   );
 
   return { ...view, ...providerMocks, providersConfig };
+}
+
+/** As renderProvidersSection, while Xum reconnects with the last client kept (after the switch). */
+function renderProvidersSectionOffline() {
+  const providersConfig = createProvidersConfig();
+  providersConfigMock = providersConfig;
+  const client = setupSettingsStory({ providersConfig: {} });
+  const providerMocks = patchProviderMethods(client, providersConfig);
+  const offline = {
+    status: "reconnecting" as const,
+    api: client,
+    error: null,
+    attempt: 1,
+    authenticate: () => undefined,
+    retry: () => undefined,
+  };
+  const view = render(
+    <SettingsSectionStory setup={() => client}>
+      <APIContext.Provider value={offline}>
+        <ProvidersSection />
+      </APIContext.Provider>
+    </SettingsSectionStory>
+  );
+  return { ...view, ...providerMocks };
 }
 
 function getProviderCard(button: HTMLElement): HTMLElement {
@@ -226,12 +244,8 @@ describe("ProvidersSection", () => {
     void mock.module("@/browser/components/SelectPrimitive/SelectPrimitive", () =>
       createSelectPrimitiveDouble()
     );
-    installTestDoubles();
-    repairRemovedProviderMock = mock(
-      (_provider: string, _workspaceIds: Iterable<string>) => undefined
-    );
+    repairRemovedProviderMock = mock((_provider: string) => undefined);
     providersConfigMock = null;
-    apiMock = null;
     providersRefreshMock.mockClear();
     updateOptimisticallyMock.mockClear();
   });
@@ -243,10 +257,9 @@ describe("ProvidersSection", () => {
     // restore the real SelectPrimitive for other test files.
     void mock.module(
       "@/browser/components/SelectPrimitive/SelectPrimitive",
-      () => ActualSelectPrimitiveModule
+      () => actualSelectPrimitiveModule
     );
     providersConfigMock = null;
-    apiMock = null;
     restoreDom?.();
     restoreDom = null;
   });
@@ -280,6 +293,75 @@ describe("ProvidersSection", () => {
     expect(within(customCard).getByText("Base URL")).toBeTruthy();
   });
 
+  test("refuses an invalid session header name and saves a valid one", async () => {
+    const view = renderProvidersSection();
+    const customButton = await view.findByRole("button", { name: /Acme OpenAI/ });
+    fireEvent.click(customButton);
+
+    const field = within(getProviderCard(customButton)).getByText("Session header").parentElement;
+    if (!field) throw new Error("Session header field not found");
+    fireEvent.click(within(field).getByRole("button", { name: "Set" }));
+    const input = within(field).getByRole("textbox");
+
+    // Saving an auth header name would send the workspace id as credentials.
+    await userEvent.type(input, "Authorization{Enter}");
+    expect(within(field).getByText(/cannot be "Authorization"/)).toBeTruthy();
+    expect(view.setProviderConfig).not.toHaveBeenCalled();
+
+    await userEvent.type(input, "x-opencode-session{Enter}", {
+      initialSelectionStart: 0,
+      initialSelectionEnd: "Authorization".length,
+    });
+    expect(view.setProviderConfig).toHaveBeenCalledWith({
+      provider: CUSTOM_PROVIDER_ID,
+      keyPath: ["sessionHeader"],
+      value: "x-opencode-session",
+    });
+  });
+
+  test("shows saved Google Vertex AI settings from the provider status", async () => {
+    const view = renderProvidersSection({
+      "google-vertex": {
+        apiKeySet: false,
+        isEnabled: true,
+        isConfigured: true,
+        googleVertex: { project: "my-gcp-project", location: "us-central1", keyFilenameSet: true },
+      },
+    });
+    const vertexButton = await view.findByRole("button", { name: /Google Vertex AI/ });
+
+    fireEvent.click(vertexButton);
+
+    const vertexCard = getProviderCard(vertexButton);
+    expect(within(vertexCard).getByText("my-gcp-project")).toBeTruthy();
+    expect(within(vertexCard).getByText("us-central1")).toBeTruthy();
+    // The key file is set (masked); the express mode API key is not.
+    expect(within(vertexCard).getAllByText("••••••••")).toHaveLength(1);
+    expect(within(vertexCard).getByText("Not set")).toBeTruthy();
+    // Nothing here comes from env vars, the key file included.
+    expect(within(vertexCard).queryByText("Set by env vars.")).toBeNull();
+  });
+
+  test("shows Google Vertex AI settings that come from env vars", async () => {
+    const view = renderProvidersSection({
+      "google-vertex": {
+        apiKeySet: false,
+        apiKeySource: "env",
+        isEnabled: true,
+        isConfigured: true,
+        googleVertex: { envProject: "env-project", keyFilenameSet: false, envKeyFilenameSet: true },
+      },
+    });
+    const vertexButton = await view.findByRole("button", { name: /Google Vertex AI/ });
+
+    fireEvent.click(vertexButton);
+
+    const vertexCard = getProviderCard(vertexButton);
+    expect(within(vertexCard).getByText("env-project")).toBeTruthy();
+    // One note each for the env project, the env key file and the env express mode API key.
+    expect(within(vertexCard).getAllByText("Set by env vars.")).toHaveLength(3);
+  });
+
   test("persists API format changes for an existing custom provider", async () => {
     const view = renderProvidersSection();
     const customButton = await view.findByRole("button", { name: /Acme OpenAI/ });
@@ -302,7 +384,7 @@ describe("ProvidersSection", () => {
   test("resyncs from the backend when API format persistence fails", async () => {
     const view = renderProvidersSection();
     view.setProviderConfig.mockImplementationOnce(() =>
-      Promise.resolve({ success: false as const, error: "policy denied" })
+      Promise.resolve({ success: false as const, error: "write failed" })
     );
 
     const customButton = await view.findByRole("button", { name: /Acme OpenAI/ });
@@ -406,7 +488,7 @@ describe("ProvidersSection", () => {
       });
     });
     await waitFor(() => {
-      expect(view.queryByRole("button", { name: "Add custom provider" })).toBeNull();
+      expect(view.queryByRole("button", { name: "Add custom provider" }) === null).toBe(true);
     });
     expect(view.getByRole("button", { name: "Add provider" })).toBeTruthy();
   });
@@ -429,7 +511,7 @@ describe("ProvidersSection", () => {
       expect(view.addCustomProvider).toHaveBeenCalled();
     });
     await waitFor(() => {
-      expect(view.queryByRole("button", { name: "Add custom provider" })).toBeNull();
+      expect(view.queryByRole("button", { name: "Add custom provider" }) === null).toBe(true);
     });
     expect(view.queryByText("Failed to add custom provider.")).toBeNull();
     expect(
@@ -437,6 +519,21 @@ describe("ProvidersSection", () => {
         "Provider added, but refreshing the provider list failed. It may appear after reopening settings."
       )
     ).toBeTruthy();
+  });
+
+  // Offline the kept client's write would fail, and the optimistic value would look saved: the
+  // provider toggle must be disabled and must not write.
+  test("disables the provider toggle and writes nothing while reconnecting", async () => {
+    const view = renderProvidersSectionOffline();
+    const openAiButton = await view.findByRole("button", { name: /^OpenAI\b/ });
+    fireEvent.click(openAiButton);
+
+    const toggle = within(getProviderCard(openAiButton)).getByRole("switch", {
+      name: "Toggle openai provider",
+    });
+    expect(toggle.hasAttribute("disabled")).toBe(true);
+    fireEvent.click(toggle);
+    expect(view.setProviderConfig).not.toHaveBeenCalled();
   });
 
   test("shows and persists the OpenAI WebSocket transport toggle", async () => {
@@ -482,6 +579,53 @@ describe("ProvidersSection", () => {
         keyPath: ["webSocketTransportEnabled"],
         value: "",
       });
+    });
+  });
+
+  test.each([
+    { name: "on", initial: false, persisted: true },
+    { name: "off (removes the key)", initial: true, persisted: "" },
+  ])("persists the cyber model setting when toggled $name", async (testCase) => {
+    const view = renderProvidersSection();
+    if (testCase.initial) view.providersConfig.openai.cyberModelEnabled = true;
+    const openAiButton = await view.findByRole("button", { name: /^OpenAI\b/ });
+
+    fireEvent.click(openAiButton);
+
+    const cyberToggle = within(getProviderCard(openAiButton)).getByRole("switch", {
+      name: /Enable cyber model/i,
+    });
+    expect(cyberToggle.getAttribute("aria-checked")).toBe(String(testCase.initial));
+
+    fireEvent.click(cyberToggle);
+
+    await waitFor(() => {
+      expect(view.setProviderConfig).toHaveBeenCalledWith({
+        provider: "openai",
+        keyPath: ["cyberModelEnabled"],
+        value: testCase.persisted,
+      });
+    });
+  });
+
+  test("keeps the cyber model setting on and resyncs when turning it off fails to persist", async () => {
+    const view = renderProvidersSection();
+    view.providersConfig.openai.cyberModelEnabled = true;
+    view.setProviderConfig.mockImplementationOnce(() =>
+      Promise.resolve({ success: false as const, error: "write failed" })
+    );
+    const openAiButton = await view.findByRole("button", { name: /^OpenAI\b/ });
+    fireEvent.click(openAiButton);
+
+    fireEvent.click(
+      within(getProviderCard(openAiButton)).getByRole("switch", { name: /Enable cyber model/i })
+    );
+
+    await waitFor(() => {
+      expect(providersRefreshMock).toHaveBeenCalled();
+    });
+    expect(updateOptimisticallyMock).not.toHaveBeenCalledWith("openai", {
+      cyberModelEnabled: undefined,
     });
   });
 
@@ -580,7 +724,7 @@ describe("ProvidersSection", () => {
       expect(view.removeCustomProvider).toHaveBeenCalledWith({ provider: CUSTOM_PROVIDER_ID });
     });
     await waitFor(() => {
-      expect(view.queryByRole("button", { name: /Acme OpenAI/ })).toBeNull();
+      expect(view.queryByRole("button", { name: /Acme OpenAI/ }) === null).toBe(true);
     });
     expect(
       await view.findByText(
@@ -602,7 +746,7 @@ describe("ProvidersSection", () => {
       expect(view.removeCustomProvider).toHaveBeenCalledWith({ provider: CUSTOM_PROVIDER_ID });
     });
     expect(confirmMock).toHaveBeenCalledTimes(1);
-    expect(repairRemovedProviderMock).toHaveBeenCalledWith(CUSTOM_PROVIDER_ID, expect.any(Set));
+    expect(repairRemovedProviderMock).toHaveBeenCalledWith(CUSTOM_PROVIDER_ID);
   });
 
   test("invalidates queued format writes when the provider is removed", async () => {
@@ -641,13 +785,13 @@ describe("ProvidersSection", () => {
     expect(view.setProviderConfig).toHaveBeenCalledTimes(1);
   });
 
-  test("startCoderLogin hint launches the Coder OAuth flow against the configured deployment", async () => {
-    // Regression: the "Settings: Login with Coder" palette command passes a
-    // one-shot startCoderLogin hint through SettingsContext; ProvidersSection
-    // must consume it by actually starting the OAuth flow, not just opening
-    // the Providers list. The hint is injected by spying on useSettings
-    // (a full-plumbing variant that clicked through a live SettingsProvider
-    // proved order-fragile in the monolithic CI process).
+  /**
+   * Browser-mode Coder login harness: no window.api (browser, not desktop), a
+   * configured deployment URL, and a fetch double standing in for the Xum
+   * server's /auth/coder/start route. Returns the recorded start requests and
+   * the waitForDesktopFlow mock the flow continues on.
+   */
+  function setupBrowserCoderLogin(opts: { hint: boolean }) {
     const providersConfig = createProvidersConfig();
     providersConfig.coder = {
       apiKeySet: false,
@@ -657,7 +801,6 @@ describe("ProvidersSection", () => {
     };
     providersConfigMock = providersConfig;
     const client = setupSettingsStory({ providersConfig: {} });
-    apiMock = client;
 
     const startDesktopFlow = mock((_input: { deploymentUrl: string; flowId?: string }) =>
       Promise.resolve({
@@ -665,16 +808,37 @@ describe("ProvidersSection", () => {
         data: { flowId: "flow", authorizeUrl: "https://coder.example.com/oauth2/authorize" },
       })
     );
+    const waitForDesktopFlow = mock(
+      // Never resolves — the user would complete the login in the browser.
+      (_input: { flowId: string }) => new Promise<never>(() => undefined)
+    );
     (client as unknown as Record<string, unknown>).coderOauth = {
       startDesktopFlow,
-      // Never resolves — the user would complete the login in the browser.
-      waitForDesktopFlow: () => new Promise(() => undefined),
+      waitForDesktopFlow,
       cancelDesktopFlow: () => Promise.resolve(undefined),
     };
 
+    const startRequests: URL[] = [];
+    const fetchDouble = (input: RequestInfo | URL) => {
+      const url = new URL(typeof input === "string" ? input : (input as URL).toString());
+      startRequests.push(url);
+      return Promise.resolve(
+        new Response(
+          JSON.stringify({
+            flowId: url.searchParams.get("flowId"),
+            authorizeUrl: "https://coder.example.com/oauth2/authorize",
+          }),
+          { status: 200, headers: { "Content-Type": "application/json" } }
+        )
+      );
+    };
+    spyOn(globalThis, "fetch").mockImplementation(
+      Object.assign(fetchDouble, { preconnect: () => undefined }) as typeof fetch
+    );
+
     // Stateful hint: true until the section consumes it, so re-renders after
     // consumption do not re-trigger the login.
-    let startCoderLoginHint = true;
+    let startCoderLoginHint = opts.hint;
     const setProvidersStartCoderLogin = mock((start: boolean) => {
       startCoderLoginHint = start;
     });
@@ -685,7 +849,7 @@ describe("ProvidersSection", () => {
       close: () => undefined,
       setActiveSection: () => undefined,
       registerOnClose: () => () => undefined,
-      providersExpandedProvider: null,
+      providersExpandedProvider: opts.hint ? null : "coder",
       setProvidersExpandedProvider: () => undefined,
       providersStartCoderLogin: startCoderLoginHint,
       setProvidersStartCoderLogin,
@@ -695,22 +859,126 @@ describe("ProvidersSection", () => {
       setSecretsProjectPath: () => undefined,
       instructionsProjectPath: null,
       setInstructionsProjectPath: () => undefined,
+      openedWithoutSection: false,
     }));
 
-    render(
+    const view = render(
+      <SettingsSectionStory setup={() => client}>
+        <ProvidersSection />
+      </SettingsSectionStory>
+    );
+    return {
+      view,
+      startDesktopFlow,
+      waitForDesktopFlow,
+      startRequests,
+      setProvidersStartCoderLogin,
+    };
+  }
+
+  test("Coder model routing offers same-type instances and persists the selection", async () => {
+    const providersConfig = createProvidersConfig();
+    providersConfig.coder = {
+      apiKeySet: false,
+      isEnabled: true,
+      isConfigured: true,
+      deploymentUrl: "https://coder.example.com",
+      coderOauthSet: true,
+      discoveredProviders: [
+        { name: "anthropic-bedrock", type: "anthropic" },
+        { name: "openai-azure", type: "openai" },
+        { name: "agents-google", type: "google" },
+      ],
+      canonicalRoutes: { openai: "openai-removed", google: "agents-google" },
+    };
+    providersConfigMock = providersConfig;
+    const client = setupSettingsStory({ providersConfig: {} });
+    const { setProviderConfig } = patchProviderMethods(client, providersConfig);
+    const view = render(
       <SettingsSectionStory setup={() => client}>
         <ProvidersSection />
       </SettingsSectionStory>
     );
 
+    fireEvent.click(await view.findByRole("button", { name: /^Coder/ }));
+
+    // A mapping to an instance the deployment no longer lists stays visible as stale.
+    expect(await view.findByText(/openai-removed is not a known OpenAI provider/)).toBeTruthy();
+    // "Routes to" follows the mappings: Google is added, the stale OpenAI mapping drops OpenAI.
+    expect(view.getByText("Anthropic, Google")).toBeTruthy();
+
+    fireEvent.pointerDown(view.getByRole("combobox", { name: "Anthropic Coder provider" }));
+    expect(view.queryByRole("button", { name: "openai-azure" })).toBeNull();
+    fireEvent.click(await view.findByRole("button", { name: "anthropic-bedrock" }));
+
     await waitFor(() => {
-      expect(startDesktopFlow).toHaveBeenCalled();
+      expect(setProviderConfig).toHaveBeenCalledWith({
+        provider: "coder",
+        keyPath: ["canonicalRoutes", "anthropic"],
+        value: "anthropic-bedrock",
+      });
+    });
+
+    // A rejected write must restore the persisted mappings over the optimistic one.
+    providersRefreshMock.mockClear();
+    setProviderConfig.mockImplementationOnce(() => Promise.reject(new Error("connection lost")));
+    fireEvent.pointerDown(view.getByRole("combobox", { name: "Google Coder provider" }));
+    fireEvent.click(
+      await view.findByRole("button", { name: "Default (not routed through Coder)" })
+    );
+    expect(await view.findByText("Saving model routing failed: connection lost")).toBeTruthy();
+    expect(providersRefreshMock).toHaveBeenCalledTimes(1);
+  });
+
+  test("startCoderLogin hint launches the Coder OAuth flow against the configured deployment", async () => {
+    // Regression: the "Settings: Login with Coder" palette command passes a
+    // one-shot startCoderLogin hint through SettingsContext; ProvidersSection
+    // must consume it by actually starting the OAuth flow, not just opening
+    // the Providers list. The hint is injected by spying on useSettings
+    // (a full-plumbing variant that clicked through a live SettingsProvider
+    // proved order-fragile in the monolithic CI process).
+    const { startDesktopFlow, waitForDesktopFlow, startRequests, setProvidersStartCoderLogin } =
+      setupBrowserCoderLogin({ hint: true });
+
+    await waitFor(() => {
+      expect(startRequests).toHaveLength(1);
     });
     // The hint is one-shot: consumed (cleared) exactly once, one flow started.
     expect(setProvidersStartCoderLogin).toHaveBeenCalledWith(false);
-    expect(startDesktopFlow).toHaveBeenCalledTimes(1);
-    expect(startDesktopFlow.mock.calls[0][0]).toMatchObject({
-      deploymentUrl: "https://coder.example.com",
+    // Browser mode: the server-hosted flow, not the desktop loopback one.
+    expect(startDesktopFlow).not.toHaveBeenCalled();
+    expect(startRequests[0].pathname).toBe("/auth/coder/start");
+    expect(startRequests[0].searchParams.get("deploymentUrl")).toBe("https://coder.example.com");
+    // The flow then continues on the shared oRPC wait with the started flow ID.
+    await waitFor(() => {
+      expect(waitForDesktopFlow).toHaveBeenCalledTimes(1);
     });
+    const startedFlowId = startRequests[0].searchParams.get("flowId");
+    expect(startedFlowId).toBeTruthy();
+    expect(waitForDesktopFlow.mock.calls[0][0].flowId).toBe(startedFlowId!);
+    expect(startRequests).toHaveLength(1);
+  });
+
+  test("offers Login with Coder on a remote Xum server and starts the server-hosted flow", async () => {
+    // Regression: remote browsers used to get an explanation instead of the
+    // login control ("the OAuth callback must reach this machine"). The
+    // callback now lands on the server's own origin, so the control renders
+    // and the start request targets that origin.
+    (window as unknown as { happyDOM: { setURL: (url: string) => void } }).happyDOM.setURL(
+      "https://xum.example.com/"
+    );
+    const { view, startRequests } = setupBrowserCoderLogin({ hint: false });
+
+    const loginButton = await view.findByRole("button", { name: "Login with Coder" });
+    expect(view.queryByText(/requires the desktop app/)).toBeNull();
+
+    fireEvent.click(loginButton);
+
+    await waitFor(() => {
+      expect(startRequests).toHaveLength(1);
+    });
+    expect(startRequests[0].origin).toBe("https://xum.example.com");
+    expect(startRequests[0].pathname).toBe("/auth/coder/start");
+    await view.findByText("Waiting for authorization...");
   });
 });

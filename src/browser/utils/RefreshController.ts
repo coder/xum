@@ -16,7 +16,6 @@
 export type RefreshTrigger =
   | "manual" // User clicked refresh button
   | "scheduled" // Debounced tool completion
-  | "priority" // Priority debounced (active workspace)
   | "focus" // Window regained focus
   | "visibility" // Tab became visible
   | "unpaused" // Interaction ended, flushing pending
@@ -50,9 +49,6 @@ export interface RefreshControllerOptions {
 
   /** Debounce delay for triggered refreshes (ms). Default: 3000 */
   debounceMs?: number;
-
-  /** Priority debounce delay (ms). Used by schedulePriority(). Default: same as debounceMs */
-  priorityDebounceMs?: number;
 
   /**
    * Whether to proactively refresh on focus, not just flush pending.
@@ -90,7 +86,6 @@ export class RefreshController {
   private readonly onRefreshComplete: ((info: LastRefreshInfo) => void) | null;
   private readonly onRefreshError: ((info: RefreshFailureInfo) => void) | null;
   private readonly debounceMs: number;
-  private readonly priorityDebounceMs: number;
   private readonly refreshOnFocus: boolean;
   private readonly focusDebounceMs: number;
   private readonly isPaused: (() => boolean) | null;
@@ -124,7 +119,6 @@ export class RefreshController {
     this.onRefreshComplete = options.onRefreshComplete ?? null;
     this.onRefreshError = options.onRefreshError ?? null;
     this.debounceMs = options.debounceMs ?? 3000;
-    this.priorityDebounceMs = options.priorityDebounceMs ?? this.debounceMs;
     this.refreshOnFocus = options.refreshOnFocus ?? false;
     this.focusDebounceMs = options.focusDebounceMs ?? 500;
     this.isPaused = options.isPaused ?? null;
@@ -135,7 +129,6 @@ export class RefreshController {
   private updatePendingTrigger(trigger: RefreshTrigger): void {
     const priorities: Record<RefreshTrigger, number> = {
       manual: 3,
-      priority: 2,
       scheduled: 1,
       focus: 0,
       visibility: 0,
@@ -172,17 +165,10 @@ export class RefreshController {
     this.scheduleWithDelay(this.debounceMs, "scheduled");
   }
 
-  /**
-   * Schedule with priority (shorter) rate limit. Used for active workspace.
-   */
-  schedulePriority(): void {
-    this.scheduleWithDelay(this.priorityDebounceMs, "priority");
-  }
-
   private scheduleWithDelay(delayMs: number, trigger: RefreshTrigger): void {
     if (this.disposed) return;
 
-    // Always update pending trigger (manual > priority > scheduled)
+    // Always update pending trigger (manual > scheduled)
     this.updatePendingTrigger(trigger);
 
     // If refresh is in-flight, mark pending and let onComplete handle scheduling

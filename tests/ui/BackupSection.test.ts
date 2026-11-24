@@ -1,16 +1,52 @@
 import "./dom";
 import React from "react";
 import { act, cleanup, fireEvent, render, waitFor, within } from "@testing-library/react";
+import type { BoundFunctions, queries } from "@testing-library/react";
 import { APIProvider } from "@/browser/contexts/API";
+import { RouterProvider } from "@/browser/contexts/RouterContext";
+import { SettingsProvider, useSettings } from "@/browser/contexts/SettingsContext";
 import { ThemeProvider } from "@/browser/contexts/ThemeContext";
+import { Dialog, DialogContent, DialogTitle } from "@/browser/components/Dialog/Dialog";
 import { TooltipProvider } from "@/browser/components/Tooltip/Tooltip";
 import { BackupSection } from "@/browser/features/Settings/Sections/BackupSection";
+import { consumePendingPluginsSectionIntent } from "@/browser/features/Settings/Sections/pluginsSectionIntents";
 import { createMockORPCClient } from "@/browser/stories/mocks/orpc";
+import { call, os } from "@orpc/server";
+import {
+  BACKUP_CONTENT_DEFAULTS,
+  SettingsBackupInputSchema,
+} from "@/common/config/schemas/settingsBackup";
+import { backup, EMPTY_BACKUP_PLUGIN_REPORT } from "@/common/orpc/schemas/backup";
+import { EXPERIMENT_IDS } from "@/common/constants/experiments";
+import { resetTestExperiments } from "@/browser/testUtils";
 
 type MockOptions = Parameters<typeof createMockORPCClient>[0];
 type MockClient = ReturnType<typeof createMockORPCClient>;
 
-function backupSectionTree(client: MockClient) {
+/** Shows which Settings section is active, so a test can see where the section sent the user. */
+function ActiveSettingsSection() {
+  const { activeSection, isOpen } = useSettings();
+  return React.createElement(
+    "output",
+    { "data-testid": "settings-route" },
+    isOpen ? activeSection : "closed"
+  );
+}
+
+function backupSectionTree(client: MockClient, inSettingsDialog = false) {
+  const section = React.createElement(BackupSection);
+  const children = inSettingsDialog
+    ? React.createElement(
+        Dialog,
+        { open: true },
+        React.createElement(
+          DialogContent,
+          { "aria-describedby": undefined },
+          React.createElement(DialogTitle, null, "Settings"),
+          section
+        )
+      )
+    : section;
   return React.createElement(
     ThemeProvider,
     null,
@@ -19,7 +55,16 @@ function backupSectionTree(client: MockClient) {
       null,
       React.createElement(APIProvider, {
         client,
-        children: React.createElement(BackupSection),
+        children: React.createElement(
+          RouterProvider,
+          null,
+          React.createElement(
+            SettingsProvider,
+            null,
+            children,
+            React.createElement(ActiveSettingsSection)
+          )
+        ),
       })
     )
   );
@@ -27,7 +72,8 @@ function backupSectionTree(client: MockClient) {
 
 function renderBackupSection(
   overrides: Partial<NonNullable<MockOptions>> = {},
-  setupClient?: (client: MockClient) => void
+  setupClient?: (client: MockClient) => void,
+  inSettingsDialog = false
 ) {
   const client = createMockORPCClient({
     backupSettings: {
@@ -46,23 +92,29 @@ function renderBackupSection(
       localOnlyFiles: ["agents/local-only.md"],
       redactions: ["mcp.jsonc: github.headers.Authorization"],
       commandApprovals: [],
+      projectImports: [],
+      projectBundleSkipped: false,
+      pushError: null,
     },
     backupRestore: {
       commit: "def5678",
       snapshotPath: "/tmp/mux-backup-snapshot",
       changedFiles: ["preferences.json"],
       localOnlyFiles: ["agents/local.md"],
+      projectImportResults: [],
+      projectBundleSkipped: false,
+      unapprovedProjectImports: [],
     },
     ...overrides,
   });
 
   setupClient?.(client);
 
-  const view = render(backupSectionTree(client));
+  const view = render(backupSectionTree(client, inSettingsDialog));
 
   return { client, view };
 }
-async function confirmRestore(canvas: ReturnType<typeof within>): Promise<void> {
+async function confirmRestore(canvas: BoundFunctions<typeof queries>): Promise<void> {
   fireEvent.click(canvas.getByRole("button", { name: /^Restore$/ }));
   const dialog = await within(document.body).findByRole("dialog");
   fireEvent.click(within(dialog).getByRole("button", { name: /Restore settings/i }));
@@ -70,6 +122,7 @@ async function confirmRestore(canvas: ReturnType<typeof within>): Promise<void> 
 
 describe("BackupSection", () => {
   afterEach(() => {
+    resetTestExperiments();
     cleanup();
   });
 
@@ -89,6 +142,116 @@ describe("BackupSection", () => {
     // Preview discards the export's secret scan, so an override offered here would let a
     // push publish secrets without ever showing the blocked-file list.
     expect(canvas.queryByRole("checkbox", { name: "Override secret scan" })).toBeNull();
+  });
+
+  test("saves the content selection and gates the MCP sub-options on their parent", async () => {
+    const { client, view } = renderBackupSection();
+    const canvas = within(view.container);
+    await canvas.findByText("Settings backup");
+    const saveSettings = jest.spyOn(client.backup, "saveSettings");
+
+    const headers = canvas.getByRole("checkbox", { name: "HTTP header values" });
+    const commands = canvas.getByRole("checkbox", { name: "stdio commands" });
+    // Defaults: everything selected except projects.
+    expect(headers.getAttribute("aria-checked")).toBe("true");
+    expect(
+      canvas
+        .getByRole("checkbox", { name: "Project list & project memories" })
+        .getAttribute("aria-checked")
+    ).toBe("false");
+
+    fireEvent.click(headers);
+    expect(headers.getAttribute("aria-checked")).toBe("false");
+    expect(canvas.getByText("Unsaved changes")).toBeTruthy();
+
+    // Deselecting the parent disables both sub-options without forgetting their values.
+    const mcp = canvas.getByRole("checkbox", { name: "MCP server configuration" });
+    fireEvent.click(mcp);
+    expect(commands.hasAttribute("disabled")).toBe(true);
+    expect(commands.getAttribute("aria-checked")).toBe("false");
+    fireEvent.click(mcp);
+    expect(commands.hasAttribute("disabled")).toBe(false);
+    expect(commands.getAttribute("aria-checked")).toBe("true");
+    expect(headers.getAttribute("aria-checked")).toBe("false");
+
+    await act(async () => {
+      fireEvent.click(canvas.getByRole("button", { name: "Save settings" }));
+    });
+    await waitFor(() =>
+      expect(saveSettings).toHaveBeenCalledWith({
+        repoUrl: "git@github.com:example/dotfiles.git",
+        branch: "main",
+        path: "mux/",
+        ...BACKUP_CONTENT_DEFAULTS,
+        includeMcpHeaders: false,
+      })
+    );
+    await waitFor(() => expect(canvas.queryByText("Unsaved changes") === null).toBe(true));
+  });
+
+  test("toggles the content selection from the keyboard under the parent gate", async () => {
+    const { client, view } = renderBackupSection();
+    const canvas = within(view.container);
+    await canvas.findByText("Settings backup");
+    const saveSettings = jest.spyOn(client.backup, "saveSettings");
+
+    const mcp = canvas.getByRole("checkbox", { name: "MCP server configuration" });
+    const headers = canvas.getByRole("checkbox", { name: "HTTP header values" });
+    fireEvent.keyDown(window, { key: "c", code: "KeyC", ctrlKey: true, altKey: true });
+    expect(mcp.getAttribute("aria-checked")).toBe("false");
+    // A sub-option shortcut is inert while its parent is off, like the disabled checkbox.
+    fireEvent.keyDown(window, { key: "h", code: "KeyH", ctrlKey: true, altKey: true });
+    fireEvent.keyDown(window, { key: "c", code: "KeyC", ctrlKey: true, altKey: true });
+    expect(headers.getAttribute("aria-checked")).toBe("true");
+    fireEvent.keyDown(window, { key: "h", code: "KeyH", ctrlKey: true, altKey: true });
+    expect(headers.getAttribute("aria-checked")).toBe("false");
+    fireEvent.keyDown(window, { key: "j", code: "KeyJ", ctrlKey: true, altKey: true });
+
+    fireEvent.keyDown(window, { key: "s", code: "KeyS", ctrlKey: true, altKey: true });
+    await waitFor(() =>
+      expect(saveSettings).toHaveBeenCalledWith({
+        repoUrl: "git@github.com:example/dotfiles.git",
+        branch: "main",
+        path: "mux/",
+        ...BACKUP_CONTENT_DEFAULTS,
+        includeMcpHeaders: false,
+        includeProjects: true,
+      })
+    );
+  });
+
+  test("keeps shortcuts working inside the settings dialog that hosts the section", async () => {
+    renderBackupSection({}, undefined, true);
+    const settings = await within(document.body).findByRole("dialog", { name: "Settings" });
+    const canvas = within(settings);
+    await canvas.findByText("Settings backup");
+    const mcp = canvas.getByRole("checkbox", { name: "MCP server configuration" });
+
+    fireEvent.keyDown(settings, { key: "c", code: "KeyC", ctrlKey: true, altKey: true });
+    expect(mcp.getAttribute("aria-checked")).toBe("false");
+  });
+
+  test("re-arms shortcuts in the settings dialog after a nested confirm closes", async () => {
+    renderBackupSection({}, undefined, true);
+    const body = within(document.body);
+    const settings = await body.findByRole("dialog", { name: "Settings" });
+    const canvas = within(settings);
+    await canvas.findByText("Settings backup");
+    const mcp = canvas.getByRole("checkbox", { name: "MCP server configuration" });
+    const restore = canvas.getByRole("button", { name: /^Restore$/ });
+    await waitFor(() => expect(restore.hasAttribute("disabled")).toBe(false));
+
+    fireEvent.click(restore);
+    const confirm = await body.findByRole("dialog", { name: "Restore settings backup?" });
+    fireEvent.keyDown(document.body, { key: "c", code: "KeyC", ctrlKey: true, altKey: true });
+    expect(mcp.getAttribute("aria-checked")).toBe("true");
+    fireEvent.click(within(confirm).getByRole("button", { name: /Cancel/ }));
+    await waitFor(() =>
+      expect(body.queryByRole("dialog", { name: "Restore settings backup?" }) === null).toBe(true)
+    );
+    // The confirm has no trigger to return focus to, so closing it leaves focus on the body.
+    fireEvent.keyDown(document.body, { key: "c", code: "KeyC", ctrlKey: true, altKey: true });
+    expect(mcp.getAttribute("aria-checked")).toBe("false");
   });
 
   test("refreshes backup settings changed by another window", async () => {
@@ -117,6 +280,7 @@ describe("BackupSection", () => {
         repoUrl: "git@github.com:example/other.git",
         branch: "release",
         path: "shared/",
+        ...BACKUP_CONTENT_DEFAULTS,
       })
     );
     await canvas.findByText("Backup to repository");
@@ -164,14 +328,17 @@ describe("BackupSection", () => {
   });
 
   test("disables destructive actions once the config stream dies", async () => {
-    let failStream!: (error: Error) => void;
+    // The shared AppConfigStore subscribes too, so fail every stream.
+    const failStreams: ((error: Error) => void)[] = [];
     const { view } = renderBackupSection({}, (client) => {
       const real = client.config.onConfigChanged.bind(client.config);
       jest.spyOn(client.config, "onConfigChanged").mockImplementation(async (input, options) => {
         const iterator = await real(input, options);
         const failure = new Promise<never>((_, reject) => {
-          failStream = reject;
+          failStreams.push(reject);
         });
+        // Streams no one reads any more must not surface the rejection as unhandled.
+        failure.catch(() => undefined);
         return {
           next: () => Promise.race([failure, iterator.next()]),
           return: iterator.return?.bind(iterator),
@@ -186,7 +353,7 @@ describe("BackupSection", () => {
     );
 
     await act(async () => {
-      failStream(new Error("stream torn down"));
+      for (const failStream of failStreams) failStream(new Error("stream torn down"));
       await Promise.resolve();
     });
 
@@ -344,6 +511,7 @@ describe("BackupSection", () => {
         repoUrl: "git@github.com:example/new.git",
         branch: "main",
         path: "mux/",
+        ...BACKUP_CONTENT_DEFAULTS,
         approvedSecretDigest: undefined,
       })
     );
@@ -478,6 +646,9 @@ describe("BackupSection", () => {
         localOnlyFiles: [],
         redactions: [],
         commandApprovals: [approval],
+        projectImports: [],
+        projectBundleSkipped: false,
+        pushError: null,
       },
     });
     const canvas = within(view.container);
@@ -539,6 +710,9 @@ describe("BackupSection", () => {
         localOnlyFiles: [],
         redactions: [],
         commandApprovals: [approval],
+        projectImports: [],
+        projectBundleSkipped: false,
+        pushError: null,
       },
     });
     const canvas = within(view.container);
@@ -583,6 +757,10 @@ describe("BackupSection", () => {
         snapshotPath: "/tmp/mux-backup-snapshot",
         changedFiles: [],
         localOnlyFiles: [],
+        projectImportResults: [],
+        projectBundleSkipped: false,
+        plugins: EMPTY_BACKUP_PLUGIN_REPORT,
+        unapprovedProjectImports: [],
       },
     });
 
@@ -610,5 +788,1011 @@ describe("BackupSection", () => {
     fireEvent.click(canvas.getByRole("button", { name: "Save settings" }));
 
     await canvas.findByText("Could not persist backup settings");
+  });
+
+  test.each([
+    ["Branch", "no such branch!"],
+    ["Subdirectory", "../escape"],
+  ])("names the field and rule when the server rejects an invalid %s", async (label, value) => {
+    const { client, view } = renderBackupSection();
+    const canvas = within(view.container);
+    await canvas.findByText("Settings backup");
+
+    // The real contract's input validation produces the error oRPC sends to the client.
+    const saveSettings = os.input(backup.saveSettings.input).handler(() => {
+      throw new Error("invalid input must not reach the handler");
+    });
+    jest
+      .spyOn(client.backup, "saveSettings")
+      .mockImplementation((input) => call(saveSettings, input));
+
+    fireEvent.change(canvas.getByLabelText(label), { target: { value } });
+    fireEvent.click(canvas.getByRole("button", { name: "Save settings" }));
+
+    const issues = SettingsBackupInputSchema.safeParse({
+      ...BACKUP_CONTENT_DEFAULTS,
+      repoUrl: "git@github.com:example/dotfiles.git",
+      branch: label === "Branch" ? value : "main",
+      path: label === "Subdirectory" ? value : "mux/",
+    }).error?.issues;
+    expect(issues).toHaveLength(1);
+    const [issue] = issues!;
+    const field = String(issue.path[0]);
+    const shown = await canvas.findByText(
+      (text) => text.includes(field) && text.includes(issue.message)
+    );
+    expect(shown).toBeTruthy();
+  });
+
+  test("sends only approved project imports with their target paths on restore", async () => {
+    const candidate = {
+      sourcePath: "/home/dev/src/rocket",
+      name: "rocket",
+      gitRemote: "git@github.com:dev/rocket.git",
+      memoryFileCount: 2,
+      token: "rocket-token",
+    };
+    const unapproved = {
+      sourcePath: "/home/dev/src/probe",
+      name: "probe",
+      memoryFileCount: 0,
+      token: "probe-token",
+    };
+    const { client, view } = renderBackupSection({
+      backupPreview: {
+        pushChanges: [],
+        restoreChanges: [],
+        localOnlyFiles: [],
+        redactions: [],
+        commandApprovals: [],
+        projectImports: [candidate, unapproved],
+        projectBundleSkipped: false,
+        pushError: null,
+      },
+      backupRestore: {
+        commit: "def5678",
+        snapshotPath: "/tmp/mux-backup-snapshot",
+        changedFiles: [],
+        localOnlyFiles: [],
+        projectImportResults: [
+          {
+            sourcePath: candidate.sourcePath,
+            targetPath: "/home/other/rocket",
+            name: candidate.name,
+            status: "imported",
+            writtenFiles: ["memory/project/rocket-abc/notes.md"],
+            skippedFiles: [],
+            registered: true,
+          },
+        ],
+        projectBundleSkipped: false,
+        unapprovedProjectImports: [],
+      },
+    });
+    const canvas = within(view.container);
+    await canvas.findByText("Settings backup");
+
+    fireEvent.click(canvas.getByRole("button", { name: "Preview changes" }));
+    await canvas.findByText("Projects to reimport");
+    // The remote is rendered as inert text, never a link.
+    expect(canvas.getByText(/git@github\.com:dev\/rocket\.git/)).toBeTruthy();
+    expect(canvas.queryByRole("link")).toBeNull();
+
+    const restore = jest.spyOn(client.backup, "restore");
+    fireEvent.click(canvas.getByRole("checkbox", { name: "Import project rocket" }));
+    const targetInputs = canvas.getAllByLabelText("Local project directory");
+    fireEvent.change(targetInputs[0], { target: { value: "/home/other/rocket" } });
+    await confirmRestore(canvas);
+
+    await waitFor(() =>
+      expect(restore).toHaveBeenCalledWith(
+        expect.objectContaining({
+          projectImports: [{ token: "rocket-token", targetPath: "/home/other/rocket" }],
+        })
+      )
+    );
+    await canvas.findByText("Project import results");
+    expect(canvas.getByText(/Imported: rocket/)).toBeTruthy();
+  });
+
+  test("reports a conflicted import as partial and keeps its candidate on offer", async () => {
+    const candidate = {
+      sourcePath: "/home/dev/src/rocket",
+      name: "rocket",
+      memoryFileCount: 2,
+      token: "rocket-token",
+    };
+    const { view } = renderBackupSection({
+      backupPreview: {
+        pushChanges: [],
+        restoreChanges: [],
+        localOnlyFiles: [],
+        redactions: [],
+        commandApprovals: [],
+        projectImports: [candidate],
+        projectBundleSkipped: false,
+        pushError: null,
+      },
+      backupRestore: {
+        commit: "def5678",
+        snapshotPath: "/tmp/mux-backup-snapshot",
+        changedFiles: [],
+        localOnlyFiles: [],
+        projectImportResults: [
+          {
+            sourcePath: candidate.sourcePath,
+            targetPath: "/home/other/rocket",
+            name: candidate.name,
+            status: "imported",
+            writtenFiles: ["memory/project/rocket-abc/notes.md"],
+            skippedFiles: ["memory/project/rocket-abc/conflict.md"],
+            // Imported into a project that already existed: nothing to unregister.
+            registered: false,
+          },
+        ],
+        projectBundleSkipped: false,
+        // The backend re-offers a conflicted import; the UI must not call it done.
+        unapprovedProjectImports: [candidate],
+      },
+    });
+    const canvas = within(view.container);
+    await canvas.findByText("Settings backup");
+
+    fireEvent.click(canvas.getByRole("button", { name: "Preview changes" }));
+    await canvas.findByText("Projects to reimport");
+    fireEvent.click(canvas.getByRole("checkbox", { name: "Import project rocket" }));
+    fireEvent.change(canvas.getAllByLabelText("Local project directory")[0], {
+      target: { value: "/home/other/rocket" },
+    });
+    await confirmRestore(canvas);
+
+    await canvas.findByText("Project import results");
+    expect(canvas.getByText(/Partially imported: rocket/)).toBeTruthy();
+    expect(canvas.queryByText(/^Imported: rocket/)).toBeNull();
+    // The undo guidance names only what this run created: files, not a registration.
+    expect(canvas.queryByText(/Newly registered project/)).toBeNull();
+    expect(canvas.queryByText(/remove the projects marked as newly registered/)).toBeNull();
+    // Still offered for a retry after the conflicts are resolved.
+    expect(canvas.getByRole("checkbox", { name: "Import project rocket" })).toBeTruthy();
+  });
+
+  test("keeps an earlier attempt's added files and registration on a retry", async () => {
+    const candidate = {
+      sourcePath: "/home/dev/src/rocket",
+      name: "rocket",
+      memoryFileCount: 2,
+      token: "rocket-token",
+    };
+    const attempt = (attemptResult: {
+      writtenFiles: string[];
+      skippedFiles: string[];
+      registered: boolean;
+    }) => ({
+      commit: "def5678",
+      snapshotPath: "/tmp/mux-backup-snapshot",
+      changedFiles: [],
+      localOnlyFiles: [],
+      projectImportResults: [
+        {
+          sourcePath: candidate.sourcePath,
+          targetPath: "/home/other/rocket",
+          name: candidate.name,
+          status: "imported" as const,
+          ...attemptResult,
+        },
+      ],
+      projectBundleSkipped: false,
+      plugins: EMPTY_BACKUP_PLUGIN_REPORT,
+      unapprovedProjectImports: attemptResult.skippedFiles.length > 0 ? [candidate] : [],
+    });
+    const { view } = renderBackupSection(
+      {
+        backupPreview: {
+          pushChanges: [],
+          restoreChanges: [],
+          localOnlyFiles: [],
+          redactions: [],
+          commandApprovals: [],
+          projectImports: [candidate],
+          projectBundleSkipped: false,
+          pushError: null,
+        },
+      },
+      (client) => {
+        // The first attempt registers the project and adds one file before a conflict; the
+        // retry finds that file in place and reports only what it added itself.
+        jest
+          .spyOn(client.backup, "restore")
+          .mockResolvedValueOnce({
+            success: true,
+            data: attempt({
+              writtenFiles: ["memory/project/rocket-abc/notes.md"],
+              skippedFiles: ["memory/project/rocket-abc/conflict.md"],
+              registered: true,
+            }),
+          })
+          .mockResolvedValueOnce({
+            success: true,
+            data: attempt({
+              writtenFiles: ["memory/project/rocket-abc/conflict.md"],
+              skippedFiles: [],
+              registered: false,
+            }),
+          });
+      }
+    );
+    const canvas = within(view.container);
+    await canvas.findByText("Settings backup");
+
+    fireEvent.click(canvas.getByRole("button", { name: "Preview changes" }));
+    await canvas.findByText("Projects to reimport");
+    fireEvent.click(canvas.getByRole("checkbox", { name: "Import project rocket" }));
+    fireEvent.change(canvas.getAllByLabelText("Local project directory")[0], {
+      target: { value: "/home/other/rocket" },
+    });
+    await confirmRestore(canvas);
+    await canvas.findByText(/Partially imported: rocket/);
+    // The undo list names the files, not a count.
+    expect(
+      canvas.getByText(/Added memory file: memory\/project\/rocket-abc\/notes\.md/)
+    ).toBeTruthy();
+
+    fireEvent.click(canvas.getByRole("checkbox", { name: "Import project rocket" }));
+    fireEvent.change(canvas.getAllByLabelText("Local project directory")[0], {
+      target: { value: "/home/other/rocket" },
+    });
+    await confirmRestore(canvas);
+    await canvas.findByText(/^Imported: rocket/);
+    // One card for the import, listing both attempts' files and the registration the first
+    // attempt made — the retry alone would say nothing was registered.
+    expect(canvas.queryByText(/Partially imported: rocket/)).toBeNull();
+    expect(
+      canvas.getByText(
+        /Added memory files: memory\/project\/rocket-abc\/notes\.md, memory\/project\/rocket-abc\/conflict\.md/
+      )
+    ).toBeTruthy();
+    expect(canvas.getByText(/Newly registered project/)).toBeTruthy();
+    expect(canvas.getByText(/remove the projects marked as newly registered/)).toBeTruthy();
+
+    // Saving different settings drops the preview and its approvals, not this: the files and
+    // the registration are still there to undo.
+    fireEvent.change(canvas.getByLabelText("Repository URL"), {
+      target: { value: "git@github.com:example/other.git" },
+    });
+    fireEvent.click(canvas.getByRole("button", { name: "Save settings" }));
+    await canvas.findByText("Backup settings saved.");
+    expect(
+      canvas.getByText(/Added memory files: memory\/project\/rocket-abc\/notes\.md/)
+    ).toBeTruthy();
+    expect(canvas.getByText(/Newly registered project/)).toBeTruthy();
+  });
+
+  test("re-presents fresh candidates when import approval goes stale", async () => {
+    const staleCandidate = {
+      sourcePath: "/home/dev/src/rocket",
+      name: "rocket",
+      memoryFileCount: 1,
+      token: "stale-token",
+    };
+    const freshCandidate = { ...staleCandidate, token: "fresh-token" };
+    const { client, view } = renderBackupSection({
+      backupPreview: {
+        pushChanges: [],
+        restoreChanges: [],
+        localOnlyFiles: [],
+        redactions: [],
+        commandApprovals: [],
+        projectImports: [staleCandidate],
+        projectBundleSkipped: false,
+        pushError: null,
+      },
+    });
+    const canvas = within(view.container);
+    await canvas.findByText("Settings backup");
+
+    fireEvent.click(canvas.getByRole("button", { name: "Preview changes" }));
+    await canvas.findByText("Projects to reimport");
+    fireEvent.click(canvas.getByRole("checkbox", { name: "Import project rocket" }));
+
+    const restore = jest.spyOn(client.backup, "restore").mockResolvedValueOnce({
+      success: false,
+      error: {
+        code: "PROJECT_IMPORT_APPROVAL_REQUIRED",
+        message: "The approved project imports no longer match the backup.",
+        projectImports: [freshCandidate],
+      },
+    });
+    await confirmRestore(canvas);
+    await waitFor(() => expect(restore).toHaveBeenCalledTimes(1));
+
+    // The fresh candidate replaced the stale one and starts unapproved, so an immediate
+    // second restore sends no imports.
+    await canvas.findByText("Projects to reimport");
+    const checkbox = canvas.getByRole("checkbox", { name: "Import project rocket" });
+    expect(checkbox.getAttribute("aria-checked")).toBe("false");
+    await confirmRestore(canvas);
+    await waitFor(() =>
+      expect(restore).toHaveBeenLastCalledWith(expect.objectContaining({ projectImports: [] }))
+    );
+  });
+
+  test("drops stale project import candidates after a push replaces the remote bundle", async () => {
+    const { view } = renderBackupSection({
+      backupPreview: {
+        pushChanges: [],
+        restoreChanges: [],
+        localOnlyFiles: [],
+        redactions: [],
+        commandApprovals: [],
+        projectImports: [
+          {
+            sourcePath: "/home/dev/src/rocket",
+            name: "rocket",
+            memoryFileCount: 1,
+            token: "rocket-token",
+          },
+        ],
+        projectBundleSkipped: false,
+        pushError: null,
+      },
+    });
+    const canvas = within(view.container);
+    await canvas.findByText("Settings backup");
+
+    fireEvent.click(canvas.getByRole("button", { name: "Preview changes" }));
+    await canvas.findByText("Projects to reimport");
+
+    // The push rewrote the remote bundle; the candidates' tokens describe the old one.
+    fireEvent.click(canvas.getByRole("button", { name: "Back up now" }));
+    await canvas.findByText(/Backed up settings at/);
+    expect(canvas.queryByText("Projects to reimport")).toBeNull();
+  });
+
+  test("makes no MCP coverage claim when the export preview failed", async () => {
+    const { view } = renderBackupSection({
+      backupPreview: {
+        pushChanges: [],
+        restoreChanges: [],
+        localOnlyFiles: [],
+        redactions: [],
+        commandApprovals: [],
+        projectImports: [],
+        projectBundleSkipped: false,
+        pushError: "mcp.jsonc is not valid JSONC",
+      },
+    });
+    const canvas = within(view.container);
+    await canvas.findByText("Settings backup");
+
+    fireEvent.click(canvas.getByRole("button", { name: "Preview changes" }));
+    await canvas.findByText("Kept on this device");
+    expect(canvas.queryByText("Every MCP value is in the backup.")).toBeNull();
+    expect(canvas.getByText("Not computed because the export preview failed.")).toBeTruthy();
+  });
+
+  test("reports a skipped project bundle after a preview", async () => {
+    const { view } = renderBackupSection({
+      backupPreview: {
+        pushChanges: [],
+        restoreChanges: [],
+        localOnlyFiles: [],
+        redactions: [],
+        commandApprovals: [],
+        projectImports: [],
+        projectBundleSkipped: true,
+        pushError: null,
+      },
+    });
+    const canvas = within(view.container);
+    await canvas.findByText("Settings backup");
+
+    fireEvent.click(canvas.getByRole("button", { name: "Preview changes" }));
+    await canvas.findByText(/carries a project bundle, but project backup is disabled/);
+  });
+
+  test("lists pinned artifacts a preview left out", async () => {
+    const { view } = renderBackupSection({
+      backupPreview: {
+        pushChanges: [],
+        restoreChanges: [],
+        localOnlyFiles: [],
+        redactions: [],
+        commandApprovals: [],
+        projectImports: [],
+        projectBundleSkipped: false,
+        shelfSkipped: ["artifacts/global/big.bin (over the 8 MiB limit for one backup file)"],
+        pushError: null,
+      },
+    });
+    const canvas = within(view.container);
+    await canvas.findByText("Settings backup");
+    expect(canvas.queryByText(/pinned artifacts were left out/)).toBeNull();
+
+    fireEvent.click(canvas.getByRole("button", { name: "Preview changes" }));
+    await canvas.findByText(/pinned artifacts were left out/);
+    expect(canvas.getByText(/artifacts\/global\/big\.bin/)).toBeTruthy();
+  });
+
+  test("lists backed-up files a preview left behind a local symlink", async () => {
+    const { view } = renderBackupSection({
+      backupPreview: {
+        pushChanges: [],
+        restoreChanges: [],
+        localOnlyFiles: [],
+        redactions: [],
+        commandApprovals: [],
+        projectImports: [],
+        projectBundleSkipped: false,
+        symlinkSkipped: ["skills/gh-stack/SKILL.md"],
+        pushError: null,
+      },
+    });
+    const canvas = within(view.container);
+    await canvas.findByText("Settings backup");
+    expect(canvas.queryByText("skills/gh-stack/SKILL.md")).toBeNull();
+
+    fireEvent.click(canvas.getByRole("button", { name: "Preview changes" }));
+    await canvas.findByText("skills/gh-stack/SKILL.md");
+  });
+
+  test("drops the left-out artifact notice once different settings are saved", async () => {
+    const { view } = renderBackupSection({
+      backupPreview: {
+        pushChanges: [],
+        restoreChanges: [],
+        localOnlyFiles: [],
+        redactions: [],
+        commandApprovals: [],
+        projectImports: [],
+        projectBundleSkipped: false,
+        shelfSkipped: ["artifacts/global/big.bin (over the 8 MiB limit for one backup file)"],
+        pushError: null,
+      },
+    });
+    const canvas = within(view.container);
+    await canvas.findByText("Settings backup");
+    fireEvent.click(canvas.getByRole("button", { name: "Preview changes" }));
+    await canvas.findByText(/pinned artifacts were left out/);
+
+    // The notice describes the previewed repository, not the next one.
+    fireEvent.change(canvas.getByLabelText("Repository URL"), {
+      target: { value: "git@github.com:example/other.git" },
+    });
+    fireEvent.click(canvas.getByRole("button", { name: "Save settings" }));
+    await canvas.findByText("Backup settings saved.");
+    expect(canvas.queryByText(/pinned artifacts were left out/)).toBeNull();
+  });
+
+  test("leaves a saved global-artifacts selection out of requests while the experiment is off", async () => {
+    const { client, view } = renderBackupSection({
+      backupSettings: {
+        repoUrl: "git@github.com:example/dotfiles.git",
+        branch: "main",
+        path: "mux/",
+        includeGlobalArtifacts: true,
+      },
+    });
+    const canvas = within(view.container);
+    await canvas.findByText("Settings backup");
+    const preview = jest.spyOn(client.backup, "preview");
+    const push = jest.spyOn(client.backup, "push");
+    const restore = jest.spyOn(client.backup, "restore");
+
+    fireEvent.click(canvas.getByRole("button", { name: "Preview changes" }));
+    await waitFor(() => expect(preview).toHaveBeenCalledTimes(1));
+    expect(preview.mock.calls[0][0]).toMatchObject({ includeGlobalArtifacts: false });
+    await canvas.findByText("Backup to repository");
+
+    fireEvent.click(canvas.getByRole("button", { name: "Back up now" }));
+    await waitFor(() => expect(push).toHaveBeenCalledTimes(1));
+    expect(push.mock.calls[0][0]).toMatchObject({ includeGlobalArtifacts: false });
+
+    await confirmRestore(canvas);
+    await waitFor(() => expect(restore).toHaveBeenCalledTimes(1));
+    expect(restore.mock.calls[0][0]).toMatchObject({ includeGlobalArtifacts: false });
+  });
+
+  test("offers the global artifacts toggle and its shortcut only with the Artifacts experiment", async () => {
+    const shortcut = { key: "u", code: "KeyU", ctrlKey: true, altKey: true };
+    const off = renderBackupSection();
+    const offCanvas = within(off.view.container);
+    await offCanvas.findByRole("checkbox", { name: "Global instructions" });
+    expect(offCanvas.queryByRole("checkbox", { name: "Pinned global artifacts" })).toBeNull();
+    fireEvent.keyDown(window, shortcut);
+    // Nothing to toggle: the draft stays unchanged, so saving stays disabled.
+    expect(offCanvas.getByRole("button", { name: "Save settings" }).hasAttribute("disabled")).toBe(
+      true
+    );
+    off.view.unmount();
+
+    const on = renderBackupSection({ experiments: { [EXPERIMENT_IDS.ARTIFACTS]: true } });
+    const onCanvas = within(on.view.container);
+    const toggle = await onCanvas.findByRole("checkbox", { name: "Pinned global artifacts" });
+    expect(toggle.getAttribute("aria-checked")).toBe("false");
+    fireEvent.keyDown(window, shortcut);
+    await waitFor(() => expect(toggle.getAttribute("aria-checked")).toBe("true"));
+  });
+
+  test("editing the form does not read the settings or open the change stream again", async () => {
+    let getSettings: jest.SpyInstance | undefined;
+    let onConfigChanged: jest.SpyInstance | undefined;
+    const { view } = renderBackupSection({}, (client) => {
+      getSettings = jest.spyOn(client.backup, "getSettings");
+      onConfigChanged = jest.spyOn(client.config, "onConfigChanged");
+    });
+    const canvas = within(view.container);
+    await waitFor(() =>
+      expect(canvas.getByRole("button", { name: "Preview changes" }).hasAttribute("disabled")).toBe(
+        false
+      )
+    );
+    const readsBefore = getSettings?.mock.calls.length;
+    const streamsBefore = onConfigChanged?.mock.calls.length;
+
+    for (const value of ["git@github.com:example/a.git", "git@github.com:example/b.git"]) {
+      fireEvent.change(canvas.getByLabelText("Repository URL"), { target: { value } });
+    }
+    await canvas.findByText("Unsaved changes");
+
+    // A rerun of the reload effect calls both during the commit, so nothing is left to wait for.
+    expect(getSettings?.mock.calls.length).toBe(readsBefore);
+    expect(onConfigChanged?.mock.calls.length).toBe(streamsBefore);
+  });
+
+  describe("plugins in the backup", () => {
+    const SHA_MISSING = "ab".repeat(20);
+    const SHA_INSTALLED = "cd".repeat(20);
+
+    function pluginRow(
+      name: string,
+      status: "missing" | "installed" | "folderMissing" | "conflict",
+      extra = {}
+    ) {
+      return {
+        name,
+        source: {
+          type: "git" as const,
+          url: `https://github.com/example/${name}.git`,
+          ref: "main",
+          refType: "branch" as const,
+        },
+        lockedSha: status === "installed" ? SHA_INSTALLED : SHA_MISSING,
+        status,
+        ...extra,
+      };
+    }
+
+    function reportOf(
+      rows: ReturnType<typeof pluginRow>[],
+      extra: { skipped?: boolean; warnings?: string[] } = {}
+    ) {
+      return { rows, skipped: false, warnings: [], ...extra };
+    }
+
+    const PREVIEW_BASE = {
+      pushChanges: [],
+      restoreChanges: [],
+      localOnlyFiles: [],
+      redactions: [],
+      commandApprovals: [],
+      projectImports: [],
+      projectBundleSkipped: false,
+      pushError: null,
+    };
+
+    const RESTORE_BASE = {
+      commit: "def5678",
+      snapshotPath: "/tmp/mux-backup-snapshot",
+      changedFiles: [],
+      localOnlyFiles: [],
+      projectImportResults: [],
+      projectBundleSkipped: false,
+      unapprovedProjectImports: [],
+    };
+
+    beforeEach(() => {
+      consumePendingPluginsSectionIntent();
+    });
+
+    afterEach(() => {
+      consumePendingPluginsSectionIntent();
+    });
+
+    test("is a content option that is on by default, and toggles from the keyboard", async () => {
+      const { client, view } = renderBackupSection();
+      const canvas = within(view.container);
+      const toggle = await canvas.findByRole("checkbox", { name: "Agent plugins" });
+      expect(toggle.getAttribute("aria-checked")).toBe("true");
+      const saveSettings = jest.spyOn(client.backup, "saveSettings");
+
+      fireEvent.keyDown(window, { key: "x", code: "KeyX", ctrlKey: true, altKey: true });
+      expect(toggle.getAttribute("aria-checked")).toBe("false");
+      fireEvent.click(canvas.getByRole("button", { name: "Save settings" }));
+
+      await waitFor(() =>
+        expect(saveSettings).toHaveBeenCalledWith(
+          expect.objectContaining({ includePlugins: false })
+        )
+      );
+    });
+
+    test("lists the backup's plugins after a preview and offers only the missing ones for review", async () => {
+      const { view } = renderBackupSection({
+        backupPreview: {
+          ...PREVIEW_BASE,
+          plugins: reportOf([
+            pluginRow("alpha", "missing", {
+              source: {
+                type: "git",
+                url: "https://github.com/example/mono.git",
+                ref: "v1.2.0",
+                refType: "tag",
+                subpath: "packages/alpha",
+              },
+            }),
+            pluginRow("beta", "installed"),
+            pluginRow("gamma", "conflict"),
+            pluginRow("delta", "missing"),
+            pluginRow("epsilon", "folderMissing"),
+          ]),
+        },
+      });
+      const canvas = within(view.container);
+      await canvas.findByText("Settings backup");
+
+      fireEvent.click(canvas.getByRole("button", { name: "Preview changes" }));
+
+      await canvas.findByText("Plugins in this backup");
+      expect(canvas.getByText("github.com/example/mono/packages/alpha")).toBeTruthy();
+      expect(canvas.getByText(`v1.2.0 · ${SHA_MISSING.slice(0, 12)}`)).toBeTruthy();
+      expect(canvas.getByText(`main · ${SHA_INSTALLED.slice(0, 12)}`)).toBeTruthy();
+      expect(canvas.getAllByText("Not installed")).toHaveLength(2);
+      expect(canvas.getAllByText("Installed")).toHaveLength(1);
+      expect(canvas.getAllByText("Name in use")).toHaveLength(1);
+      expect(canvas.getAllByText("Folder missing")).toHaveLength(1);
+      expect(canvas.getByRole("button", { name: /Review and install \(2\)/ })).toBeTruthy();
+    });
+
+    test("opens Settings → Plugins with the missing plugins queued for their install review", async () => {
+      const { view } = renderBackupSection({
+        backupPreview: {
+          ...PREVIEW_BASE,
+          plugins: reportOf([
+            pluginRow("alpha", "missing"),
+            pluginRow("beta", "installed"),
+            pluginRow("gamma", "conflict"),
+            pluginRow("delta", "missing"),
+            pluginRow("epsilon", "folderMissing"),
+          ]),
+        },
+      });
+      const canvas = within(view.container);
+      await canvas.findByText("Settings backup");
+      fireEvent.click(canvas.getByRole("button", { name: "Preview changes" }));
+
+      fireEvent.click(await canvas.findByRole("button", { name: /Review and install/ }));
+
+      await waitFor(() => expect(canvas.getByTestId("settings-route").textContent).toBe("plugins"));
+      const intent = consumePendingPluginsSectionIntent();
+      expect(intent?.type).toBe("install-from-backup");
+      const entries = intent?.type === "install-from-backup" ? intent.entries : [];
+      expect(entries.map((entry) => entry.name)).toEqual(["alpha", "delta"]);
+      // The statuses were only the reason these two were picked; the queue never reads them.
+      expect(entries.some((entry) => "status" in entry)).toBe(false);
+    });
+
+    test("reviews from the keyboard only while a preview shows a missing plugin", async () => {
+      const chord = { key: "y", code: "KeyY", ctrlKey: true, altKey: true };
+      const { view } = renderBackupSection({
+        backupPreview: { ...PREVIEW_BASE, plugins: reportOf([pluginRow("alpha", "missing")]) },
+      });
+      const canvas = within(view.container);
+      await canvas.findByText("Settings backup");
+
+      fireEvent.keyDown(window, chord);
+      expect(consumePendingPluginsSectionIntent()).toBeNull();
+
+      fireEvent.click(canvas.getByRole("button", { name: "Preview changes" }));
+      await canvas.findByText("Plugins in this backup");
+      fireEvent.keyDown(window, chord);
+
+      await waitFor(() => expect(canvas.getByTestId("settings-route").textContent).toBe("plugins"));
+      expect(consumePendingPluginsSectionIntent()?.type).toBe("install-from-backup");
+    });
+
+    test("hides the plugin list while the form holds an unsaved change, and queues nothing from it", async () => {
+      const chord = { key: "y", code: "KeyY", ctrlKey: true, altKey: true };
+      const { view } = renderBackupSection({
+        backupPreview: { ...PREVIEW_BASE, plugins: reportOf([pluginRow("alpha", "missing")]) },
+      });
+      const canvas = within(view.container);
+      await canvas.findByText("Settings backup");
+      fireEvent.click(canvas.getByRole("button", { name: "Preview changes" }));
+      await canvas.findByText("Plugins in this backup");
+
+      fireEvent.change(canvas.getByLabelText("Repository URL"), {
+        target: { value: "git@github.com:example/other.git" },
+      });
+
+      await waitFor(() => expect(canvas.queryByText("Plugins in this backup")).toBeNull());
+      expect(canvas.queryByRole("button", { name: /Review and install/ })).toBeNull();
+      const routeBefore = canvas.getByTestId("settings-route").textContent;
+      fireEvent.keyDown(window, chord);
+      expect(consumePendingPluginsSectionIntent()).toBeNull();
+      expect(canvas.getByTestId("settings-route").textContent).toBe(routeBefore);
+    });
+
+    test("offers no review when every listed plugin is installed or its name is taken", async () => {
+      const { view } = renderBackupSection({
+        backupPreview: {
+          ...PREVIEW_BASE,
+          plugins: reportOf([pluginRow("beta", "installed"), pluginRow("gamma", "conflict")]),
+        },
+      });
+      const canvas = within(view.container);
+      await canvas.findByText("Settings backup");
+
+      fireEvent.click(canvas.getByRole("button", { name: "Preview changes" }));
+
+      await canvas.findByText("Plugins in this backup");
+      expect(canvas.queryByRole("button", { name: /Review and install/ })).toBeNull();
+    });
+
+    test("shows no plugin card for a backup without a plugin list", async () => {
+      const { view } = renderBackupSection();
+      const canvas = within(view.container);
+      await canvas.findByText("Settings backup");
+
+      fireEvent.click(canvas.getByRole("button", { name: "Preview changes" }));
+
+      await canvas.findByText("Backup to repository");
+      expect(canvas.queryByText("Plugins in this backup")).toBeNull();
+    });
+
+    test("says a plugin list was skipped when plugin backup is off", async () => {
+      const { view } = renderBackupSection({
+        backupPreview: { ...PREVIEW_BASE, plugins: reportOf([], { skipped: true }) },
+      });
+      const canvas = within(view.container);
+      await canvas.findByText("Settings backup");
+
+      fireEvent.click(canvas.getByRole("button", { name: "Preview changes" }));
+
+      await canvas.findByText(/carries a plugin list, but plugin backup is disabled/);
+      expect(canvas.queryByRole("button", { name: /Review and install/ })).toBeNull();
+    });
+
+    test("shows what it could not read of the plugin list, even with no row to show", async () => {
+      const { view } = renderBackupSection({
+        backupPreview: {
+          ...PREVIEW_BASE,
+          plugins: reportOf([], {
+            warnings: ["The plugin list was not read: it is not valid JSON."],
+          }),
+        },
+      });
+      const canvas = within(view.container);
+      await canvas.findByText("Settings backup");
+
+      fireEvent.click(canvas.getByRole("button", { name: "Preview changes" }));
+
+      await canvas.findByText(/it is not valid JSON/);
+      expect(canvas.queryByRole("button", { name: /Review and install/ })).toBeNull();
+    });
+
+    test("shows a left-out row next to the rows it could read", async () => {
+      const { view } = renderBackupSection({
+        backupPreview: {
+          ...PREVIEW_BASE,
+          plugins: reportOf([pluginRow("alpha", "missing")], {
+            warnings: ['Left out row 2 ("future"): source.type: Invalid input'],
+          }),
+        },
+      });
+      const canvas = within(view.container);
+      await canvas.findByText("Settings backup");
+
+      fireEvent.click(canvas.getByRole("button", { name: "Preview changes" }));
+
+      await canvas.findByText(/Left out row 2 \("future"\)/);
+      expect(canvas.getByRole("button", { name: /Review and install \(1\)/ })).toBeTruthy();
+    });
+
+    describe("removal approval", () => {
+      const REFUSED = (
+        names: string[],
+        approval: string,
+        wholeList = false,
+        unreadable = false
+      ) => ({
+        success: false as const,
+        error: {
+          code: "PLUGIN_REMOVAL_APPROVAL_REQUIRED" as const,
+          message: "This backup would remove plugins from the backup's plugin list",
+          pluginRemoval: { names, wholeList, unreadable, approval },
+        },
+      });
+      const PUSHED = {
+        success: true as const,
+        data: { commit: "abc1234", changed: true, credential: "ssh" as const, redactions: [] },
+      };
+
+      async function openCard(
+        names: string[],
+        approval: string,
+        wholeList = false,
+        unreadable = false
+      ) {
+        const { client, view } = renderBackupSection();
+        const canvas = within(view.container);
+        await canvas.findByText("Settings backup");
+        const push = jest
+          .spyOn(client.backup, "push")
+          .mockResolvedValueOnce(REFUSED(names, approval, wholeList, unreadable));
+        fireEvent.click(canvas.getByRole("button", { name: "Back up now" }));
+        await canvas.findByText("Remove plugins from the backup?");
+        return { push, canvas };
+      }
+
+      test("says that entries it cannot read are removed too, and confirms with their digest", async () => {
+        const { push, canvas } = await openCard([], "digest-u", false, true);
+
+        expect(canvas.getByText(/cannot read/)).toBeTruthy();
+        expect(canvas.queryAllByRole("listitem")).toHaveLength(0);
+        // No sentence promises a list of names that is not there.
+        expect(canvas.queryByText(/so they are removed from it/)).toBeNull();
+
+        push.mockResolvedValueOnce(PUSHED);
+        fireEvent.click(canvas.getByRole("button", { name: "Back up and remove" }));
+        await canvas.findByText(/Backed up settings at abc1234/);
+        expect(push).toHaveBeenLastCalledWith(
+          expect.objectContaining({ approvedPluginRemovalDigest: "digest-u" })
+        );
+      });
+
+      test("puts the unreadable note after the names it does not cover", async () => {
+        const { canvas } = await openCard(["alpha"], "digest-m", false, true);
+
+        const item = canvas.getByRole("listitem");
+        const note = canvas.getByText(/cannot read/);
+        // DOCUMENT_POSITION_FOLLOWING: the note comes after the list of names.
+        expect(item.compareDocumentPosition(note) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+      });
+
+      test("says nothing about unreadable entries when the whole list goes", async () => {
+        const { canvas } = await openCard(["alpha"], "digest-w", true, true);
+
+        expect(canvas.getByText(/The whole list is removed/)).toBeTruthy();
+        expect(canvas.queryByText(/cannot read/)).toBeNull();
+      });
+
+      test("sends no approval until the user confirms the removal the backup named", async () => {
+        const { push, canvas } = await openCard(["alpha", "beta"], "digest-a");
+
+        expect(push).toHaveBeenCalledTimes(1);
+        expect(push.mock.calls[0]?.[0]).toMatchObject({ approvedPluginRemovalDigest: undefined });
+        expect(canvas.getAllByRole("listitem").map((item) => item.textContent)).toEqual(
+          expect.arrayContaining(["alpha", "beta"])
+        );
+
+        push.mockResolvedValueOnce(PUSHED);
+        fireEvent.click(canvas.getByRole("button", { name: "Back up and remove" }));
+
+        await canvas.findByText(/Backed up settings at abc1234/);
+        expect(push).toHaveBeenLastCalledWith(
+          expect.objectContaining({ approvedPluginRemovalDigest: "digest-a" })
+        );
+        expect(canvas.queryByText("Remove plugins from the backup?")).toBeNull();
+      });
+
+      test("shows the new removal and sends its digest when the backup changed since", async () => {
+        const { push, canvas } = await openCard(["alpha", "beta"], "digest-a");
+        push.mockResolvedValueOnce(REFUSED(["alpha"], "digest-b"));
+        fireEvent.click(canvas.getByRole("button", { name: "Back up and remove" }));
+        await waitFor(() => expect(canvas.queryByText("beta")).toBeNull());
+        expect(canvas.getByText("alpha")).toBeTruthy();
+
+        push.mockResolvedValueOnce(PUSHED);
+        fireEvent.click(canvas.getByRole("button", { name: "Back up and remove" }));
+
+        await waitFor(() =>
+          expect(push).toHaveBeenLastCalledWith(
+            expect.objectContaining({ approvedPluginRemovalDigest: "digest-b" })
+          )
+        );
+      });
+
+      test("says the whole list goes when the push writes none", async () => {
+        const { canvas } = await openCard(["alpha"], "digest-a", true);
+
+        expect(canvas.getByText(/The whole list is removed from the backup/)).toBeTruthy();
+      });
+
+      test("keeps the confirmed removal through a secret-scan refusal, which then needs its own override", async () => {
+        const { push, canvas } = await openCard(["alpha"], "digest-a");
+        push.mockResolvedValueOnce({
+          success: false,
+          error: {
+            code: "SECRET_DETECTED",
+            message: "Potential secrets",
+            files: ["AGENTS.md"],
+            secretApproval: "secret-a",
+          },
+        });
+        fireEvent.click(canvas.getByRole("button", { name: "Back up and remove" }));
+        const override = await canvas.findByRole("checkbox", { name: "Override secret scan" });
+        // The secret refusal says nothing about the removal, so its card stays.
+        expect(canvas.getByText("Remove plugins from the backup?")).toBeTruthy();
+        fireEvent.click(override);
+        await waitFor(() => expect(override.getAttribute("data-state")).toBe("checked"));
+
+        push.mockResolvedValueOnce(PUSHED);
+        fireEvent.click(canvas.getByRole("button", { name: "Back up now" }));
+
+        await waitFor(() =>
+          expect(push).toHaveBeenLastCalledWith(
+            expect.objectContaining({
+              approvedPluginRemovalDigest: "digest-a",
+              approvedSecretDigest: "secret-a",
+            })
+          )
+        );
+      });
+
+      test("confirms from the keyboard only while the card is showing", async () => {
+        const chord = { key: "z", code: "KeyZ", ctrlKey: true, altKey: true };
+        const { client, view } = renderBackupSection();
+        const canvas = within(view.container);
+        await canvas.findByText("Settings backup");
+        const push = jest.spyOn(client.backup, "push").mockResolvedValueOnce(REFUSED(["a"], "d1"));
+
+        fireEvent.keyDown(window, chord);
+        expect(push).not.toHaveBeenCalled();
+
+        fireEvent.click(canvas.getByRole("button", { name: "Back up now" }));
+        await canvas.findByText("Remove plugins from the backup?");
+        push.mockResolvedValueOnce(PUSHED);
+        fireEvent.keyDown(window, chord);
+
+        await waitFor(() =>
+          expect(push).toHaveBeenLastCalledWith(
+            expect.objectContaining({ approvedPluginRemovalDigest: "d1" })
+          )
+        );
+      });
+    });
+
+    test("offers the plugins right after a restore, which installed none of them", async () => {
+      const { view } = renderBackupSection({
+        backupRestore: { ...RESTORE_BASE, plugins: reportOf([pluginRow("alpha", "missing")]) },
+      });
+      const canvas = within(view.container);
+      await canvas.findByText("Settings backup");
+
+      await confirmRestore(canvas);
+
+      await canvas.findByText("Plugins in this backup");
+      expect(canvas.getByRole("button", { name: /Review and install \(1\)/ })).toBeTruthy();
+    });
+
+    test("drops the plugin card when the settings change, since it describes the old repository", async () => {
+      const { client, view } = renderBackupSection({
+        backupPreview: { ...PREVIEW_BASE, plugins: reportOf([pluginRow("alpha", "missing")]) },
+      });
+      const canvas = within(view.container);
+      await canvas.findByText("Settings backup");
+      fireEvent.click(canvas.getByRole("button", { name: "Preview changes" }));
+      await canvas.findByText("Plugins in this backup");
+
+      await act(async () => {
+        await client.backup.saveSettings({
+          repoUrl: "git@github.com:example/other.git",
+          branch: "main",
+          path: "mux/",
+        });
+      });
+
+      await waitFor(() => expect(canvas.queryByText("Plugins in this backup")).toBeNull());
+    });
   });
 });

@@ -30,7 +30,6 @@
 import crypto from "node:crypto";
 import * as fsPromises from "node:fs/promises";
 import * as path from "node:path";
-import writeFileAtomic from "write-file-atomic";
 
 import assert from "@/common/utils/assert";
 import { log } from "@/node/services/log";
@@ -39,7 +38,11 @@ import {
   withTargetMutationLocks,
 } from "@/node/services/refinement/targetMutationLocks";
 import { hasErrorCode } from "@/node/services/tools/skillFileUtils";
-import { acquireProcessFileLock } from "@/node/utils/concurrency/fileLock";
+import { SESSION_MEMORY_DIR_NAME } from "@/common/constants/memory";
+import { nodeSessionLocks } from "@/node/services/sessionLocks/nodeSessionLocks";
+import type { SessionLocks } from "@/node/services/sessionLocks/sessionLocks";
+import { nodeHostFiles } from "@/node/services/hostFiles/nodeHostFiles";
+import type { HostFiles } from "@/node/services/hostFiles/hostFiles";
 
 /**
  * Removal failed WITHOUT a durable tombstone (r63). Callers must abort
@@ -49,6 +52,26 @@ import { acquireProcessFileLock } from "@/node/utils/concurrency/fileLock";
  * ENOSPC) clears — while the workspace no longer exists anywhere else.
  * Keeping the workspace registered keeps removal retryable instead.
  */
+/**
+ * A sub-agent's removal failed before publishing its tombstone under its
+ * memory owner's store lock (lock unavailable, history lock timeout, or the
+ * in-lock legacy-notebook handover failing). The caller must ABORT the
+ * removal — no tombstone, no deregistration — because the orphan fallback
+ * would leave an admitted child write free to land in the owner's live
+ * notebook after removal, or delete the only copy of a legacy note.
+ */
+export class SharedMemoryRemovalAbortedError extends Error {
+  constructor(workspaceId: string, options?: ErrorOptions) {
+    super(
+      `Removing ${workspaceId} failed before its tombstone could be published under the shared workspace-memory store lock (${
+        options?.cause instanceof Error ? options.cause.message : String(options?.cause)
+      }); removal aborted and can be retried`,
+      options
+    );
+    this.name = "SharedMemoryRemovalAbortedError";
+  }
+}
+
 export class TombstoneNotDurableError extends Error {
   constructor(workspaceId: string, options?: ErrorOptions) {
     super(
@@ -112,10 +135,13 @@ export function refineApplyLockPath(rootDir: string, workspaceId: string): strin
  */
 export async function isWorkspaceRemovalTombstoned(
   rootDir: string,
-  workspaceId: string
+  workspaceId: string,
+  // The marker lives under `<rootDir>/locks`, not in a session dir, so the default is the host's
+  // files. HistoryService passes its own SessionFiles: the check needs only `access`.
+  files: { readonly promises: Pick<HostFiles["promises"], "access"> } = nodeHostFiles
 ): Promise<boolean> {
   try {
-    await fsPromises.access(workspaceRemovalTombstonePath(rootDir, workspaceId));
+    await files.promises.access(workspaceRemovalTombstonePath(rootDir, workspaceId));
     return true;
   } catch (error) {
     return !hasErrorCode(error, "ENOENT");
@@ -141,7 +167,37 @@ export async function removeSessionDirUnderMemoryLocks(args: {
    * unconditional rollback rm would delete the marker the OTHER (possibly
    * succeeding or still-active) attempt relies on.
    */
+  /**
+   * The tombstone was already published under these same locks by
+   * sealSubAgentForRemovalUnderMemoryLocks (sub-agents: before the checkout
+   * was deleted). Nothing fallible remains before the rm, and a lock failure
+   * here takes the orphan path instead of aborting a removal whose checkout
+   * is already gone.
+   */
+  tombstoneSealed?: boolean;
   attemptId: string;
+  /**
+   * Session dir of the workspace whose `memory/` this workspace's
+   * `/memories/workspace` resolves to when that is ANOTHER workspace (a
+   * sub-agent sharing its task tree's notebook, memoryWorkspaceOwner.ts).
+   * Its store lock is held too: a child mutation is admitted under the
+   * OWNER's store key while journaling into this session dir, so a removal
+   * that took only this session's keys could publish the tombstone between
+   * the mutation's tombstone check and its commit.
+   */
+  sharedWorkspaceMemorySessionDir?: string;
+  /**
+   * Runs INSIDE the target locks, immediately before the tombstone is
+   * published: the legacy-notebook handover runs here, so a note a child
+   * wrote after any earlier pass (another backend) is still captured — the
+   * locks guarantee no further write can slip in. A throw aborts the removal
+   * (see SharedMemoryRemovalAbortedError).
+   */
+  beforeTombstone?: () => Promise<void>;
+  /** The refine and history locks (phase 4: SessionLocks). Absent: the Node layer. */
+  locks?: SessionLocks;
+  /** Writes the tombstone and deletes the session dir (phase 5: HostFiles). Absent: the Node layer. */
+  files?: HostFiles;
 }): Promise<void> {
   assert(args.sessionDir.length > 0, "removeSessionDirUnderMemoryLocks requires a session dir");
   // Crash clearly on a malformed config (test stubs, future refactors): an
@@ -151,6 +207,125 @@ export async function removeSessionDirUnderMemoryLocks(args: {
     typeof args.rootDir === "string" && args.rootDir.length > 0,
     "removeSessionDirUnderMemoryLocks requires a rootDir"
   );
+  assert(args.attemptId.length > 0, "removeSessionDirUnderMemoryLocks requires an attemptId");
+  let tombstonePublishedUnderLocks = args.tombstoneSealed === true;
+  try {
+    await withRemovalLocks(args, async () => {
+      await args.beforeTombstone?.();
+      // Tombstone BEFORE rm: once the locks release, any waiting writer
+      // re-checks it pre-commit (inside its own lock) and refuses, so the
+      // deleted directory cannot be recreated by a late mutation or
+      // journal append. A sealed tombstone is republished (idempotent):
+      // relying on the earlier marker alone would let a concurrent attempt's
+      // compensating rollback delete the only tombstone while this one
+      // proceeds to delete the session and deregister.
+      await publishRemovalTombstone(args);
+      tombstonePublishedUnderLocks = true;
+      // mutation-equivalent: files is a HostFiles object or undefined, so ?? and || agree
+      await (args.files ?? nodeHostFiles).promises.rm(args.sessionDir, {
+        recursive: true,
+        force: true,
+      });
+    });
+  } catch (error) {
+    // The orphan path below assumes a wedged writer's target is THIS
+    // workspace's retained session dir. A sub-agent's admitted memory write
+    // targets its OWNER's live notebook instead, so unless the tombstone was
+    // already published UNDER the owner-store lock, publishing it outside
+    // (after the lock was released, or never taken) would let a holder that
+    // passed its commit check — or a new writer — finish after removal.
+    // Abort instead: the workspace stays registered and removal is retried.
+    if (args.sharedWorkspaceMemorySessionDir !== undefined && !tombstonePublishedUnderLocks) {
+      throw new SharedMemoryRemovalAbortedError(args.workspaceId, { cause: error });
+    }
+    // Fail-closed orphan path (r62): a wedged writer blocks the deletion,
+    // but the caller proceeds to deregister the workspace regardless — so
+    // the terminal marker must still become durable or a foreign backend
+    // would keep mutating memory and journaling into the retained orphan
+    // forever. Publishing outside the locks is safe on THIS path precisely
+    // because the directory is not deleted: a writer mid-commit lands in
+    // the orphan, and every later mutation observes the tombstone.
+    try {
+      await publishRemovalTombstone(args);
+    } catch (publishError) {
+      // No durable marker could be written at all (r63, e.g. ENOSPC):
+      // deregistering now would leave the orphan writable again the moment
+      // the transient failure clears. Signal the caller to ABORT the
+      // removal so the workspace stays registered and retryable.
+      throw new TombstoneNotDurableError(args.workspaceId, { cause: publishError });
+    }
+    throw error;
+  }
+}
+
+/**
+ * Sub-agent removal, BEFORE the checkout is deleted: run the final, fallible
+ * shared-memory handover (legacy-notebook adoption) under the full removal
+ * lock set and publish the removal tombstone in the same critical section.
+ * From here on no backend — including a downgraded one, which honors the
+ * same locks and tombstone at its memory commit points — can add to the
+ * child's notebooks, so the later session-dir deletion has nothing fallible
+ * left in front of it. Runs before runtime deletion so a handover failure
+ * aborts with the checkout intact (the caller rolls the tombstone back if
+ * the checkout deletion is then refused). Any failure aborts the removal
+ * (SharedMemoryRemovalAbortedError).
+ */
+export async function sealSubAgentForRemovalUnderMemoryLocks(args: {
+  rootDir: string;
+  sessionDir: string;
+  workspaceId: string;
+  attemptId: string;
+  sharedWorkspaceMemorySessionDir: string;
+  beforeTombstone: () => Promise<void>;
+  /** The refine and history locks (phase 4: SessionLocks). Absent: the Node layer. */
+  locks?: SessionLocks;
+  /** Writes the tombstone (phase 5: HostFiles). Absent: the Node layer. */
+  files?: HostFiles;
+}): Promise<void> {
+  try {
+    await withRemovalLocks(args, async () => {
+      await args.beforeTombstone();
+      await publishRemovalTombstone(args);
+    });
+  } catch (error) {
+    throw new SharedMemoryRemovalAbortedError(args.workspaceId, { cause: error });
+  }
+}
+
+async function publishRemovalTombstone(args: {
+  rootDir: string;
+  workspaceId: string;
+  attemptId: string;
+  files?: HostFiles;
+}): Promise<void> {
+  assert(args.attemptId.length > 0, "removal tombstone requires an attemptId");
+  // mutation-equivalent: files is a HostFiles object or undefined, so ?? and || agree
+  const files = args.files ?? nodeHostFiles;
+  const tombstonePath = workspaceRemovalTombstonePath(args.rootDir, args.workspaceId);
+  await files.promises.mkdir(path.dirname(tombstonePath), { recursive: true });
+  await files.writeFileAtomic(
+    tombstonePath,
+    JSON.stringify({
+      workspaceId: args.workspaceId,
+      removedAt: Date.now(),
+      attemptId: args.attemptId,
+    })
+  );
+}
+
+/** The removal critical section's lock set (see removeSessionDirUnderMemoryLocks). */
+async function withRemovalLocks(
+  args: {
+    rootDir: string;
+    sessionDir: string;
+    workspaceId: string;
+    sharedWorkspaceMemorySessionDir?: string;
+    locks?: SessionLocks;
+  },
+  body: () => Promise<void>
+): Promise<void> {
+  // mutation-equivalent: locks is a SessionLocks object or undefined, so ?? and || agree
+  const locks = args.locks ?? nodeSessionLocks;
   // Same key derivations as MemoryService.storeLockKey: the workspace store
   // root lives inside the session directory; global/project mutations hold
   // the coarse `<rootDir>/memory` key while journaling into this session dir.
@@ -159,24 +334,25 @@ export async function removeSessionDirUnderMemoryLocks(args: {
     path.join(args.sessionDir, "memory")
   );
   const sharedMemoryKey = memoryMutationLockKey(args.rootDir, path.join(args.rootDir, "memory"));
+  // The session scope store also lives inside the session directory, under its own key.
+  const sessionMemoryKey = memoryMutationLockKey(
+    args.rootDir,
+    path.join(args.sessionDir, SESSION_MEMORY_DIR_NAME)
+  );
+  const ownerMemoryKeys =
+    args.sharedWorkspaceMemorySessionDir === undefined
+      ? []
+      : [
+          memoryMutationLockKey(
+            args.rootDir,
+            path.join(args.sharedWorkspaceMemorySessionDir, "memory")
+          ),
+        ];
   // The session dir itself is a third target key (r63): session-scoped
   // sidecar writers (headless usage) serialize their tombstone check +
   // commit against this same key, closing their check→write window.
   const sessionDirKey = path.resolve(args.sessionDir);
-  assert(args.attemptId.length > 0, "removeSessionDirUnderMemoryLocks requires an attemptId");
-  const publishTombstone = async (): Promise<void> => {
-    const tombstonePath = workspaceRemovalTombstonePath(args.rootDir, args.workspaceId);
-    await fsPromises.mkdir(path.dirname(tombstonePath), { recursive: true });
-    await writeFileAtomic(
-      tombstonePath,
-      JSON.stringify({
-        workspaceId: args.workspaceId,
-        removedAt: Date.now(),
-        attemptId: args.attemptId,
-      })
-    );
-  };
-  try {
+  {
     // Refine serialization (r66) — acquired FIRST (r67): a /refine apply in
     // ANOTHER backend is untouched by the remover's process-local
     // cancellation and holds this same (session-dir-external) lock across
@@ -193,51 +369,29 @@ export async function removeSessionDirUnderMemoryLocks(args: {
     // RefineService. Fail-closed like the other locks: a long apply blocks
     // removal into the orphan path rather than having the directory deleted
     // out from under its writes.
-    await using _refineLock = await acquireProcessFileLock({
+    await using _refineLock = await locks.acquireProcessFileLock({
       lockPath: refineApplyLockPath(args.rootDir, args.workspaceId),
       timeoutMs: 10_000,
       label: "refine serialization lock (removal)",
     });
     await withTargetMutationLocks(
       args.rootDir,
-      [sessionDirKey, workspaceMemoryKey, sharedMemoryKey],
+      [sessionDirKey, workspaceMemoryKey, sessionMemoryKey, sharedMemoryKey, ...ownerMemoryKeys],
       async () => {
         // History append serialization (r63): a foreign backend's in-flight
         // stream can be mid-append under the history write lock; acquiring
         // that same (session-dir-external) lock here means the append either
         // commits before the deletion below or starts afterwards and hits
         // HistoryService's in-lock tombstone gate.
-        await using _historyLock = await acquireProcessFileLock({
+        await using _historyLock = await locks.acquireProcessFileLock({
           lockPath: historyWriteLockPath(args.rootDir, args.workspaceId),
           timeoutMs: 10_000,
           label: "history write lock (removal)",
         });
-        // Tombstone BEFORE rm: once the locks release, any waiting writer
-        // re-checks it pre-commit (inside its own lock) and refuses, so the
-        // deleted directory cannot be recreated by a late mutation or
-        // journal append.
-        await publishTombstone();
-        await fsPromises.rm(args.sessionDir, { recursive: true, force: true });
-      }
+        await body();
+      },
+      locks
     );
-  } catch (error) {
-    // Fail-closed orphan path (r62): a wedged writer blocks the deletion,
-    // but the caller proceeds to deregister the workspace regardless — so
-    // the terminal marker must still become durable or a foreign backend
-    // would keep mutating memory and journaling into the retained orphan
-    // forever. Publishing outside the locks is safe on THIS path precisely
-    // because the directory is not deleted: a writer mid-commit lands in
-    // the orphan, and every later mutation observes the tombstone.
-    try {
-      await publishTombstone();
-    } catch (publishError) {
-      // No durable marker could be written at all (r63, e.g. ENOSPC):
-      // deregistering now would leave the orphan writable again the moment
-      // the transient failure clears. Signal the caller to ABORT the
-      // removal so the workspace stays registered and retryable.
-      throw new TombstoneNotDurableError(args.workspaceId, { cause: publishError });
-    }
-    throw error;
   }
 }
 
@@ -262,9 +416,14 @@ export async function rollbackRemovalTombstoneIfOwned(args: {
   workspaceId: string;
   attemptId: string;
   workspaceStillRegistered: () => boolean;
+  /** The target lock (phase 4: SessionLocks). Absent: the Node layer. */
+  locks?: SessionLocks;
 }): Promise<boolean> {
   const tombstonePath = workspaceRemovalTombstonePath(args.rootDir, args.workspaceId);
-  return await withTargetMutationLocks(args.rootDir, [path.resolve(args.sessionDir)], async () => {
+  // The caller's SessionLocks (phase 4) take the target lock.
+  const withTargetLock = <T>(fn: () => Promise<T>) =>
+    withTargetMutationLocks(args.rootDir, [path.resolve(args.sessionDir)], fn, args.locks);
+  return await withTargetLock(async () => {
     let parsed: { attemptId?: unknown };
     try {
       parsed = JSON.parse(await fsPromises.readFile(tombstonePath, "utf-8")) as {

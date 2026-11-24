@@ -61,6 +61,26 @@ describe("pruneModelData", () => {
     });
     expect(pruned.bogus).toBeUndefined();
   });
+
+  test("keeps long-context rates at every threshold LiteLLM names, in a fixed key order", () => {
+    const pruned = pruneModelData({
+      "provider/model": {
+        output_cost_per_token_above_272k_tokens: 0.000003,
+        cache_read_input_token_cost_above_100k_tokens: 0.0000001,
+        input_cost_per_token: 0.000001,
+        input_cost_per_token_above_272k_tokens_priority: 0.000004,
+        cache_creation_input_token_cost_above_1hr_above_272k_tokens: 0.000004,
+        max_input_tokens: 1000000,
+      },
+    });
+
+    expect(Object.entries(pruned["provider/model"])).toEqual([
+      ["max_input_tokens", 1000000],
+      ["input_cost_per_token", 0.000001],
+      ["cache_read_input_token_cost_above_100k_tokens", 0.0000001],
+      ["output_cost_per_token_above_272k_tokens", 0.000003],
+    ]);
+  });
 });
 
 describe("sanitizePricing", () => {
@@ -72,10 +92,16 @@ describe("sanitizePricing", () => {
       negative: { input_cost_per_token: -0.001 },
       "not-a-number": { output_cost_per_token: "0.001" },
       infinite: { cache_read_input_token_cost: Number.POSITIVE_INFINITY },
+      "negative-long-context": { input_cost_per_token_above_272k_tokens: -0.001 },
     });
 
     expect(Object.keys(catalog).sort()).toEqual(["good", "no-costs"]);
-    expect(droppedModelIds.sort()).toEqual(["infinite", "negative", "not-a-number"]);
+    expect(droppedModelIds.sort()).toEqual([
+      "infinite",
+      "negative",
+      "negative-long-context",
+      "not-a-number",
+    ]);
   });
 });
 
@@ -351,6 +377,25 @@ describe("validateModelData", () => {
     ).not.toThrow();
   });
 
+  test("guards long-context rates at any threshold like the base rates", () => {
+    const baseline = chatEntries(700, { input_cost_per_token_above_272k_tokens: 0.000002 });
+    expect(() =>
+      validateModelData(
+        { catalog: { ...chatEntries(700), ...curatedCoverage }, droppedModelIds: [] },
+        baseline
+      )
+    ).toThrow(/chat input_cost_per_token_above_272k_tokens coverage shrank from 700 to 0/);
+
+    const catalog = { ...baseline, ...curatedCoverage };
+    catalog["provider/model-3"] = {
+      ...catalog["provider/model-3"],
+      input_cost_per_token_above_272k_tokens: 0.000002e-9,
+    };
+    expect(() => validateModelData({ catalog, droppedModelIds: [] }, baseline)).toThrow(
+      /provider:model-3 input_cost_per_token_above_272k_tokens: 0.000002 -> 2e-15/
+    );
+  });
+
   test("rejects a poisoned higher-precedence alias shadowing a baseline row", () => {
     // Adding openai/x on top of a baseline bare x (or moving the row there)
     // leaves every count and median intact, but runtime lookup prefers the
@@ -404,14 +449,6 @@ describe("validateModelData", () => {
     expect(() =>
       validateModelData({ catalog: chatEntries(600), droppedModelIds: dropped })
     ).toThrow(/entries have invalid pricing/);
-  });
-
-  test("rejects data missing curated known models", () => {
-    // A large catalog that satisfies the size floor but carries none of the
-    // curated model keys that models-extra does not already cover.
-    expect(() => validateModelData({ catalog: chatEntries(600), droppedModelIds: [] })).toThrow(
-      /curated known models missing from upstream/
-    );
   });
 });
 

@@ -39,14 +39,25 @@ _Automated by the `<workflow-name>` workflow (GitHub Actions)._
 - If a PR is already open for your change, keep it up to date with the latest commits; don't leave it stale.
 - When updating a PR, ensure the title and body describe the **entire** diff against the base branch—not just the most recent commit or push.
 - Never enable auto-merge or merge into `main` yourself. The user must explicitly merge PRs.
+- Open a PR ready for review when it is meant to land, not as a draft. `pr.yml` runs on `ready_for_review`, so `gh pr ready` reruns every PR job plus the story lane that skips drafts, and Codex reviews the head again.
 
 ## CI & Validation
 
 - Prefer local validation first (e.g., `make static-check` or a targeted test subset) because CI waiting can take 10+ minutes.
+- Before the first push of a fix, find every other code path that reads the same input or makes the same decision. Search for the function, the constant, the file name and the error text. Make each one agree with the fix and cover it with a test, or say in the PR body why it does not need the change. For a CI path filter, list every file that the job reads (configs, `Makefile`, `package.json`, `bun.lock`, the workflow file) and check that a change to each one triggers the job.
 - Use `./scripts/wait_pr_ready.sh <pr_number>` as the default last-step helper when there's no more useful local work left.
-- `wait_pr_ready.sh` polls the Codex and checks gates together and fails fast when either gate reaches a terminal failure.
-- Use `./scripts/wait_pr_checks.sh <pr_number>` and `./scripts/wait_pr_codex.sh <pr_number>` directly only when you need to debug a specific gate.
+- `wait_pr_ready.sh` polls the Codex, CI checks, and (when requested) `coder-agents-review` gates together and fails fast on the first terminal failure.
+- Use `./scripts/wait_pr_checks.sh <pr_number>` and `./scripts/wait_pr_codex.sh <pr_number>` directly only when you need to debug a specific gate. They print counts: `gh pr view <pr_number> --json statusCheckRollup` lists the checks, and `./scripts/check_codex_comments.sh <pr_number>` lists the Codex findings.
 - If asked to fix an issue in CI, first replicate it locally, get it to pass locally, then use `wait_pr_ready.sh`.
+- When a required gate fails while the signal it checks is green (Codex approved, the tests pass), run `git fetch origin` and then `git log origin/main -- <the gate's scripts>` first, and read the gate at `origin/main`, not in your checkout. A rerun of the job replays the old merge commit, so it cannot pick up a gate fix on main. A new `pull_request` event (a push, or merging `origin/main` into the branch) runs on a fresh merge ref and does.
+
+### Landing a stack through the merge queue
+
+- `gh stack merge <stack#> --yes` only adds the stack to the queue. "All or nothing" covers that step, not the landing. The queue merges in groups: a failed group removes its PR (`RemovedFromMergeQueueEvent.reason` reads `failed_checks`) and every PR above it (`stack_invalidated`), while the PRs below stay merged.
+- After the enqueue, watch every member until it is merged or removed. `gh pr view --json` has no merge-queue field, so read `mergeQueueEntry{state}` and the removal event through `gh api graphql`, and treat a failed query as an error, not as "still queued".
+- Read each removed member's `state`, head and base before you touch the stack. A member whose base branch was deleted can be closed instead of rebased: reopen it and retarget it to `main` before you push anything above it.
+- When a lower PR merged, GitHub rebases the removed PRs onto `main`: wait for `Required` and a new Codex review on their new heads. When the bottom PR failed, the heads do not change: fix the failure, or confirm it is a flake. Then run `gh stack merge` again. It re-adds only the PRs that did not merge.
+- An enqueue that exits 4 with `Required status check "Required" is expected` added nothing: one member's head has no `Required` run yet.
 
 ## Status Decoding
 
@@ -82,17 +93,13 @@ Use these scripts to check, resolve, and wait on Codex review comments:
 - `./scripts/wait_pr_codex.sh <pr_number>` — Waits for Codex-only status (or one-shot status with `--once`).
 - `./scripts/wait_pr_ready.sh <pr_number>` — Unified Codex + CI gate poller (preferred for normal PR readiness loops).
 
-> PR readiness is mandatory. You MUST keep iterating until the PR is fully ready.
-> A PR is fully ready only when: (1) Codex explicitly approves, (2) all Codex review threads are resolved, and (3) all required CI checks pass.
-> You MUST NOT report success or stop the loop before these conditions are met.
+The PR readiness definition, the review loop, and its early-stop cases live in the PR Workflow section of AGENTS.md; follow them there.
 
-When a PR exists, stay in this loop until it is fully ready:
+#### Security review receipts and round cost
 
-1. Push your fixes.
-2. Resolve each review thread: `./scripts/resolve_pr_comment.sh <thread_id>`.
-3. Comment `@codex review` to re-request review.
-4. Run `./scripts/wait_pr_ready.sh <pr_number>`.
-5. If Codex or checks fail, fix locally, push, and repeat.
+- The `Codex Comments` check can wait for a Codex security review receipt that names the PR head. This happens only when the head's security review completed with no findings metadata (both findings flags null) and no clean receipt exists. Automatic reviews on PR open or on a push often end that way, because Codex posts a receipt mainly for a review that a comment asked for. In that state `check_codex_comments.sh` exits 10 with "No Codex security review was requested for <head>: request one".
+- `wait_pr_codex.sh` (and so `wait_pr_ready.sh`) posts that request itself, once per head, as `@codex security review`, a blank line, and `Head: <sha>`. It does this only when the PR already has a human `@codex review` comment. On a PR where only the automatic reviews ran, it stops earlier with "No '@codex review' comment found", and a hand-posted security request does not get past that check. Post `@codex review` first, then rerun the helper, so it can post the security request itself.
+- A pushed head that reaches this state therefore costs two Codex review rounds: the automatic review and the security review request. Batch every fix for a round into one push.
 
 ## Coder Agents Review Workflow
 
@@ -132,11 +139,13 @@ PR bodies should generally follow this structure; omit sections that are N/A or 
   - Steps taken to prove the change works as intended
   - Avoid boilerplate like `ran tests`; include this section only for novel, change-specific steps
   - Do not include steps implied by passing PR checks
+- Screenshots
+  - Required when the PR changes UI: cropped, dark-theme shots of each main change (see the PR Workflow section of AGENTS.md for capture and hosting)
 - Risks
   - PRs that touch intricate logic must include an assessment of regression risk
   - Explain regression risk in terms of severity and affected product areas
 - Pains
-  - Only include for non-trivial changes that that took multiple iteration cycles
+  - Only include for non-trivial changes that took multiple iteration cycles
   - Explain codebase or environment pains that slowed down planning, implementation, or validation
 
 ### Edits
@@ -160,8 +169,8 @@ into a toggle.
 
 ## Upkeep
 
-Once the code is pushed to the remote (even if not yet a Pull Request), do your best to commit
-and push all changes before responding to ensure its visible to the user. Commits on the working branch
+Once the code is pushed to the remote (even if not yet a Pull Request), commit and push all
+changes before responding so they are visible to the user. Commits on the working branch
 are for yourself to understand the change, they do not have to follow repository conventions as the
 PR body and title become the commit subject and body respectively.
 

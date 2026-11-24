@@ -4,6 +4,39 @@ import assert from "@/common/utils/assert";
 
 export { TASK_SETTINGS_LIMITS } from "@/common/config/schemas/taskSettings";
 
+/**
+ * An attempt is replaceable only after its owner has settled and its report is positively absent.
+ * Missing config or an interrupted status alone cannot distinguish a dead owner from preparation.
+ */
+export type TaskAttemptOutcome<Report> =
+  | { kind: "reported"; report: Report }
+  | { kind: "live"; executionId: string }
+  | { kind: "cleanup-pending" }
+  /**
+   * `code: "no-record"`: a strict config read (well-formed, or no config file) has no row for
+   * the task: it was removed, or never published. Never set for an unreadable or malformed
+   * config. Not proof of absence by itself: a reservation stalled before its publishing commit
+   * can still publish the row later (see WorkflowRunner.consultFailedCheckpoint).
+   */
+  | { kind: "indeterminate"; reason: string; code?: "no-record" }
+  /**
+   * `attemptId`: the attempt that ended (the owned attempt, or the row's current attempt named
+   * by the parent's settlement receipt). A replacement may retire exactly this attempt
+   * (claimRetiredAttempt); absent for a pre-identity owned attempt, which is never replaced.
+   * `failure`: the attempt failed terminally (persisted failure artifact, e.g. model_refusal). It
+   * ended, but its failure is the step's result: never replaced, the failure propagates.
+   */
+  | {
+      kind: "terminal-no-report";
+      attemptId?: string;
+      failure?: { errorMessage: string };
+      /** Same strict-read meaning as on `indeterminate`: the ended attempt has no row. */
+      code?: "no-record";
+    };
+
+/** A bounded settlement wait never turns unresolved cleanup into permission to replace a child. */
+export type TaskAttemptSettlement<Report> = TaskAttemptOutcome<Report> | { kind: "timeout" };
+
 // Normalized runtime settings always include numeric task limits.
 export type TaskSettings = Required<
   Pick<TaskSettingsOnDisk, "maxParallelAgentTasks" | "maxTaskNestingDepth">
@@ -18,14 +51,6 @@ export const DEFAULT_TASK_SETTINGS: TaskSettings = {
   // explicit remove owns irreversible cleanup. Workflow-owned tasks keep their transient cleanup.
   preserveSubagentsUntilArchive: true,
 };
-
-export {
-  BACKGROUND_WORK_ATTENTION_POLICIES,
-  BackgroundWorkAttentionPolicySchema,
-  DEFAULT_BACKGROUND_WORK_ATTENTION_POLICY,
-  resolveBackgroundWorkAttentionPolicy,
-  type BackgroundWorkAttentionPolicy,
-} from "./backgroundWorkAttention";
 
 function clampInt(value: unknown, fallback: number, min: number, max: number): number {
   if (typeof value !== "number" || !Number.isFinite(value)) {

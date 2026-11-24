@@ -1,6 +1,9 @@
+import "../../../../../tests/ui/dom";
+import { APIProvider } from "@/browser/contexts/API";
 import { act, cleanup, renderHook } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, mock, test } from "bun:test";
 import { GlobalWindow } from "happy-dom";
+import type { ReactNode } from "react";
 
 const getBootstrapMock = mock(() =>
   Promise.resolve({
@@ -10,22 +13,21 @@ const getBootstrapMock = mock(() =>
   })
 );
 
-void mock.module("@/browser/contexts/API", () => ({
-  useAPI: () => ({
-    api: {
-      browser: {
-        getBootstrap: getBootstrapMock,
-      },
-    },
-    status: "connected" as const,
-    error: null,
-    authenticate: () => undefined,
-    retry: () => undefined,
-  }),
-}));
+// Inject the client through the real provider: a module mock of contexts/API is process-wide
+// and leaks this partial client into later-evaluated suites.
+const apiClient = createTestApiClient({
+  browser: {
+    getBootstrap: getBootstrapMock,
+  },
+});
+
+function ApiWrapper(props: { children: ReactNode }) {
+  return <APIProvider client={apiClient}>{props.children}</APIProvider>;
+}
 
 import type { useBrowserBridgeConnection as UseBrowserBridgeConnection } from "./useBrowserBridgeConnection";
 import { useBrowserBridgeConnection as untypedUseBrowserBridgeConnection } from "./useBrowserBridgeConnection.ts?test-isolation=static";
+import { createTestApiClient } from "@/browser/testUtils";
 
 const useBrowserBridgeConnection =
   untypedUseBrowserBridgeConnection as unknown as typeof UseBrowserBridgeConnection;
@@ -99,7 +101,9 @@ async function flushAsyncWork() {
 }
 
 async function connectHook() {
-  const result = renderHook(() => useBrowserBridgeConnection("workspace-1"));
+  const result = renderHook(() => useBrowserBridgeConnection("workspace-1"), {
+    wrapper: ApiWrapper,
+  });
 
   act(() => {
     result.result.current.connect("session-a");
@@ -174,7 +178,9 @@ describe("useBrowserBridgeConnection", () => {
   });
 
   test("passes explicit other-workspace scope to browser bootstrap", async () => {
-    const result = renderHook(() => useBrowserBridgeConnection("workspace-1"));
+    const result = renderHook(() => useBrowserBridgeConnection("workspace-1"), {
+      wrapper: ApiWrapper,
+    });
 
     act(() => {
       result.result.current.connect("session-a", { allowOtherWorkspaceSession: true });

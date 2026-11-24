@@ -1,7 +1,7 @@
 import { describe, test, expect, beforeEach } from "bun:test";
 import { z } from "zod";
 import type { Tool } from "ai";
-import { generateXumTypes, getCachedXumTypes, clearTypeCache } from "./typeGenerator";
+import { generateXumTypes, getCachedXumTypes, clearTypeCacheForTests } from "./typeGenerator";
 
 /**
  * Create a mock tool with the given schema and optional execute function.
@@ -109,7 +109,7 @@ describe("generateXumTypes", () => {
       task_message_sibling: createMockTool(z.object({ task_id: z.string(), message: z.string() })),
     });
 
-    // Both tools must resolve through RESULT_SCHEMAS so the kernel sees their
+    // Both tools must resolve through catalog result schemas so the kernel sees their
     // status discriminants instead of an opaque unknown return type.
     expect(types).toContain(
       "function task_message_parent(args: TaskMessageParentArgs): TaskMessageParentResult"
@@ -328,7 +328,7 @@ describe("generateXumTypes", () => {
 
 describe("getCachedXumTypes", () => {
   beforeEach(() => {
-    clearTypeCache();
+    clearTypeCacheForTests();
   });
 
   test("invalidates cache when tool schema changes", async () => {

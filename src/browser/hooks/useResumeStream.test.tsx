@@ -1,17 +1,21 @@
 import React from "react";
 import { afterEach, beforeEach, describe, expect, mock, test } from "bun:test";
-import { cleanup, fireEvent, render, waitFor } from "@testing-library/react";
+import { restoreDomGlobals, saveDomGlobals } from "../../../tests/ui/domGlobals";
+import { act, cleanup, fireEvent, render, renderHook, waitFor } from "@testing-library/react";
 import { GlobalWindow } from "happy-dom";
 
 import { APIProvider, type APIClient } from "@/browser/contexts/API";
 import {
   addEphemeralMessage,
+  useWorkspaceState,
   useWorkspaceStoreRaw,
   workspaceStore,
 } from "@/browser/stores/WorkspaceStore";
 import type { MuxMessage } from "@/common/types/message";
 import type { FrontendWorkspaceMetadata } from "@/common/types/workspace";
 import { useResumeStream } from "./useResumeStream";
+import { createTestApiClient } from "@/browser/testUtils";
+import { createConnectionHarness, GAP_MODES } from "@/browser/contexts/connection.testHarness";
 
 const DEFAULT_WORKSPACE_ID = "ws-1";
 
@@ -25,9 +29,9 @@ const setAutoRetryEnabled = mock((_input: unknown) =>
 );
 
 function createApiClient(): APIClient {
-  return {
+  return createTestApiClient({
     workspace: { resumeStream, setAutoRetryEnabled },
-  } as unknown as APIClient;
+  });
 }
 
 function createWorkspaceMetadata(workspaceId: string): FrontendWorkspaceMetadata {
@@ -57,10 +61,9 @@ function seedWorkspaceWithUserMessage(workspaceId: string): void {
 
 // workspaceId/resetKey come straight from props so tests can rerender with new identity.
 const ResumeHarness: React.FC<{ workspaceId?: string; resetKey?: string | null }> = (props) => {
-  const { resume, error } = useResumeStream(
-    props.workspaceId ?? DEFAULT_WORKSPACE_ID,
-    props.resetKey
-  );
+  const workspaceId = props.workspaceId ?? DEFAULT_WORKSPACE_ID;
+  const { messages } = useWorkspaceState(workspaceId);
+  const { resume, error } = useResumeStream(workspaceId, props.resetKey, messages);
   return (
     <div>
       <button type="button" onClick={() => void resume()}>
@@ -79,6 +82,7 @@ const Harness: React.FC<{ workspaceId?: string; resetKey?: string | null }> = (p
 
 describe("useResumeStream", () => {
   beforeEach(() => {
+    saveDomGlobals();
     globalThis.window = new GlobalWindow() as unknown as Window & typeof globalThis;
     globalThis.document = globalThis.window.document;
     useWorkspaceStoreRaw().dispose();
@@ -91,8 +95,7 @@ describe("useResumeStream", () => {
   afterEach(() => {
     cleanup();
     useWorkspaceStoreRaw().dispose();
-    globalThis.window = undefined as unknown as Window & typeof globalThis;
-    globalThis.document = undefined as unknown as Document;
+    restoreDomGlobals();
   });
 
   test("resumes the stream without touching the auto-retry preference", async () => {
@@ -148,4 +151,19 @@ describe("useResumeStream", () => {
 
     expect(view.queryByTestId("resume-error")).toBeNull();
   });
+
+  // useAPI() keeps the last client while reconnecting (kept-gap): resume must still see "offline".
+  test.each([...GAP_MODES])(
+    "while the connection is down (%s), resume shows the offline error",
+    async (mode) => {
+      const harness = createConnectionHarness(mode, () => ({ workspace: { resumeStream } }));
+      const { result } = renderHook(() => useResumeStream(DEFAULT_WORKSPACE_ID, "turn-1", []), {
+        wrapper: harness.Wrapper,
+      });
+      await harness.drop();
+      await act(() => result.current.resume());
+      expect(result.current.error).toBe("Not connected to server");
+      expect(resumeStream).not.toHaveBeenCalled();
+    }
+  );
 });

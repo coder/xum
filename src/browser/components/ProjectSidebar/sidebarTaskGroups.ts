@@ -3,6 +3,7 @@ import {
   isSidebarSubAgentRunning,
   isWorkspaceDelegatedActivityActive,
   type AgentRowRenderMeta,
+  type DelegatedActivityOptions,
 } from "@/browser/utils/ui/workspaceFiltering";
 import type { FrontendWorkspaceMetadata } from "@/common/types/workspace";
 import { hasCompletedAgentReport } from "@/common/utils/agentTaskCompletion";
@@ -153,7 +154,7 @@ export function getWorkflowGroupStorageKey(workspace: FrontendWorkspaceMetadata)
  */
 export function collectActiveWorkflowGroupKeys(
   workspaces: FrontendWorkspaceMetadata[],
-  options: { isWorkspaceLiveActive?: (workspaceId: string) => boolean } = {}
+  options: DelegatedActivityOptions = {}
 ): Set<string> {
   const keys = new Set<string>();
   for (const workspace of workspaces) {
@@ -203,6 +204,7 @@ export function computeSidebarTaskGroups(params: {
   /** Unfiltered section rows used for totals and the leaf-only rule. */
   allRows: FrontendWorkspaceMetadata[];
   selectedWorkspaceId?: string;
+  hasActiveBashMonitor?: (workspaceId: string) => boolean;
   isWorkspaceLiveActive?: (workspaceId: string) => boolean;
 }): SidebarTaskGroupsResult {
   const childrenByParentId = new Map<string, FrontendWorkspaceMetadata[]>();
@@ -283,6 +285,7 @@ export function computeSidebarTaskGroups(params: {
       if (
         isWorkspaceDelegatedActivityActive(member, {
           isWorkspaceLiveActive: params.isWorkspaceLiveActive,
+          hasActiveBashMonitor: params.hasActiveBashMonitor,
         })
       ) {
         runningCount += 1;
@@ -316,6 +319,7 @@ export function computeSidebarTaskGroups(params: {
             member.taskStatus === "queued" ||
             isWorkspaceDelegatedActivityActive(member, {
               isWorkspaceLiveActive: params.isWorkspaceLiveActive,
+              hasActiveBashMonitor: params.hasActiveBashMonitor,
             })
         )
       );
@@ -372,6 +376,7 @@ export function computeTaskGroupMemberRowMeta(params: {
   group: SidebarTaskGroupModel;
   headerMeta: AgentRowRenderMeta;
   headerDepth: number;
+  hasActiveBashMonitor?: (workspaceId: string) => boolean;
   isWorkspaceLiveActive?: (workspaceId: string) => boolean;
 }): Map<string, AgentRowRenderMeta> {
   const members = params.group.displayMembers;
@@ -384,6 +389,7 @@ export function computeTaskGroupMemberRowMeta(params: {
       member != null &&
       isSidebarSubAgentRunning(member, {
         isWorkspaceLiveActive: params.isWorkspaceLiveActive,
+        hasActiveBashMonitor: params.hasActiveBashMonitor,
       })
     ) {
       lastRunningMemberIndex = index;

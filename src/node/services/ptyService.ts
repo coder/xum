@@ -16,6 +16,7 @@ import type {
 } from "@/common/types/terminal";
 import type { PtyHandle } from "@/node/runtime/transports";
 import { spawnPtyProcess } from "@/node/runtime/ptySpawn";
+import { cdThenExecShell } from "@/node/runtime/streamUtils";
 import { SSHRuntime } from "@/node/runtime/SSHRuntime";
 import { LocalBaseRuntime } from "@/node/runtime/LocalBaseRuntime";
 import { resolveContainerCli } from "@/node/runtime/containerCli";
@@ -43,6 +44,11 @@ interface SessionData {
 
 interface CreateSessionOptions {
   env?: NodeJS.ProcessEnv;
+  /**
+   * Shell commands run before the interactive shell in SSH, Docker and devcontainer terminals
+   * (ends with "; "; see buildScratchShellPrelude). Visible in command args: no secrets.
+   */
+  remoteShellPrelude?: string;
   /** User-configured default shell from config.json. */
   defaultShell?: string;
 }
@@ -108,6 +114,7 @@ export class PTYService {
         workspacePath,
         cols: params.cols,
         rows: params.rows,
+        shellPrelude: options?.remoteShellPrelude,
       });
       runtimeLabel = "SSH";
       log.info(`[PTY] SSH terminal for ${sessionId}: ssh ${runtime.getConfig().host}`);
@@ -128,7 +135,11 @@ export class PTYService {
         devcontainerArgs.push("--remote-env", `${key}=${value}`);
       }
 
-      devcontainerArgs.push("--", "/bin/sh");
+      devcontainerArgs.push(
+        "--",
+        "/bin/sh",
+        ...(options?.remoteShellPrelude ? ["-c", `${options.remoteShellPrelude}exec /bin/sh`] : [])
+      );
       runtimeLabel = "Devcontainer";
       const logArgs = redactDevcontainerArgsForLog(devcontainerArgs);
       log.info(`[PTY] Devcontainer terminal for ${sessionId}: devcontainer ${logArgs.join(" ")}`);
@@ -140,7 +151,6 @@ export class PTYService {
         cwd: workspacePath,
         cols: params.cols,
         rows: params.rows,
-        preferElectronBuild: false,
       });
     } else if (runtime instanceof LocalBaseRuntime) {
       try {
@@ -169,7 +179,6 @@ export class PTYService {
         cwd: workspacePath,
         cols: params.cols,
         rows: params.rows,
-        preferElectronBuild: true,
         env: options?.env,
         logLocalEnv: true,
       });
@@ -184,7 +193,7 @@ export class PTYService {
         containerName,
         "/bin/sh",
         "-c",
-        `cd ${shellQuotePath(workspacePath)} && exec /bin/sh`,
+        cdThenExecShell(shellQuotePath(workspacePath), options?.remoteShellPrelude, "/bin/sh"),
       ];
       runtimeLabel = "Docker";
       const containerCli = await resolveContainerCli();
@@ -197,7 +206,6 @@ export class PTYService {
         cwd: process.cwd(),
         cols: params.cols,
         rows: params.rows,
-        preferElectronBuild: false,
       });
     } else {
       throw new Error(`Unsupported runtime type: ${runtime.constructor.name}`);
@@ -318,12 +326,5 @@ export class PTYService {
     const sessionIds = Array.from(this.sessions.keys());
     log.info(`Closing all ${sessionIds.length} terminal session(s)`);
     sessionIds.forEach((id) => this.closeSession(id));
-  }
-
-  /**
-   * Get all sessions for debugging
-   */
-  getSessions(): Map<string, SessionData> {
-    return this.sessions;
   }
 }

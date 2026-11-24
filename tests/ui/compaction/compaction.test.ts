@@ -9,16 +9,17 @@
 import "../dom";
 import { waitFor } from "@testing-library/react";
 
-import { preloadTestModules, type TestEnvironment } from "../../ipc/setup";
+import { preloadTestModules, setupProviders, type TestEnvironment } from "../../ipc/setup";
 
 import { BackgroundProcessManager } from "@/node/services/backgroundProcessManager";
 
 import { fireEvent } from "@testing-library/react";
 import { createAppHarness } from "../harness";
+import { startWaitBudget } from "./waitBudget";
 import { WORKSPACE_DEFAULTS } from "@/constants/workspaceDefaults";
-import { updatePersistedState } from "@/browser/hooks/usePersistedState";
-import { getAutoCompactionThresholdKey } from "@/common/constants/storage";
 import { workspaceStore } from "@/browser/stores/WorkspaceStore";
+import { getAppConfigStore, updateUserPreferences } from "@/browser/stores/AppConfigStore";
+import { resolveAutoCompactionThreshold } from "@/common/utils/compaction/autoCompactionThreshold";
 
 interface ServiceContainerPrivates {
   backgroundProcessManager: BackgroundProcessManager;
@@ -61,8 +62,8 @@ async function getActiveTextarea(container: HTMLElement): Promise<HTMLTextAreaEl
   return waitFor(
     () => {
       const textareas = Array.from(
-        container.querySelectorAll('textarea[aria-label="Message Claude"]')
-      ) as HTMLTextAreaElement[];
+        container.querySelectorAll<HTMLTextAreaElement>('textarea[aria-label="Message"]')
+      );
       if (textareas.length === 0) {
         throw new Error("Chat textarea not found");
       }
@@ -78,18 +79,37 @@ async function getActiveTextarea(container: HTMLElement): Promise<HTMLTextAreaEl
   );
 }
 
-async function setDeterministicForceCompactionThreshold(
-  env: TestEnvironment,
-  workspaceId: string
-): Promise<void> {
-  // Keep force-compaction tests deterministic even if persisted settings enable 1M context
-  // or raise the auto-compaction threshold. 10% threshold + 5% force buffer => trigger at 15%.
-  updatePersistedState(getAutoCompactionThresholdKey(WORKSPACE_DEFAULTS.model), 10);
-  const result = await env.orpc.workspace.setAutoCompactionThreshold({
-    workspaceId,
-    threshold: 0.1,
+const FORCE_THRESHOLD_PERCENT = 10;
+
+// Every long wait in a test draws on a budget that ends before the test's limit (waitBudget.ts).
+// The limits on the `test(...)` calls stay literals (prettier unwraps a test body only for a
+// literal), so keep them in step with these.
+const TEST_LIMIT_MS = 60_000;
+const FORCE_TEST_LIMIT_MS = 120_000;
+
+/**
+ * Move the per-model slider the way the UI does (a merge patch to config.json).
+ * 10% threshold + 5% force buffer => force compaction triggers at 15%.
+ */
+function moveThresholdSlider(percent: number): void {
+  updateUserPreferences({
+    ai: { autoCompactionThresholdByModel: { [WORKSPACE_DEFAULTS.model]: percent } },
   });
-  expect(result.success).toBe(true);
+}
+
+/** The backend reads the threshold from config.json; wait until the mirrored write landed. */
+async function waitForPersistedThreshold(env: TestEnvironment, fraction: number): Promise<void> {
+  await waitFor(
+    () => {
+      expect(
+        resolveAutoCompactionThreshold(
+          env.config.loadConfigOrDefault().userPreferences,
+          WORKSPACE_DEFAULTS.model
+        )
+      ).toBe(fraction);
+    },
+    { timeout: 10_000 }
+  );
 }
 
 describe("Compaction UI (mock AI router)", () => {
@@ -123,9 +143,20 @@ describe("Compaction UI (mock AI router)", () => {
   }, 60_000);
 
   test("auto-compacts after context_exceeded and resumes", async () => {
+    const remainingMs = startWaitBudget(TEST_LIMIT_MS);
     const app = await createAppHarness({ branchPrefix: "compaction-ui" });
 
     try {
+      // The UI auto-compacts into the largest-context model of a configured provider (see
+      // getHigherContextCompactionSuggestion), and a model qualifies only with a larger context
+      // than the default model's (Google, Moonshot AI, Meta and Z.ai each list one; no OpenAI
+      // built-in does since GPT-6.2 Astra's 922K input cap replaced GPT-6 Astra's 1.05M).
+      // Without such a provider the UI does not auto-compact: it shows the manual "Insert /compact"
+      // button, and this test waits for a summary that never comes. The mock router never calls
+      // the provider, so a dummy key is enough. Seeding it here keeps the test independent of an
+      // ambient provider key.
+      await setupProviders(app.env, { google: { apiKey: "test-key-for-ui-tests" } });
+
       const triggerMessage = "Trigger context error";
       const userDraft = "My draft message that should be preserved";
 
@@ -134,9 +165,9 @@ describe("Compaction UI (mock AI router)", () => {
       // User starts typing while auto-compaction is in progress
       await app.chat.typeWithoutSending(userDraft);
 
-      await app.chat.expectTranscriptContains("Mock compaction summary:", 60_000);
-      await app.chat.expectTranscriptContains(`Continue with: ${triggerMessage}`, 60_000);
-      await app.chat.expectTranscriptContains(`Mock response: ${triggerMessage}`, 60_000);
+      await app.chat.expectTranscriptContains("Mock compaction summary:", remainingMs());
+      await app.chat.expectTranscriptContains(`Continue with: ${triggerMessage}`, remainingMs());
+      await app.chat.expectTranscriptContains(`Mock response: ${triggerMessage}`, remainingMs());
 
       // Verify user's draft was NOT overwritten by auto-compaction
       await app.chat.expectInputValue(userDraft);
@@ -146,6 +177,7 @@ describe("Compaction UI (mock AI router)", () => {
   }, 60_000);
 
   test("force compaction triggers during streaming", async () => {
+    const remainingMs = startWaitBudget(FORCE_TEST_LIMIT_MS);
     const app = await createAppHarness({ branchPrefix: "compaction-ui" });
 
     try {
@@ -159,41 +191,74 @@ describe("Compaction UI (mock AI router)", () => {
       });
       expect(seedResult.success).toBe(true);
       await app.chat.expectTranscriptContains(`Mock response: ${seedMessage}`);
-      await setDeterministicForceCompactionThreshold(app.env, app.workspaceId);
+      // Slider, then an immediate composer send: the composer waits for the preference write
+      // to be acknowledged, so the backend decides with the new threshold.
+      moveThresholdSlider(FORCE_THRESHOLD_PERCENT);
+      await app.chat.send(triggerMessage);
+      await waitForPersistedThreshold(app.env, FORCE_THRESHOLD_PERCENT / 100);
 
-      const triggerResult = await app.env.orpc.workspace.sendMessage({
-        workspaceId: app.workspaceId,
-        message: triggerMessage,
-        options: { model: WORKSPACE_DEFAULTS.model, agentId: WORKSPACE_DEFAULTS.agentId },
-      });
-      expect(triggerResult.success).toBe(true);
-
-      const compactionAssertionTimeoutMs = 120_000;
-      await app.chat.expectTranscriptContains(
-        "Mock compaction summary:",
-        compactionAssertionTimeoutMs
-      );
-      await app.chat.expectTranscriptContains(
-        "Mock response: Continue",
-        compactionAssertionTimeoutMs
-      );
+      await app.chat.expectTranscriptContains("Mock compaction summary:", remainingMs());
+      await app.chat.expectTranscriptContains("Mock response: Continue", remainingMs());
       // Compaction transcript now renders a single top boundary row.
-      await app.chat.expectTranscriptContains("Compaction boundary", compactionAssertionTimeoutMs);
+      await app.chat.expectTranscriptContains("Compaction boundary", remainingMs());
 
       // Force compaction now prunes to the latest boundary window, so the
       // pre-compaction triggering turn is no longer shown.
-      await app.chat.expectTranscriptNotContains(triggerMessage, compactionAssertionTimeoutMs);
+      await app.chat.expectTranscriptNotContains(triggerMessage, remainingMs());
     } finally {
       await app.dispose();
     }
   }, 120_000);
 
+  test("a slider change whose save fails refuses the send and keeps the draft", async () => {
+    const app = await createAppHarness({ branchPrefix: "compaction-ui" });
+
+    try {
+      const seedMessage = "Seed before the failing save";
+      await app.chat.send(seedMessage);
+      await app.chat.expectTranscriptContains(`Mock response: ${seedMessage}`);
+
+      const sendMessage = jest.spyOn(app.env.services.workspaceService, "sendMessage");
+      let failSave: (error: Error) => void = () => undefined;
+      const updateUserPreferences = jest
+        .spyOn(app.env.config, "updateUserPreferences")
+        .mockImplementation(
+          () =>
+            new Promise<void>((_resolve, reject) => {
+              failSave = reject;
+            })
+        );
+      const flush = jest.spyOn(getAppConfigStore(), "flushUserPreferences");
+      const draft = "Draft that must survive a failed settings save";
+      moveThresholdSlider(FORCE_THRESHOLD_PERCENT);
+      await waitFor(() => expect(updateUserPreferences).toHaveBeenCalled(), { timeout: 10_000 });
+      await app.chat.send(draft);
+      // Fail the save only once the send waits on it.
+      await waitFor(() => expect(flush).toHaveBeenCalled(), { timeout: 10_000 });
+      failSave(new Error("disk full"));
+      flush.mockRestore();
+
+      // The composer refuses the send visibly rather than streaming with a stale threshold.
+      await waitFor(
+        () => expect(app.view.container.textContent ?? "").toContain("Settings could not be saved"),
+        { timeout: 10_000 }
+      );
+      await app.chat.expectInputValue(draft);
+      expect(sendMessage).not.toHaveBeenCalled();
+    } finally {
+      await app.dispose();
+    }
+  }, 60_000);
+
   test("/compact command sends any foreground bash to background", async () => {
+    const remainingMs = startWaitBudget(TEST_LIMIT_MS);
     const app = await createAppHarness({ branchPrefix: "compaction-ui" });
 
     let unregister: (() => void) | undefined;
 
     try {
+      await app.chat.startHeldToolTurn("Seed conversation for /compact test");
+
       const manager = getBackgroundProcessManager(app.env);
 
       const toolCallId = "bash-foreground-compact";
@@ -207,6 +272,7 @@ describe("Compaction UI (mock AI router)", () => {
         () => {
           backgrounded = true;
           unregister?.();
+          app.env.services.aiService.releaseMockToolCalls(app.workspaceId);
         }
       );
 
@@ -215,26 +281,16 @@ describe("Compaction UI (mock AI router)", () => {
       // Ensure the UI's subscription has observed the foreground bash before sending /compact.
       await waitForForegroundToolCallId(app.env, app.workspaceId, toolCallId);
 
-      const seedMessage = "Seed conversation for /compact test";
-
-      const seedResult = await app.env.orpc.workspace.sendMessage({
-        workspaceId: app.workspaceId,
-        message: seedMessage,
-        options: { model: WORKSPACE_DEFAULTS.model, agentId: WORKSPACE_DEFAULTS.agentId },
-      });
-      expect(seedResult.success).toBe(true);
-      await app.chat.expectTranscriptContains(`Mock response: ${seedMessage}`);
-
       // Send /compact command via the UI (like a user would)
       await app.chat.send("/compact -t 500");
 
-      await app.chat.expectTranscriptContains("Mock compaction summary:", 60_000);
+      await app.chat.expectTranscriptContains("Mock compaction summary:", remainingMs());
 
       await waitFor(
         () => {
           expect(backgrounded).toBe(true);
         },
-        { timeout: 60_000 }
+        { timeout: remainingMs() }
       );
     } finally {
       unregister?.();
@@ -243,6 +299,7 @@ describe("Compaction UI (mock AI router)", () => {
   }, 60_000);
 
   test("/compact with Ctrl+Enter (turn-end) does NOT auto-background foreground bash", async () => {
+    const remainingMs = startWaitBudget(TEST_LIMIT_MS);
     const app = await createAppHarness({ branchPrefix: "compaction-ui" });
 
     let unregister: (() => void) | undefined;
@@ -283,7 +340,7 @@ describe("Compaction UI (mock AI router)", () => {
       const textarea = await getActiveTextarea(app.view.container);
       fireEvent.keyDown(textarea, { key: "Enter", ctrlKey: true });
 
-      await app.chat.expectTranscriptContains("Mock compaction summary:", 60_000);
+      await app.chat.expectTranscriptContains("Mock compaction summary:", remainingMs());
 
       expect(backgrounded).toBe(false);
     } finally {
@@ -293,11 +350,14 @@ describe("Compaction UI (mock AI router)", () => {
   }, 60_000);
 
   test("force compaction sends any foreground bash to background", async () => {
+    const remainingMs = startWaitBudget(FORCE_TEST_LIMIT_MS);
     const app = await createAppHarness({ branchPrefix: "compaction-ui" });
 
     let unregister: (() => void) | undefined;
 
     try {
+      await app.chat.startHeldToolTurn("Seed conversation for compaction");
+
       const manager = getBackgroundProcessManager(app.env);
 
       const toolCallId = "bash-foreground";
@@ -311,37 +371,28 @@ describe("Compaction UI (mock AI router)", () => {
         () => {
           backgrounded = true;
           unregister?.();
+          app.env.services.aiService.releaseMockToolCalls(app.workspaceId);
         }
       );
 
       unregister = registration.unregister;
 
-      // Ensure the UI's subscription has observed the foreground bash before streaming starts.
+      // Observe foreground Bash before queueing the follow-up on the held turn.
       await waitForForegroundToolCallId(app.env, app.workspaceId, toolCallId);
 
-      const seedMessage = "Seed conversation for compaction";
-      const triggerMessage = "[force] Trigger force compaction";
+      moveThresholdSlider(FORCE_THRESHOLD_PERCENT);
+      await waitForPersistedThreshold(app.env, FORCE_THRESHOLD_PERCENT / 100);
 
-      const seedResult = await app.env.orpc.workspace.sendMessage({
-        workspaceId: app.workspaceId,
-        message: seedMessage,
-        options: { model: WORKSPACE_DEFAULTS.model, agentId: WORKSPACE_DEFAULTS.agentId },
-      });
-      expect(seedResult.success).toBe(true);
-      await app.chat.expectTranscriptContains(`Mock response: ${seedMessage}`);
-      await setDeterministicForceCompactionThreshold(app.env, app.workspaceId);
+      // Queue on a live turn so tool-end input backgrounds Bash before force compaction.
+      await app.chat.send("[force] Trigger force compaction");
 
-      // Send via the UI path so the foreground bash auto-background logic runs exactly
-      // as it does for real user sends, while backend mid-stream compaction handles the rest.
-      await app.chat.send(triggerMessage);
-
-      await app.chat.expectTranscriptContains("Mock compaction summary:", 60_000);
+      await app.chat.expectTranscriptContains("Mock compaction summary:", remainingMs());
 
       await waitFor(
         () => {
           expect(backgrounded).toBe(true);
         },
-        { timeout: 60_000 }
+        { timeout: remainingMs() }
       );
     } finally {
       unregister?.();
@@ -351,7 +402,7 @@ describe("Compaction UI (mock AI router)", () => {
 });
 
 describe("Auto-follow-up and compaction notification behavior (mock AI router)", () => {
-  const notifications: Array<{ title: string; body?: string }> = [];
+  const notifications: { title: string; body?: string }[] = [];
   let originalWindowNotification: unknown;
 
   beforeAll(async () => {
@@ -407,12 +458,12 @@ describe("Auto-follow-up and compaction notification behavior (mock AI router)",
       globalThis as { Notification: unknown }
     ).Notification;
 
-    // Enable notifications via UI (click bell button in workspace header)
-    const notifyButton = app.view.container.querySelector(
-      '[data-testid="notify-on-response-button"]'
-    );
-    if (!notifyButton) throw new Error("Notify button not found");
-    fireEvent.click(notifyButton);
+    // Enable notifications with the toggle shortcut. The bell only opens the settings popover,
+    // and Radix popover content does not render in happy-dom.
+    if (!app.view.container.querySelector('[data-testid="notify-on-response-button"]')) {
+      throw new Error("Notify button not found");
+    }
+    fireEvent.keyDown(window, { key: ",", code: "Comma", ctrlKey: true, shiftKey: true });
 
     // Send seed message and wait for notification
     await app.chat.send(seedMessage);
@@ -504,29 +555,6 @@ describe("Auto-follow-up and compaction notification behavior (mock AI router)",
       await app.chat.expectStreamComplete();
 
       expect(notifications.length).toBe(countAfterSeed);
-    } finally {
-      await cleanup();
-    }
-  }, 60_000);
-
-  // Note: Force compaction interrupts an active stream. In the real backend, this would send
-  // a stream-abort event and the interrupted stream would NOT trigger a notification.
-  // However, the mock AI completes streams normally (no mid-stream abort simulation),
-  // so the "interrupted" stream's completion still fires a notification.
-  test.skip("force compaction with auto-continue should fire only ONE notification", async () => {
-    const { app, countAfterSeed, cleanup } = await setupNotificationTest(
-      "Seed for force compaction"
-    );
-
-    try {
-      // Force compaction auto-generates a "Continue" message
-      await app.chat.send("[force] Trigger force compaction");
-      await app.chat.expectTranscriptContains("Mock compaction summary:", 60_000);
-      await app.chat.expectTranscriptContains("Mock response: Continue", 60_000);
-
-      const { newCount, last } = await waitForNewNotifications(countAfterSeed);
-      expect(newCount).toBe(1);
-      expect(last.body).toBe("Mock response: Continue");
     } finally {
       await cleanup();
     }

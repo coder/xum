@@ -1,4 +1,5 @@
 import type { AgentSideConnection } from "@agentclientprotocol/sdk";
+import { BASH_DEFAULT_TIMEOUT_SECS } from "../../src/common/constants/toolLimits";
 import { ToolRouter } from "../../src/node/acp/toolRouter";
 
 function createRouter(overrides?: {
@@ -15,9 +16,9 @@ function createRouter(overrides?: {
   extMethod?: (toolName: string, params: Record<string, unknown>) => Promise<unknown>;
 }): {
   router: ToolRouter;
-  writeCalls: Array<{ sessionId: string; path: string; content: string }>;
+  writeCalls: { sessionId: string; path: string; content: string }[];
 } {
-  const writeCalls: Array<{ sessionId: string; path: string; content: string }> = [];
+  const writeCalls: { sessionId: string; path: string; content: string }[] = [];
 
   const connection = {
     readTextFile:
@@ -64,6 +65,33 @@ function createRouter(overrides?: {
   return { router, writeCalls };
 }
 
+/**
+ * Await `run` with global setTimeout recorded, so a wait deadline can be observed without spending
+ * it: armedDelays collects every delay armed during the call, and accelerateToMs makes each timer
+ * fire then instead of at its own delay.
+ */
+async function withRecordedTimeouts<T>(
+  run: () => Promise<T>,
+  accelerateToMs?: number
+): Promise<{ result: T; armedDelays: number[] }> {
+  const armedDelays: number[] = [];
+  const realSetTimeout = globalThis.setTimeout;
+  globalThis.setTimeout = ((
+    callback: (...args: never[]) => void,
+    delayMs?: number,
+    ...args: unknown[]
+  ) => {
+    armedDelays.push(delayMs ?? 0);
+    return realSetTimeout(callback, accelerateToMs ?? delayMs, ...(args as []));
+  }) as unknown as typeof globalThis.setTimeout;
+
+  try {
+    return { result: await run(), armedDelays };
+  } finally {
+    globalThis.setTimeout = realSetTimeout;
+  }
+}
+
 describe("ACP ToolRouter", () => {
   it("does not delegate unknown filesystem tools via generic fs capabilities", () => {
     const { router } = createRouter();
@@ -102,7 +130,7 @@ describe("ACP ToolRouter", () => {
       exitCode: 0,
     });
     expect(result).toEqual(
-      expect.objectContaining({
+      expect.objectContaining<Record<string, unknown>>({
         wall_duration_ms: expect.any(Number),
       })
     );
@@ -166,13 +194,82 @@ describe("ACP ToolRouter", () => {
       timeout_secs: 0.02,
     });
 
-    expect(result).toMatchObject({
+    expect(result).toMatchObject<Record<string, unknown>>({
       success: false,
       output: "partial\n",
       exitCode: -1,
       error: expect.stringContaining("Command exceeded timeout of 0.02 seconds"),
     });
     expect(killCalls).toBe(1);
+  });
+
+  it("waits on a delegated foreground bash call with the default deadline when timeout_secs is omitted", async () => {
+    // Making timeout_secs optional in the schema made an omitted value reachable here, and an
+    // unbounded waitForExit would hang the turn. The accelerated deadline lets the timeout path run
+    // in milliseconds; the recorded delay is the deadline the production code armed.
+    let killCalls = 0;
+
+    const { router } = createRouter({
+      createTerminal: async () => ({
+        id: "default-timeout-term",
+        currentOutput: async () => ({ output: "partial\n", truncated: false }),
+        waitForExit: async () => await new Promise(() => undefined),
+        kill: async () => {
+          killCalls += 1;
+          return undefined;
+        },
+        release: async () => undefined,
+        [Symbol.asyncDispose]: async () => undefined,
+      }),
+    });
+
+    const { result, armedDelays } = await withRecordedTimeouts(
+      () => router.delegateToEditor("session-1", "bash", { script: "tail -f /tmp/log" }),
+      5
+    );
+
+    expect(result).toMatchObject<Record<string, unknown>>({
+      success: false,
+      output: "partial\n",
+      exitCode: -1,
+      error: expect.stringContaining(
+        `Command exceeded timeout of ${BASH_DEFAULT_TIMEOUT_SECS} seconds`
+      ),
+    });
+    expect(armedDelays).toContain(BASH_DEFAULT_TIMEOUT_SECS * 1000);
+    expect(killCalls).toBe(1);
+  });
+
+  it("waits without a deadline for a delegated non-bash terminal call", async () => {
+    // The bash default belongs to bash alone: a terminal tool that has no timeout_secs at all must
+    // still be waited on until it exits. Delays are recorded and left alone here, because the
+    // assertion is that no deadline is armed.
+    const { router } = createRouter({
+      createTerminal: async () => ({
+        id: "non-bash-term",
+        currentOutput: async () => ({ output: "done\n", truncated: false }),
+        waitForExit: async () => {
+          await new Promise<void>((resolve) => {
+            setTimeout(resolve, 5);
+          });
+          return { exitCode: 0 };
+        },
+        kill: async () => undefined,
+        release: async () => undefined,
+        [Symbol.asyncDispose]: async () => undefined,
+      }),
+    });
+
+    const { result, armedDelays } = await withRecordedTimeouts(() =>
+      router.delegateToEditor("session-1", "terminal.run", { command: "sleep" })
+    );
+
+    expect(result).toMatchObject<Record<string, unknown>>({
+      success: true,
+      output: "done\n",
+      exitCode: 0,
+    });
+    expect(armedDelays).not.toContain(BASH_DEFAULT_TIMEOUT_SECS * 1000);
   });
 
   it("honors timeout_secs for delegated file_read calls", async () => {

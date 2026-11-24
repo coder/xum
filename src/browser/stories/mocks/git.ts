@@ -7,6 +7,8 @@ export interface GitStatusFixture {
   dirty?: number;
   headCommit?: string;
   originCommit?: string;
+  /** Checked-out branch; the branch selector resolves to it (and offers copy) once reported. */
+  headBranch?: string;
 
   // Optional overrides for line-delta display (additions/deletions)
   outgoingAdditions?: number;
@@ -25,7 +27,8 @@ export function createGitStatusOutput(fixture: GitStatusFixture): string {
   const incomingAdditions = fixture.incomingAdditions ?? behind * 10;
   const incomingDeletions = fixture.incomingDeletions ?? behind * 3;
 
-  const lines = ["---PRIMARY---", "main", "---AHEAD_BEHIND---", `${ahead} ${behind}`];
+  const lines = fixture.headBranch ? ["---HEAD_BRANCH---", fixture.headBranch] : [];
+  lines.push("---PRIMARY---", "main", "---AHEAD_BEHIND---", `${ahead} ${behind}`);
   lines.push("---DIRTY---");
   lines.push(String(dirty));
   lines.push("---LINE_DELTA---");

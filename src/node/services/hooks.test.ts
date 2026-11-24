@@ -12,22 +12,8 @@ import {
   runPostHook,
 } from "./hooks";
 import { LocalRuntime } from "@/node/runtime/LocalRuntime";
-
-class ExecPathMappingRuntime extends LocalRuntime {
-  constructor(
-    projectPath: string,
-    private readonly hostPrefix: string,
-    private readonly execPrefix: string
-  ) {
-    super(projectPath);
-  }
-
-  mapPathForExec(filePath: string): string {
-    return filePath.startsWith(this.hostPrefix)
-      ? this.execPrefix + filePath.slice(this.hostPrefix.length)
-      : filePath;
-  }
-}
+import { log } from "@/node/services/log";
+import { ExecPathMappingRuntime } from "./testExecPathMappingRuntime";
 
 describe("hooks", () => {
   let tempDir: string;
@@ -43,38 +29,39 @@ describe("hooks", () => {
   });
 
   describe("exec path mapping", () => {
-    test("returns mapped project hook and tool_env paths after host discovery", async () => {
+    test("discovery returns host-namespace paths even on exec-mapping runtimes", async () => {
       const configDir = path.join(tempDir, ".xum");
       const hookPath = path.join(configDir, "tool_hook");
       const toolEnvPath = path.join(configDir, "tool_env");
-      const execPrefix = "/workspaces/project";
       await fs.mkdir(configDir, { recursive: true });
       await fs.writeFile(hookPath, "#!/bin/bash\necho test");
       await fs.writeFile(toolEnvPath, "export FOO=bar");
 
-      const mappingRuntime = new ExecPathMappingRuntime(tempDir, tempDir, execPrefix);
-      const statSpy = spyOn(mappingRuntime, "stat");
-
-      expect(await getHookPath(mappingRuntime, tempDir)).toBe(
-        path.posix.join(execPrefix, ".xum/tool_hook")
-      );
-      expect(await getToolEnvPath(mappingRuntime, tempDir)).toBe(
-        path.posix.join(execPrefix, ".xum/tool_env")
-      );
-      const statPaths = statSpy.mock.calls.map(([filePath]) => filePath);
-      expect(statPaths).toContain(hookPath);
-      expect(statPaths).toContain(toolEnvPath);
+      const mappingRuntime = new ExecPathMappingRuntime(tempDir, tempDir, "/workspaces/project");
+      expect(await getHookPath(mappingRuntime, tempDir)).toBe(hookPath);
+      expect(await getToolEnvPath(mappingRuntime, tempDir)).toBe(toolEnvPath);
     });
 
     test("hook runners export the mapped project dir as XUM_PROJECT_DIR", async () => {
-      const execPrefix = "/workspaces/project";
+      const execPrefix = path.join(tempDir, "exec");
       const mappingRuntime = new ExecPathMappingRuntime(tempDir, tempDir, execPrefix);
       const hookDir = path.join(tempDir, ".xum");
-      await fs.mkdir(hookDir, { recursive: true });
+      const execHookDir = path.join(execPrefix, ".xum");
+      await Promise.all([
+        fs.mkdir(hookDir, { recursive: true }),
+        fs.mkdir(execHookDir, { recursive: true }),
+      ]);
       const writeHook = async (name: string) => {
         const hookPath = path.join(hookDir, name);
-        await fs.writeFile(hookPath, '#!/bin/bash\necho "project_dir=$XUM_PROJECT_DIR"');
-        await fs.chmod(hookPath, 0o755);
+        const contents = '#!/bin/bash\necho "project_dir=$XUM_PROJECT_DIR"';
+        await Promise.all([
+          fs.writeFile(hookPath, contents),
+          fs.writeFile(path.join(execHookDir, name), contents),
+        ]);
+        await Promise.all([
+          fs.chmod(hookPath, 0o755),
+          fs.chmod(path.join(execHookDir, name), 0o755),
+        ]);
         return hookPath;
       };
       const context = {
@@ -336,6 +323,37 @@ describe("hooks", () => {
   });
 
   describe("runPostHook", () => {
+    // The agent sandbox keeps the stream's temp folder, in the home folder, closed.
+    test("opens the payload files it names for the hook's sandbox", async () => {
+      const hookDir = path.join(tempDir, ".xum");
+      const hookPath = path.join(hookDir, "tool_post");
+      await fs.mkdir(hookDir, { recursive: true });
+      await fs.writeFile(hookPath, "#!/bin/bash\nexit 0");
+      await fs.chmod(hookPath, 0o755);
+      const exec = spyOn(runtime, "exec");
+
+      await runPostHook(
+        runtime,
+        hookPath,
+        {
+          tool: "test_tool",
+          toolInput: JSON.stringify({ text: "x".repeat(10_000) }),
+          workspaceId: "test-workspace",
+          projectDir: tempDir,
+          runtimeTempDir: tempDir,
+        },
+        { value: 42 }
+      );
+
+      const options = exec.mock.calls.find((call) => call[1].env?.XUM_TOOL_RESULT_PATH)?.[1];
+      const payloads = [
+        options?.env?.XUM_TOOL_INPUT_PATH,
+        options?.env?.XUM_TOOL_RESULT_PATH,
+      ].filter((payload): payload is string => payload !== undefined);
+      expect(payloads).toHaveLength(2);
+      expect(options?.sandboxReadPaths).toEqual(payloads);
+    });
+
     test("succeeds when hook exits 0", async () => {
       const hookDir = path.join(tempDir, ".mux");
       const hookPath = path.join(hookDir, "tool_post");
@@ -357,6 +375,83 @@ describe("hooks", () => {
 
       expect(result.success).toBe(true);
       expect(result.exitCode).toBe(0);
+    });
+
+    // Both hook runners share this contract; runPreHook is covered here too.
+    test.each([
+      [
+        "tool_pre",
+        (rt: LocalRuntime, hookPath: string, ctx: Parameters<typeof runPreHook>[2]) =>
+          runPreHook(rt, hookPath, ctx).then((r) => r.output),
+      ],
+      [
+        "tool_post",
+        (rt: LocalRuntime, hookPath: string, ctx: Parameters<typeof runPreHook>[2]) =>
+          runPostHook(rt, hookPath, ctx, { success: true }).then((r) => r.output),
+      ],
+    ] as const)(
+      "a %s hook skipped because its tool call was aborted is not logged as an error",
+      async (name, run) => {
+        const hookPath = path.join(tempDir, ".xum", name);
+        await fs.mkdir(path.dirname(hookPath), { recursive: true });
+        await fs.writeFile(hookPath, "#!/bin/bash\nexit 0");
+        await fs.chmod(hookPath, 0o755);
+        const context = {
+          tool: "test_tool",
+          toolInput: "{}",
+          workspaceId: "test-workspace",
+          projectDir: tempDir,
+          abortSignal: AbortSignal.abort(),
+        };
+        const logError = spyOn(log, "error").mockImplementation(() => undefined);
+        try {
+          // Cancelled tool call (user interrupt): skipped hook.
+          expect(await run(runtime, hookPath, context)).toContain("aborted");
+          expect(logError).not.toHaveBeenCalled();
+
+          // Any other failure to run the hook is still an error.
+          const failing = Object.create(runtime) as LocalRuntime;
+          failing.exec = () => Promise.reject(new Error("spawn failed"));
+          expect(await run(failing, hookPath, { ...context, abortSignal: undefined })).toContain(
+            "spawn failed"
+          );
+          expect(logError).toHaveBeenCalledTimes(1);
+        } finally {
+          logError.mockRestore();
+        }
+      }
+    );
+
+    test("pre- and post-hooks still run when a tool value contains NUL bytes", async () => {
+      const writeHook = async (name: string) => {
+        const hookPath = path.join(tempDir, ".xum", name);
+        await fs.mkdir(path.dirname(hookPath), { recursive: true });
+        await fs.writeFile(
+          hookPath,
+          '#!/bin/bash\necho "ok=$XUM_TOOL_INPUT_OK nul=${XUM_TOOL_INPUT_NUL-unset}"'
+        );
+        await fs.chmod(hookPath, 0o755);
+        return hookPath;
+      };
+      // Binary bash output (or file content) can carry NUL; spawn rejects such env values.
+      const toolInputValue = { nul: "a\0b", ok: "x" };
+      const context = {
+        tool: "bash",
+        toolInput: JSON.stringify(toolInputValue),
+        toolInputValue,
+        workspaceId: "test-workspace",
+        projectDir: tempDir,
+      };
+
+      const pre = await runPreHook(runtime, await writeHook("tool_pre"), context);
+      expect(pre.allowed).toBe(true);
+      expect(pre.output).toBe("ok=x nul=unset");
+
+      const post = await runPostHook(runtime, await writeHook("tool_post"), context, {
+        output: "binary\0output",
+      });
+      expect(post.success).toBe(true);
+      expect(post.output).toBe("ok=x nul=unset");
     });
 
     test("receives MUX_TOOL_RESULT env var", async () => {
@@ -936,6 +1031,53 @@ echo "GOT_RESULT=$RESULT" >&2
 
       expect(hook.success).toBe(true);
       expect(hook.stderr).toContain('GOT_RESULT={"streaming":true}');
+    });
+
+    test("a tool_hook spawn aborted by the caller is not logged as an error, a timeout still is", async () => {
+      const hookPath = path.join(tempDir, ".xum", "tool_hook");
+      await fs.mkdir(path.dirname(hookPath), { recursive: true });
+      await fs.writeFile(hookPath, "#!/bin/bash\necho $MUX_EXEC\nread RESULT\n");
+      await fs.chmod(hookPath, 0o755);
+      const context = {
+        tool: "test",
+        toolInput: "{}",
+        workspaceId: "test",
+        projectDir: tempDir,
+      };
+      let toolExecuted = false;
+      const executeTool = () => {
+        toolExecuted = true;
+        return Promise.resolve({ success: true });
+      };
+      const logError = spyOn(log, "error").mockImplementation(() => undefined);
+      try {
+        // Cancelled tool call (user interrupt): the spawn is refused, which is expected.
+        const cancelled = await runWithHook(
+          runtime,
+          hookPath,
+          { ...context, abortSignal: AbortSignal.abort() },
+          executeTool
+        );
+        expect(cancelled.hook.success).toBe(false);
+        expect(logError).not.toHaveBeenCalled();
+
+        // The hook's own pre-phase timeout aborts the same internal signal; that stays an error.
+        const slowSpawn = Object.create(runtime) as LocalRuntime;
+        slowSpawn.exec = (_command, options) =>
+          new Promise((_resolve, reject) => {
+            options.abortSignal?.addEventListener("abort", () =>
+              reject(new Error("spawn aborted"))
+            );
+          });
+        const timedOut = await runWithHook(slowSpawn, hookPath, context, executeTool, {
+          preHookTimeoutMs: 10,
+        });
+        expect(timedOut.hook.stderr).toContain("spawn aborted");
+        expect(logError).toHaveBeenCalledTimes(1);
+        expect(toolExecuted).toBe(false);
+      } finally {
+        logError.mockRestore();
+      }
     });
 
     test("times out when pre-hook takes too long (does not run tool)", async () => {

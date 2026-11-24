@@ -9,18 +9,25 @@ import type { AgentTreeTargetRelation } from "@/node/services/taskService";
 
 import { parseToolResult, requireTaskService, requireWorkspaceId } from "./toolUtils";
 
+const TARGET_RELATION_LABELS: Record<
+  AgentTreeTargetRelation,
+  ReturnType<typeof targetRelationLabel>
+> = {
+  target_descendant: "descendant",
+  target_ancestor: "ancestor",
+  peer: "sibling",
+  // Cross-tree targets still take the untrusted envelope path, exactly like siblings.
+  target_unrelated: "unrelated",
+  target_main_chat: "main_chat",
+  target_side_chat: "side_chat",
+  target_tagged: "tagged",
+};
+
 /** Routing relation → the target's relation to the sender, as shown in tool results. */
 function targetRelationLabel(
   relation: AgentTreeTargetRelation
-): "descendant" | "ancestor" | "sibling" {
-  switch (relation) {
-    case "target_descendant":
-      return "descendant";
-    case "target_ancestor":
-      return "ancestor";
-    case "peer":
-      return "sibling";
-  }
+): "descendant" | "ancestor" | "sibling" | "unrelated" | "main_chat" | "side_chat" | "tagged" {
+  return TARGET_RELATION_LABELS[relation];
 }
 
 export const createTaskSendMessageTool: ToolFactory = (config: ToolConfiguration) => {
@@ -54,6 +61,9 @@ export const createTaskSendMessageTool: ToolFactory = (config: ToolConfiguration
                   targetRelation,
                   ...(result.data.queueDispatchMode != null
                     ? { queueDispatchMode: result.data.queueDispatchMode }
+                    : {}),
+                  ...(result.data.awaitsDelegatedTurn === true
+                    ? { awaitsDelegatedTurn: true as const }
                     : {}),
                 },
           "task_send_message"

@@ -1,3 +1,4 @@
+import type { WorkspaceSidebarState } from "@/browser/stores/WorkspaceStore";
 import type { FrontendWorkspaceMetadata } from "@/common/types/workspace";
 import type { ProjectConfig } from "@/common/types/project";
 import { hasCompletedAgentReport } from "@/common/utils/agentTaskCompletion";
@@ -122,8 +123,35 @@ export interface WorkspaceDelegatedActivity {
   workflowQueuedCount: number;
 }
 
-interface DelegatedActivityOptions {
+export interface DelegatedActivityOptions {
+  hasActiveBashMonitor?: (workspaceId: string) => boolean;
   isWorkspaceLiveActive?: (workspaceId: string) => boolean;
+}
+
+/**
+ * The sidebar's "working" reading of a workspace's live store state, used as the
+ * `isWorkspaceLiveActive` hint above. Shared so the composer tray and the sidebar
+ * cannot drift on what counts as live activity.
+ */
+export function isWorkspaceSidebarStateWorking(
+  state: Pick<
+    WorkspaceSidebarState,
+    | "canInterrupt"
+    | "isStarting"
+    | "activeWorkflowRunCount"
+    | "activeBashMonitorCount"
+    | "awaitingUserQuestion"
+  >
+): boolean {
+  return (
+    (state.canInterrupt ||
+      state.isStarting ||
+      state.activeWorkflowRunCount > 0 ||
+      // An armed background bash monitor keeps the workspace "working" so collapsed
+      // project/parent rows don't look idle while it waits to be woken.
+      state.activeBashMonitorCount > 0) &&
+    !state.awaitingUserQuestion
+  );
 }
 
 function createEmptyDelegatedActivity(): WorkspaceDelegatedActivity {
@@ -149,16 +177,6 @@ function hasDelegatedActivity(activity: WorkspaceDelegatedActivity): boolean {
   return activity.activeCount > 0 || activity.queuedCount > 0;
 }
 
-export function isSidebarSubAgentActive(workspace: FrontendWorkspaceMetadata): boolean {
-  return (
-    isActionableTaskExecutionStatus(workspace.taskExecutionStatus) ||
-    workspace.taskStatus === "queued" ||
-    workspace.taskStatus === "starting" ||
-    workspace.taskStatus === "running" ||
-    workspace.taskStatus === "awaiting_report"
-  );
-}
-
 export function isSidebarSubAgentRunning(
   workspace: FrontendWorkspaceMetadata,
   options: DelegatedActivityOptions = {}
@@ -167,14 +185,9 @@ export function isSidebarSubAgentRunning(
     workspace.taskExecutionStatus === "starting" ||
     workspace.taskExecutionStatus === "running" ||
     isRunningOrStartingTaskStatus(workspace.taskStatus) ||
+    options.hasActiveBashMonitor?.(workspace.id) === true ||
     getIsWorkspaceLiveActive(workspace.id, options)
   );
-}
-
-export function isActionableTaskExecutionStatus(
-  status: FrontendWorkspaceMetadata["taskExecutionStatus"]
-): boolean {
-  return status === "queued" || status === "starting" || status === "running";
 }
 
 export function isActiveOrStartingTaskStatus(
@@ -214,7 +227,10 @@ function isWorkspaceDelegatedActivityQueued(workspace: FrontendWorkspaceMetadata
 }
 
 export function isWorkspaceDelegatedActivityActive(
-  workspace: FrontendWorkspaceMetadata,
+  workspace: Pick<
+    FrontendWorkspaceMetadata,
+    "id" | "taskStatus" | "taskExecutionStatus" | "reportedAt"
+  >,
   options: DelegatedActivityOptions = {}
 ): boolean {
   if (
@@ -222,6 +238,11 @@ export function isWorkspaceDelegatedActivityActive(
     workspace.taskExecutionStatus === "running" ||
     isActiveOrStartingTaskStatus(workspace.taskStatus)
   ) {
+    return true;
+  }
+  // A report ends the agent turn, not its armed background monitors. Keep these
+  // children visible while they wait for a wake, without trusting stale stream state.
+  if (options.hasActiveBashMonitor?.(workspace.id) === true) {
     return true;
   }
   if (hasCompletedAgentReport(workspace)) {
@@ -296,7 +317,12 @@ export function computeDelegatedActivityByWorkspaceId(
 
     for (const child of childrenByParentId.get(workspace.id) ?? []) {
       const childWorkflowOwned = ownWorkflowOwned || child.workflowTask != null;
-      if (isWorkspaceDelegatedActivityActive(child, { isWorkspaceLiveActive: getIsLiveActive })) {
+      if (
+        isWorkspaceDelegatedActivityActive(child, {
+          ...options,
+          isWorkspaceLiveActive: getIsLiveActive,
+        })
+      ) {
         descendantActivity.activeCount += 1;
         if (childWorkflowOwned) {
           descendantActivity.workflowActiveCount += 1;
@@ -932,6 +958,37 @@ function comparePinnedPlacement(
   return null;
 }
 
+function sortWorkspaceRows(
+  workspaces: FrontendWorkspaceMetadata[],
+  workspaceRecency: Record<string, number>
+): void {
+  workspaces.sort((a, b) => {
+    const pinnedPlacement = comparePinnedPlacement(a, b);
+    if (pinnedPlacement !== null) {
+      return pinnedPlacement;
+    }
+
+    const aTimestamp = workspaceRecency[a.id] ?? 0;
+    const bTimestamp = workspaceRecency[b.id] ?? 0;
+    if (aTimestamp !== bTimestamp) {
+      return bTimestamp - aTimestamp;
+    }
+
+    const aCreatedAt = parseTimestampMs(a.createdAt);
+    const bCreatedAt = parseTimestampMs(b.createdAt);
+    if (aCreatedAt !== bCreatedAt) {
+      return bCreatedAt - aCreatedAt;
+    }
+
+    const nameOrder = compareStringsAsc(a.name, b.name);
+    if (nameOrder !== 0) {
+      return nameOrder;
+    }
+
+    return compareStringsAsc(a.id, b.id);
+  });
+}
+
 /**
  * Build a map of project paths to sorted workspace metadata lists.
  * Includes both persisted workspaces (from config) and workspaces from
@@ -954,6 +1011,9 @@ export function buildSortedWorkspacesByProject(
     for (const ws of config.workspaces) {
       if (!ws.id) continue;
       const meta = workspaceMetadata.get(ws.id);
+      // /side chats are ephemeral views of their main chat, never sidebar rows (like Codex,
+      // where a side conversation never shows up in the thread list).
+      if (meta?.sideChatParentWorkspaceId != null) continue;
       if (meta) {
         metadataList.push(meta);
         includedIds.add(ws.id);
@@ -965,7 +1025,7 @@ export function buildSortedWorkspacesByProject(
   // Second pass: add workspaces from metadata not yet in projects config
   // (handles race condition where metadata event arrives before config refresh completes)
   for (const [id, metadata] of workspaceMetadata) {
-    if (!includedIds.has(id)) {
+    if (!includedIds.has(id) && metadata.sideChatParentWorkspaceId == null) {
       const projectWorkspaces = result.get(metadata.projectPath) ?? [];
       projectWorkspaces.push(metadata);
       result.set(metadata.projectPath, projectWorkspaces);
@@ -976,31 +1036,7 @@ export function buildSortedWorkspacesByProject(
   // IMPORTANT: Include deterministic tie-breakers so Storybook visual snapshots can't
   // flip ordering when multiple workspaces have equal recency.
   for (const metadataList of result.values()) {
-    metadataList.sort((a, b) => {
-      const pinnedPlacement = comparePinnedPlacement(a, b);
-      if (pinnedPlacement !== null) {
-        return pinnedPlacement;
-      }
-
-      const aTimestamp = workspaceRecency[a.id] ?? 0;
-      const bTimestamp = workspaceRecency[b.id] ?? 0;
-      if (aTimestamp !== bTimestamp) {
-        return bTimestamp - aTimestamp;
-      }
-
-      const aCreatedAt = parseTimestampMs(a.createdAt);
-      const bCreatedAt = parseTimestampMs(b.createdAt);
-      if (aCreatedAt !== bCreatedAt) {
-        return bCreatedAt - aCreatedAt;
-      }
-
-      const nameOrder = compareStringsAsc(a.name, b.name);
-      if (nameOrder !== 0) {
-        return nameOrder;
-      }
-
-      return compareStringsAsc(a.id, b.id);
-    });
+    sortWorkspaceRows(metadataList, workspaceRecency);
   }
 
   // Ensure child workspaces appear directly below their parents.
@@ -1009,6 +1045,42 @@ export function buildSortedWorkspacesByProject(
   }
 
   return result;
+}
+
+/** Build one globally sorted workspace tree for the optional flat sidebar. */
+export function buildSortedWorkspacesFlat(
+  workspaces: FrontendWorkspaceMetadata[],
+  workspaceRecency: Record<string, number>
+): FrontendWorkspaceMetadata[] {
+  const rows = [...workspaces];
+  sortWorkspaceRows(rows, workspaceRecency);
+  return flattenWorkspaceTree(rows);
+}
+
+/**
+ * Newest workspace by createdAt. Recency breaks ties because legacy rows share
+ * one default createdAt.
+ */
+export function findMostRecentlyCreatedWorkspace(
+  workspaces: readonly FrontendWorkspaceMetadata[],
+  workspaceRecency: Record<string, number>
+): FrontendWorkspaceMetadata | undefined {
+  let newest: FrontendWorkspaceMetadata | undefined;
+  for (const workspace of workspaces) {
+    if (!newest) {
+      newest = workspace;
+      continue;
+    }
+    const createdDiff = parseTimestampMs(workspace.createdAt) - parseTimestampMs(newest.createdAt);
+    if (
+      createdDiff > 0 ||
+      (createdDiff === 0 &&
+        (workspaceRecency[workspace.id] ?? 0) > (workspaceRecency[newest.id] ?? 0))
+    ) {
+      newest = workspace;
+    }
+  }
+  return newest;
 }
 
 /**
@@ -1210,6 +1282,7 @@ export function partitionWorkspacesBySection(
   for (const workspace of workspaces) {
     const effectiveSectionId = resolveEffectiveSectionId(workspace, byId, sectionIds);
     if (effectiveSectionId) {
+      // eslint-disable-next-line @typescript-eslint/no-non-null-assertion -- legacy site from before the ban; remove when touching this line
       const list = bySectionId.get(effectiveSectionId)!;
       list.push(workspace);
     } else {

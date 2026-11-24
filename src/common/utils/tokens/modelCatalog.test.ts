@@ -2,8 +2,12 @@ import { describe, test, expect } from "@jest/globals";
 import { KNOWN_MODELS } from "@/common/constants/knownModels";
 import modelsJson from "./models.json";
 import { normalizeToCanonical } from "@/common/utils/ai/models";
+import { createDisplayUsage } from "./displayUsage";
 import { listModelCatalogIds } from "./modelCatalog";
+import { searchModelCatalog } from "./modelCatalogSearch";
+import { modelsExtra } from "./models-extra";
 import { getModelStats } from "./modelStats";
+import { getTotalCost } from "./usageAggregator";
 
 describe("listModelCatalogIds", () => {
   const ids = listModelCatalogIds();
@@ -57,5 +61,32 @@ describe("listModelCatalogIds", () => {
     expect(new Set(ids).size).toBe(ids.length);
     expect([...ids].sort()).toEqual(ids);
     expect(listModelCatalogIds()).toBe(ids);
+  });
+});
+
+describe("retired models", () => {
+  const retiredModelIds = Object.entries(modelsExtra).flatMap(([key, data]) =>
+    data.retired === true && data.litellm_provider ? [`${data.litellm_provider}:${key}`] : []
+  );
+
+  test("gpt-6-sol keeps its prices for recorded usage", () => {
+    expect(retiredModelIds).toContain("openai:gpt-6-sol");
+    const usage = createDisplayUsage(
+      { inputTokens: 200_000, cachedInputTokens: 100_000, outputTokens: 10_000 },
+      "openai:gpt-6-sol"
+    );
+    // Under the 272K tier: $2/M uncached input, $0.20/M cache reads, $10/M output.
+    expect(getTotalCost(usage)).toBeCloseTo(0.1 * 2 + 0.1 * 0.2 + 0.01 * 10, 12);
+  });
+
+  test("a retired model is offered neither as a built-in nor in the model catalog", () => {
+    const knownIds = Object.values(KNOWN_MODELS).map((model) => model.id);
+    const catalogIds = listModelCatalogIds();
+    for (const id of retiredModelIds) {
+      expect(knownIds).not.toContain(id);
+      expect(catalogIds).not.toContain(id);
+      const search = searchModelCatalog({ query: id.slice(id.indexOf(":") + 1) });
+      expect(search.models.map((model) => model.id)).not.toContain(id);
+    }
   });
 });

@@ -1,5 +1,5 @@
 import type { Meta, StoryObj } from "@storybook/react-vite";
-import { within } from "@storybook/test";
+import { within } from "storybook/test";
 import { lightweightMeta } from "@/browser/stories/meta.js";
 import { createMockORPCClient } from "@/browser/stories/mocks/orpc";
 import type { MemoryFileInfo } from "@/common/orpc/schemas/memory";

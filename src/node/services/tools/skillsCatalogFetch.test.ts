@@ -10,7 +10,6 @@ import { TestTempDir } from "./testHelpers";
 import {
   assertValidSkillId,
   fetchSkillContent,
-  parseSource,
   searchSkillsCatalog,
   tryParseSource,
 } from "./skillsCatalogFetch";
@@ -60,19 +59,6 @@ function createOversizedSkillMarkdown(name: string): string {
 
 afterEach(() => {
   mock.restore();
-});
-
-describe("parseSource", () => {
-  it("parses owner/repo from source string", () => {
-    expect(parseSource("vercel-labs/agent-skills")).toEqual({
-      owner: "vercel-labs",
-      repo: "agent-skills",
-    });
-  });
-
-  it("throws on invalid source format", () => {
-    expect(() => parseSource("invalid")).toThrow("Invalid source format");
-  });
 });
 
 describe("tryParseSource", () => {
@@ -257,6 +243,38 @@ describe("fetchSkillContent", () => {
     expect(result.content).toBe("---\nname: requested-skill\ndescription: Test skill\n---\nBody\n");
     expect(result.path).toBe("skills/actual-dir/SKILL.md");
     expect(result.branch).toBe("main");
+
+    mkdtempSpy.mockRestore();
+  });
+
+  // Claude Code and Codex load a skill whose description is over 1024 characters, so a remote one
+  // must not read as "not found". The fetch returns the file as written: the read cuts it.
+  it.each([
+    ["in the skill's own directory", "my-skill"],
+    ["by its frontmatter name when the directory differs", "actual-dir"],
+  ])("finds a skill whose description is over the cap, %s", async (_where, directory) => {
+    using tempDir = new TestTempDir("test-fetch-skill-long-description");
+    const skillDir = path.join(tempDir.path, "skills", directory);
+    await fsPromises.mkdir(skillDir, { recursive: true });
+    const content = `---\nname: my-skill\ndescription: ${"d".repeat(1500)}\n---\nBody\n`;
+    await fsPromises.writeFile(path.join(skillDir, "SKILL.md"), content);
+
+    execSpy = spyOn(disposableExec, "execFileAsync");
+    execSpy.mockImplementation((_file: string, args: string[]) => {
+      const stdout = args.includes("--version")
+        ? "git version 2.40.0\n"
+        : args.includes("rev-parse")
+          ? "main\n"
+          : "";
+      return createMockExecResult(Promise.resolve({ stdout, stderr: "" }));
+    });
+    const mkdtempSpy = spyOn(fsPromises, "mkdtemp");
+    mkdtempSpy.mockResolvedValue(tempDir.path);
+
+    const result = await fetchSkillContent("owner", "repo", "my-skill");
+
+    expect(result.content).toBe(content);
+    expect(result.path).toBe(`skills/${directory}/SKILL.md`);
 
     mkdtempSpy.mockRestore();
   });

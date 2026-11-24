@@ -1,4 +1,12 @@
-import { describe, expect, test } from "bun:test";
+import * as http from "node:http";
+import type { AddressInfo } from "node:net";
+import { afterEach, beforeEach, describe, expect, spyOn, test } from "bun:test";
+import { Config, ProvidersConfigStore } from "@/node/config";
+import { AIService } from "./aiService";
+import { HistoryService } from "./historyService";
+import { InitStateManager } from "./initStateManager";
+import { ProviderService } from "./providerService";
+import { DisposableTempDir } from "./tempDir";
 import { buildWorkspaceStatusPrompt, generateWorkspaceStatus } from "./workspaceStatusGenerator";
 
 describe("buildWorkspaceStatusPrompt", () => {
@@ -76,5 +84,101 @@ describe("generateWorkspaceStatus error paths", () => {
       // retrying so a future config change recovers without a new message.
       expect(result.error.reachedProvider).toBe(false);
     }
+  });
+});
+
+describe("generateWorkspaceStatus thinking", () => {
+  let tempDir: DisposableTempDir;
+  let server: http.Server;
+  let bodies: Array<Record<string, unknown>>;
+  let baseUrl: string;
+
+  beforeEach(async () => {
+    tempDir = new DisposableTempDir("workspace-status-thinking");
+    bodies = [];
+    server = http.createServer((req, res) => {
+      let raw = "";
+      req.on("data", (chunk: Buffer) => (raw += chunk.toString()));
+      req.on("end", () => {
+        bodies.push(JSON.parse(raw) as Record<string, unknown>);
+        // Non-retryable, so each candidate sends exactly one request.
+        res.writeHead(400, { "content-type": "application/json" });
+        res.end(JSON.stringify({ error: { message: "loopback", type: "invalid_request_error" } }));
+      });
+    });
+    await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+    baseUrl = `http://127.0.0.1:${(server.address() as AddressInfo).port}/v1`;
+  });
+
+  afterEach(async () => {
+    await new Promise<void>((resolve) => server.close(() => resolve()));
+    tempDir[Symbol.dispose]();
+  });
+
+  function createService(): AIService {
+    const config = new Config(tempDir.path);
+    const providersConfigStore = new ProvidersConfigStore(config.rootDir);
+    providersConfigStore.saveProvidersConfig({
+      omlx: { providerType: "openai-compatible", baseUrl, apiKey: "test-key" },
+      openai: { apiKey: "test-openai-key", baseUrl },
+    } as Parameters<ProvidersConfigStore["saveProvidersConfig"]>[0]);
+    return new AIService(
+      config,
+      new HistoryService(config),
+      new InitStateManager(config),
+      new ProviderService(config, providersConfigStore),
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      providersConfigStore
+    );
+  }
+
+  // Without explicit options a provider runs its own default effort; GLM's
+  // chat template renders an absent reasoning_effort as Max.
+  test("sends the lowest effort the model allows instead of the provider default", async () => {
+    const service = createService();
+
+    await generateWorkspaceStatus(
+      "user: fix the login bug",
+      ["omlx:GLM-5.3-Flash-oQ4e-mtp"],
+      service
+    );
+    await generateWorkspaceStatus("user: fix the login bug", ["openai:gpt-6.1-sol"], service);
+
+    expect(bodies).toHaveLength(2);
+    expect(bodies[0].reasoning_effort).toBe("low");
+    expect((bodies[1].reasoning as { effort?: unknown } | undefined)?.effort).toBe("low");
+  });
+
+  test("skips a candidate whose pinned snapshot resolves a different level", async () => {
+    const service = createService();
+    // The creation-time read maps the model to one that allows "off"; the pinned
+    // snapshot (the file on disk) does not, so it resolves GLM's "low".
+    spyOn(service, "getProvidersConfig").mockReturnValue({
+      omlx: {
+        apiKeySet: true,
+        isEnabled: true,
+        isConfigured: true,
+        isCustom: true,
+        providerType: "openai-compatible",
+        models: [{ id: "GLM-5.3-Flash-oQ4e-mtp", mappedToModel: "anthropic:claude-haiku-4-5" }],
+      },
+    });
+
+    const result = await generateWorkspaceStatus(
+      "user: fix the login bug",
+      ["omlx:GLM-5.3-Flash-oQ4e-mtp"],
+      service
+    );
+
+    expect(bodies).toHaveLength(0);
+    expect(result.success).toBe(false);
+    if (!result.success) expect(result.error.error.type).toBe("configuration");
   });
 });

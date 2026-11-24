@@ -14,7 +14,12 @@ import { QuickJSAsyncFFI } from "@jitl/quickjs-wasmfile-release-asyncify/ffi";
 import crypto from "crypto";
 import type { IJSRuntime, IJSRuntimeFactory, KernelRecordBounds, RuntimeLimits } from "./runtime";
 import type { PTCEvent, PTCExecutionResult, PTCToolCallRecord, PTCConsoleRecord } from "./types";
-import { CONSOLE_CAPTURE_BUDGET_BYTES } from "@/constants/kernelOutput";
+import type { CaptureSanitizerBudget } from "./types";
+import { createCaptureSanitizerBudget } from "./types";
+import {
+  CONSOLE_CAPTURE_BUDGET_BYTES,
+  KERNEL_RETAINED_EXECUTION_BUDGET_BYTES,
+} from "@/constants/kernelOutput";
 import { sliceUtf8Bytes } from "@/common/utils/sliceUtf8Bytes";
 
 /** Capture-time console retention accounting for one eval (see setupConsole). */
@@ -30,6 +35,15 @@ import { UNAVAILABLE_IDENTIFIERS } from "./staticAnalysis";
 // Default limits
 const DEFAULT_MEMORY_BYTES = 64 * 1024 * 1024; // 64MB
 const DEFAULT_TIMEOUT_MS = 5 * 60 * 1000; // 5 minutes
+
+/** One QuickJS context can mint at most 65,536 host-function ids over its
+ * lifetime (quickjs-emscripten stores them in a signed 16-bit slot). Past
+ * that, ids silently wrap on the C side and guest calls dispatch to whatever
+ * closure minted the aliased id 65,536 allocations earlier. Handle reuse in
+ * registerObject keeps steady-state allocation near zero, so approaching this
+ * limit means an unbounded-registration bug; fail loudly instead of letting
+ * dispatch corrupt. */
+const HOST_FN_ID_LIMIT = 60_000;
 
 /** Generate a short random ID for PTC nested tool calls (10 hex chars). */
 function generateCallId(): string {
@@ -175,6 +189,10 @@ export class QuickJSRuntime implements IJSRuntime {
   private disposed = false;
   private eventHandler?: (event: PTCEvent) => void;
   private abortController?: AbortController;
+  /** See IJSRuntime.takeActiveHostCallId: set synchronously right before a
+   * registered host function is invoked, consumed by the tool bridge inside
+   * that same synchronous window. */
+  private activeHostCallId?: string;
   private abortRequested = false; // Track abort requests before eval() starts
   private limits: RuntimeLimits = {};
   private consoleSetup = false;
@@ -182,6 +200,33 @@ export class QuickJSRuntime implements IJSRuntime {
   private pendingJobGate?: (run: () => void) => void;
   /** Kernel-mode caps on record/event capture; see IJSRuntime.setKernelRecordBounds. */
   private kernelRecordBounds?: KernelRecordBounds;
+  /** Mode-independent record sanitizer; see IJSRuntime.setCaptureResultSanitizer. */
+  private captureResultSanitizer?: (
+    toolName: string,
+    result: unknown,
+    budget?: CaptureSanitizerBudget
+  ) => unknown;
+  /** Per-execution shared media budget for the capture sanitizer in CLASSIC
+   * (non-kernel) mode, keyed like retainedResultBudgets. Classic records keep
+   * full inline results and have no kernel caps, so without sharing, every
+   * call would mint a fresh per-value media allowance and a model-authored
+   * loop of bridged media calls could persist unbounded multi-megabyte
+   * records into partial/final history (r19). Kernel mode keeps per-call
+   * allowances — its cross-call growth is already bounded by
+   * retainedResultBudgets. */
+  private readonly classicSanitizerBudgets = new WeakMap<
+    PTCToolCallRecord[],
+    CaptureSanitizerBudget
+  >();
+  /** Per-execution byte budgets for RETAINED record results, keyed by the
+   * attribution's record array like consoleBudgets (fresh array per eval;
+   * late fire-and-forget settlements share their originating eval's budget).
+   * Retained results bypass the per-record kernel bound by design, so their
+   * SUM must be bounded here (see boundCaptureResult). */
+  private readonly retainedResultBudgets = new WeakMap<
+    PTCToolCallRecord[],
+    { remainingBytes: number }
+  >();
   /** Monotonic eval counter + the generation currently inside eval() (null
    * between evals). Distinguishes settlements arriving mid-eval (queued for
    * the eval's own drain points) from truly-late ones between evals (gated).
@@ -222,6 +267,19 @@ export class QuickJSRuntime implements IJSRuntime {
     string,
     Record<string, (...args: unknown[]) => unknown>
   >();
+  /** Guest host-function handles cached per registerObject name + method.
+   * Re-registration must not mint fresh host-function ids (see
+   * HOST_FN_ID_LIMIT): persistent mounts re-register the tool bridge on
+   * every eval, which exhausted the 16-bit id space in a few hundred calls
+   * and misrouted every later xum.* call to an unrelated tool. Dispatch is
+   * late-bound through the maps above, so a cached guest function stays
+   * correct across re-registrations; only never-seen method names allocate. */
+  private readonly registeredObjectFnHandles = new Map<
+    string,
+    Map<string, { kind: "async" | "sync"; handle: QuickJSHandle }>
+  >();
+  /** Host-function ids minted on this context; see HOST_FN_ID_LIMIT. */
+  private hostFnAllocations = 0;
 
   // Execution state (reset per eval)
   private toolCalls: PTCToolCallRecord[] = [];
@@ -281,7 +339,7 @@ export class QuickJSRuntime implements IJSRuntime {
   registerFunction(name: string, fn: (...args: unknown[]) => Promise<unknown>): void {
     this.assertNotDisposed("registerFunction");
 
-    const handle = this.ctx.newAsyncifiedFunction(name, async (...argHandles) => {
+    const handle = this.newAsyncifiedHostFunction(name, async (...argHandles) => {
       if (this.abortController?.signal.aborted) {
         throw new Error("Execution aborted");
       }
@@ -297,7 +355,7 @@ export class QuickJSRuntime implements IJSRuntime {
       // Kernel mode bounds captured args/results at creation: records and
       // streamed events must never retain full guest payloads (host memory +
       // session history growth); the guest still receives full values.
-      const recordArgs = this.boundCaptureArgs(args[0]);
+      const recordArgs = this.boundCaptureArgs(args[0], name, this.toolCalls);
 
       // Emit start event
       this.eventHandler?.({
@@ -309,10 +367,13 @@ export class QuickJSRuntime implements IJSRuntime {
       });
 
       try {
+        // Hand the record callId to the dispatched function (tool bridge)
+        // through the synchronous window contract; see takeActiveHostCallId.
+        this.activeHostCallId = callId;
         const result = await fn(...args);
         const endTime = Date.now();
         const duration_ms = endTime - startTime;
-        const recordResult = this.boundCaptureResult(result);
+        const recordResult = this.boundCaptureResult(result, name, this.toolCalls);
 
         // Record tool call
         this.toolCalls.push({
@@ -376,7 +437,7 @@ export class QuickJSRuntime implements IJSRuntime {
     // it hands the guest a deferred VM promise and settles it when the host
     // promise settles. This is the async capability bridge: the guest can
     // fire-and-forget or await the returned Promise.
-    const fnHandle = this.ctx.newFunction(name, (...argHandles) => {
+    const fnHandle = this.newHostFunction(name, (...argHandles) => {
       const args: unknown[] = argHandles.map((h) => this.ctx.dump(h) as unknown);
       const startTime = Date.now();
       const callId = generateCallId();
@@ -477,8 +538,8 @@ export class QuickJSRuntime implements IJSRuntime {
           const result = await fn(...args);
           const endTime = Date.now();
           // Same creation-time bounding as synchronous bridges (kernel mode).
-          const recordArgs = this.boundCaptureArgs(args[0]);
-          const recordResult = this.boundCaptureResult(result);
+          const recordArgs = this.boundCaptureArgs(args[0], name, toolCalls);
+          const recordResult = this.boundCaptureResult(result, name, toolCalls);
           toolCalls.push({
             toolName: name,
             args: recordArgs,
@@ -503,7 +564,7 @@ export class QuickJSRuntime implements IJSRuntime {
           const endTime = Date.now();
           const errorStr = error instanceof Error ? error.message : String(error);
           const recordError = this.boundCaptureError(errorStr);
-          const recordArgs = this.boundCaptureArgs(args[0]);
+          const recordArgs = this.boundCaptureArgs(args[0], name, toolCalls);
           toolCalls.push({
             toolName: name,
             args: recordArgs,
@@ -565,6 +626,14 @@ export class QuickJSRuntime implements IJSRuntime {
     this.kernelRecordBounds = bounds;
   }
 
+  setCaptureResultSanitizer(
+    sanitizer:
+      | ((toolName: string, result: unknown, budget?: CaptureSanitizerBudget) => unknown)
+      | undefined
+  ): void {
+    this.captureResultSanitizer = sanitizer;
+  }
+
   /**
    * Bound a guest-supplied value at record/event CREATION time (kernel mode
    * only). Records live in host memory for the whole eval and events land in
@@ -594,10 +663,30 @@ export class QuickJSRuntime implements IJSRuntime {
     };
   }
 
-  private boundCaptureArgs(value: unknown): unknown {
-    return this.kernelRecordBounds === undefined
-      ? value
-      : this.boundCapture(value, this.kernelRecordBounds.argsCapBytes);
+  private boundCaptureArgs(
+    value: unknown,
+    toolName: string,
+    toolCalls: PTCToolCallRecord[]
+  ): unknown {
+    if (this.kernelRecordBounds === undefined) {
+      // Classic mode has no args cap, but media containers passed AS
+      // ARGUMENTS to another bridged tool (e.g. {payload: image}) would
+      // otherwise copy unbudgeted base64 into every start/end event and
+      // record (r22) — the result sanitizer only covers the producing call.
+      // Sanitize against the same shared per-execution budget; the guest
+      // still passes the full value to the tool.
+      return this.captureResultSanitizer !== undefined
+        ? this.captureResultSanitizer(toolName, value, this.classicCaptureBudgetFor(toolCalls))
+        : value;
+    }
+    const bounded = this.boundCapture(value, this.kernelRecordBounds.argsCapBytes);
+    if (bounded === value) return value;
+    // The marker replaced the args entirely: merge back attribution fields
+    // (e.g. the file path of a persistence-critical edit) so post-compaction
+    // extractors can still attribute the record. Marker fields are spread
+    // last so retained fields can never spoof __kernelBounded/bytes/preview.
+    const retained = this.kernelRecordBounds.captureArgsRetained?.(toolName, value);
+    return retained !== undefined ? { ...retained, ...(bounded as object) } : bounded;
   }
 
   /**
@@ -617,10 +706,129 @@ export class QuickJSRuntime implements IJSRuntime {
     return `${sliceUtf8Bytes(errorStr, capBytes)}…[${bytes} bytes total; truncated]`;
   }
 
-  private boundCaptureResult(value: unknown): unknown {
-    return this.kernelRecordBounds === undefined
-      ? value
-      : this.boundCapture(value, this.kernelRecordBounds.resultCapBytes);
+  private boundCaptureResult(
+    value: unknown,
+    toolName: string,
+    toolCalls: PTCToolCallRecord[]
+  ): unknown {
+    // The mode-independent sanitizer runs first (both classic and kernel
+    // mode): media containers are budgeted at capture because records/events
+    // persist into session history in every mode, and request-time
+    // attachment extraction rewrites only the provider copy. Classic mode
+    // shares ONE sanitizer budget per execution (see classicSanitizerBudgets);
+    // kernel mode keeps per-call allowances backed by the retained budget.
+    const sanitized =
+      this.captureResultSanitizer !== undefined
+        ? this.captureResultSanitizer(
+            toolName,
+            value,
+            this.kernelRecordBounds === undefined
+              ? this.classicCaptureBudgetFor(toolCalls)
+              : undefined
+          )
+        : value;
+    if (this.kernelRecordBounds === undefined) return sanitized;
+    // Retained records (persistence-critical tools, media containers) keep a
+    // possibly sanitized full result: compaction and request-time extractors
+    // reconstruct context from them, so a bounded preview would silently
+    // lose it.
+    const retained = this.kernelRecordBounds.captureRetained?.(toolName, sanitized);
+    if (retained !== undefined) {
+      // Execution-wide budget on retained results: each is individually
+      // bounded, but retention bypasses the per-record kernel cap by design,
+      // so a loop of retained calls would otherwise append ~3MiB containers
+      // or 50k-char persistence records without limit. Unserializable
+      // values count as overflow — never retain for free.
+      let size: number;
+      try {
+        size = Buffer.byteLength(JSON.stringify(retained) ?? "", "utf8");
+      } catch {
+        size = Number.POSITIVE_INFINITY;
+      }
+      const budget = this.retainedBudgetFor(toolCalls);
+      if (size <= budget.remainingBytes) {
+        budget.remainingBytes -= size;
+        return retained;
+      }
+      // Budget exhausted: fall back to normal bounding — oversized results
+      // become honest-size markers, small results still pass inline.
+      return this.applyRetainedResultFields(
+        QuickJSRuntime.preserveSuccessBit(
+          this.boundCapture(sanitized, this.kernelRecordBounds.resultCapBytes),
+          retained
+        ),
+        toolName,
+        sanitized
+      );
+    }
+    return this.applyRetainedResultFields(
+      QuickJSRuntime.preserveSuccessBit(
+        this.boundCapture(sanitized, this.kernelRecordBounds.resultCapBytes),
+        sanitized
+      ),
+      toolName,
+      sanitized
+    );
+  }
+
+  /** Merge captureResultRetained identity fields under a __kernelBounded
+   * result marker (marker fields win on collisions, mirroring the
+   * captureArgsRetained merge in boundCaptureArgs). No-op for results that
+   * survived bounding inline. */
+  private applyRetainedResultFields(bounded: unknown, toolName: string, source: unknown): unknown {
+    if (
+      typeof bounded !== "object" ||
+      bounded === null ||
+      (bounded as { __kernelBounded?: boolean }).__kernelBounded !== true
+    ) {
+      return bounded;
+    }
+    const retained = this.kernelRecordBounds?.captureResultRetained?.(toolName, source);
+    return retained !== undefined ? { ...retained, ...bounded } : bounded;
+  }
+
+  /** A boolean success bit is preserved onto EVERY __kernelBounded result
+   * marker (r29 — not just the retained-budget-exhausted branch): compaction
+   * folds result.success===false into the compact ok bit, and a FAILED call
+   * whose oversized result was replaced by a marker would otherwise be
+   * misreported as ok:true — advertising a never-applied edit path or a
+   * never-read file in crash-safe attachment tracking. */
+  private static preserveSuccessBit(bounded: unknown, source: unknown): unknown {
+    if (typeof source !== "object" || source === null) return bounded;
+    const success = (source as { success?: unknown }).success;
+    if (
+      typeof success === "boolean" &&
+      typeof bounded === "object" &&
+      bounded !== null &&
+      (bounded as { __kernelBounded?: boolean }).__kernelBounded === true
+    ) {
+      return { ...bounded, success };
+    }
+    return bounded;
+  }
+
+  /** Get-or-create the retained-result budget for one attribution's record
+   * array (keying mirrors consoleBudgetFor). */
+  private retainedBudgetFor(toolCalls: PTCToolCallRecord[]): { remainingBytes: number } {
+    let budget = this.retainedResultBudgets.get(toolCalls);
+    if (!budget) {
+      budget = { remainingBytes: KERNEL_RETAINED_EXECUTION_BUDGET_BYTES };
+      this.retainedResultBudgets.set(toolCalls, budget);
+    }
+    return budget;
+  }
+
+  /** Get-or-create the classic-mode shared sanitizer budget for one
+   * attribution's record array (see classicSanitizerBudgets). Public because
+   * the classic outer return value persists into the same history row and
+   * must draw from the same allowance (r29; see IJSRuntime). */
+  classicCaptureBudgetFor(toolCalls: PTCToolCallRecord[]): CaptureSanitizerBudget {
+    let budget = this.classicSanitizerBudgets.get(toolCalls);
+    if (!budget) {
+      budget = createCaptureSanitizerBudget();
+      this.classicSanitizerBudgets.set(toolCalls, budget);
+    }
+    return budget;
   }
 
   setPendingJobGate(gate: (run: () => void) => void): void {
@@ -630,7 +838,7 @@ export class QuickJSRuntime implements IJSRuntime {
   registerSyncFunction(name: string, fn: (...args: unknown[]) => unknown): void {
     this.assertNotDisposed("registerSyncFunction");
 
-    const fnHandle = this.ctx.newFunction(name, (...argHandles) => {
+    const fnHandle = this.newHostFunction(name, (...argHandles) => {
       const args: unknown[] = argHandles.map((h) => this.ctx.dump(h) as unknown);
       // Host exceptions propagate to the guest as thrown errors.
       const result = fn(...args);
@@ -764,11 +972,30 @@ export class QuickJSRuntime implements IJSRuntime {
     this.registeredObjects.set(name, obj);
     this.registeredObjectSyncMethods.set(name, syncMethods ?? {});
 
+    // Reuse cached guest functions across re-registrations; see
+    // registeredObjectFnHandles for why minting fresh ids per registration
+    // corrupts dispatch on long-lived runtimes.
+    let fnCache = this.registeredObjectFnHandles.get(name);
+    if (fnCache === undefined) {
+      fnCache = new Map();
+      this.registeredObjectFnHandles.set(name, fnCache);
+    }
+
     // Create object in QuickJS
     const objHandle = this.ctx.newObject();
 
     for (const methodName of Object.keys(obj)) {
-      const fnHandle = this.ctx.newAsyncifiedFunction(methodName, async (...argHandles) => {
+      const cachedAsync = fnCache.get(methodName);
+      if (cachedAsync?.kind === "async") {
+        this.ctx.setProp(objHandle, methodName, cachedAsync.handle);
+        continue;
+      }
+      if (cachedAsync !== undefined) {
+        // The method flipped kinds since the last registration; the cached
+        // guest function would route through the wrong wrapper. Replace it.
+        cachedAsync.handle.dispose();
+      }
+      const fnHandle = this.newAsyncifiedHostFunction(methodName, async (...argHandles) => {
         if (this.abortController?.signal.aborted) {
           throw new Error("Execution aborted");
         }
@@ -785,7 +1012,7 @@ export class QuickJSRuntime implements IJSRuntime {
         const callId = generateCallId();
 
         // Same creation-time bounding as registerFunction (kernel mode).
-        const recordArgs = this.boundCaptureArgs(args[0]);
+        const recordArgs = this.boundCaptureArgs(args[0], methodName, this.toolCalls);
 
         // Emit start event
         this.eventHandler?.({
@@ -797,10 +1024,12 @@ export class QuickJSRuntime implements IJSRuntime {
         });
 
         try {
+          // Same synchronous-window handoff as registerFunction.
+          this.activeHostCallId = callId;
           const result = await fn(...args);
           const endTime = Date.now();
           const duration_ms = endTime - startTime;
-          const recordResult = this.boundCaptureResult(result);
+          const recordResult = this.boundCaptureResult(result, methodName, this.toolCalls);
 
           // Record tool call
           this.toolCalls.push({
@@ -849,8 +1078,8 @@ export class QuickJSRuntime implements IJSRuntime {
         }
       });
 
+      fnCache.set(methodName, { kind: "async", handle: fnHandle });
       this.ctx.setProp(objHandle, methodName, fnHandle);
-      fnHandle.dispose();
     }
 
     // Sync methods: plain (non-asyncified) host functions. Asyncified methods
@@ -859,7 +1088,15 @@ export class QuickJSRuntime implements IJSRuntime {
     // call them — asyncify replays the call and returns garbage. Sync methods
     // never suspend, so they stay safe post-await (see registerSyncFunction).
     for (const methodName of Object.keys(syncMethods ?? {})) {
-      const fnHandle = this.ctx.newFunction(methodName, (...argHandles) => {
+      const cachedSync = fnCache.get(methodName);
+      if (cachedSync?.kind === "sync") {
+        this.ctx.setProp(objHandle, methodName, cachedSync.handle);
+        continue;
+      }
+      if (cachedSync !== undefined) {
+        cachedSync.handle.dispose();
+      }
+      const fnHandle = this.newHostFunction(methodName, (...argHandles) => {
         // Late-bound dispatch (see registeredObjects note above).
         const fn = this.registeredObjectSyncMethods.get(name)?.[methodName];
         if (fn === undefined) {
@@ -869,8 +1106,20 @@ export class QuickJSRuntime implements IJSRuntime {
         // Host exceptions propagate to the guest as thrown errors.
         return this.marshal(fn(...args));
       });
+      fnCache.set(methodName, { kind: "sync", handle: fnHandle });
       this.ctx.setProp(objHandle, methodName, fnHandle);
-      fnHandle.dispose();
+    }
+
+    // Methods absent from this registration: drop their cached handles so a
+    // later re-add mints a fresh function of the right kind. Guest-saved
+    // references to a removed method stay callable in the VM but fail closed
+    // through the late-bound lookup.
+    const currentSyncMethods = syncMethods ?? {};
+    for (const [methodName, cached] of fnCache) {
+      if (!(methodName in obj) && !(methodName in currentSyncMethods)) {
+        cached.handle.dispose();
+        fnCache.delete(methodName);
+      }
     }
 
     this.ctx.setProp(this.ctx.global, name, objHandle);
@@ -1047,12 +1296,26 @@ export class QuickJSRuntime implements IJSRuntime {
     this.abortController?.abort();
   }
 
+  takeActiveHostCallId(): string | undefined {
+    const callId = this.activeHostCallId;
+    this.activeHostCallId = undefined;
+    return callId;
+  }
+
   getAbortSignal(): AbortSignal | undefined {
     return this.abortController?.signal;
   }
 
   dispose(): void {
     if (!this.disposed) {
+      // The registerObject handle cache owns live guest values; release them
+      // before the context goes down.
+      for (const fnCache of this.registeredObjectFnHandles.values()) {
+        for (const cached of fnCache.values()) {
+          cached.handle.dispose();
+        }
+      }
+      this.registeredObjectFnHandles.clear();
       this.ctx.dispose();
       this.disposed = true;
       // Queued late settlements would no-op anyway (guarded checks disposed);
@@ -1066,6 +1329,36 @@ export class QuickJSRuntime implements IJSRuntime {
   }
 
   // --- Private helpers ---
+
+  /** Mint one host-function id, failing loudly at the budget: exceeding the
+   * real 16-bit space silently misroutes guest calls to unrelated closures
+   * (see HOST_FN_ID_LIMIT). All host-function creation must flow through this
+   * and newAsyncifiedHostFunction. */
+  private newHostFunction(
+    name: string,
+    fn: Parameters<QuickJSAsyncContext["newFunction"]>[1]
+  ): QuickJSHandle {
+    this.trackHostFnAllocation(name);
+    return this.ctx.newFunction(name, fn);
+  }
+
+  /** Asyncified variant of newHostFunction; same id budget. */
+  private newAsyncifiedHostFunction(
+    name: string,
+    fn: Parameters<QuickJSAsyncContext["newAsyncifiedFunction"]>[1]
+  ): QuickJSHandle {
+    this.trackHostFnAllocation(name);
+    return this.ctx.newAsyncifiedFunction(name, fn);
+  }
+
+  private trackHostFnAllocation(name: string): void {
+    this.hostFnAllocations += 1;
+    if (this.hostFnAllocations > HOST_FN_ID_LIMIT) {
+      throw new Error(
+        `QuickJS host-function id budget exhausted registering "${name}"; dispose and recreate this runtime`
+      );
+    }
+  }
 
   private assertNotDisposed(method: string): void {
     if (this.disposed) {
@@ -1249,7 +1542,7 @@ export class QuickJSRuntime implements IJSRuntime {
     const consoleObj = this.ctx.newObject();
 
     for (const level of ["log", "warn", "error"] as const) {
-      const fn = this.ctx.newFunction(level, (...argHandles) => {
+      const fn = this.newHostFunction(level, (...argHandles) => {
         const timestamp = Date.now();
         // Route to the eval that registered the enclosing reaction (falls
         // back to the current drain context for untagged code).
@@ -1301,11 +1594,34 @@ export class QuickJSRuntime implements IJSRuntime {
         }
 
         budget.retainedBytes += size;
-        attribution.consoleOutput.push({ level, args, timestamp });
+        // Media containers are budgeted at capture like tool-call records
+        // (see setCaptureResultSanitizer): console events stream into session
+        // history immediately, so any later sanitization would miss the
+        // streamed copy. Budget accounting stays on the raw size above —
+        // sanitization only shrinks, never grows.
+        const sanitizer = this.captureResultSanitizer;
+        const captured =
+          sanitizer !== undefined
+            ? args.map((arg) =>
+                sanitizer(
+                  "console",
+                  arg,
+                  // Classic mode draws from the same execution allowance as
+                  // nested records and the outer return (r29): console-arg
+                  // media must not mint a fresh per-value budget. Kernel mode
+                  // keeps per-call allowances (cross-call growth is bounded
+                  // by the retained-result budget and this console budget).
+                  this.kernelRecordBounds === undefined
+                    ? this.classicCaptureBudgetFor(attribution.toolCalls)
+                    : undefined
+                )
+              )
+            : args;
+        attribution.consoleOutput.push({ level, args: captured, timestamp });
         attribution.eventHandler?.({
           type: "console",
           level,
-          args,
+          args: captured,
           timestamp,
         });
       });
@@ -1332,7 +1648,7 @@ export class QuickJSRuntime implements IJSRuntime {
   /** Install the promise-reaction tagging patch; see REACTION_TAGGING_SCRIPT. */
   private setupReactionTagging(): void {
     // Host refcount endpoints must exist before the script captures them.
-    const retainFn = this.ctx.newFunction(RETAIN_GENERATION_FN, (genHandle) => {
+    const retainFn = this.newHostFunction(RETAIN_GENERATION_FN, (genHandle) => {
       const gen: unknown = this.ctx.dump(genHandle) as unknown;
       if (typeof gen !== "number") return;
       const entry = this.generationContexts.get(gen);
@@ -1340,7 +1656,7 @@ export class QuickJSRuntime implements IJSRuntime {
     });
     this.ctx.setProp(this.ctx.global, RETAIN_GENERATION_FN, retainFn);
     retainFn.dispose();
-    const releaseFn = this.ctx.newFunction(RELEASE_GENERATION_FN, (genHandle) => {
+    const releaseFn = this.newHostFunction(RELEASE_GENERATION_FN, (genHandle) => {
       const gen: unknown = this.ctx.dump(genHandle) as unknown;
       if (typeof gen !== "number") return;
       const entry = this.generationContexts.get(gen);

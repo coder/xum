@@ -166,6 +166,16 @@ describe("disposableExec", () => {
     expect(childProc.killed).toBe(false);
   });
 
+  test("cwd option runs the command in the requested directory", async () => {
+    const cwd = await fs.mkdtemp(path.join(os.tmpdir(), "disposable-exec-cwd-"));
+    try {
+      using command = execFileAsync("node", ["-p", "process.cwd()"], { cwd });
+      expect((await command.result).stdout.trim()).toBe(await fs.realpath(cwd));
+    } finally {
+      await fs.rm(cwd, { recursive: true, force: true });
+    }
+  });
+
   test("stdout and stderr are captured correctly", async () => {
     using proc = execAsync("echo 'stdout message' && echo 'stderr message' >&2");
     const childProc = (proc as any).child;
@@ -352,9 +362,14 @@ describe("disposableExec", () => {
   });
 
   test("maxOutputBytes rejects after an overflowing command exits cleanly", async () => {
-    using proc = execFileAsync("sh", ["-c", "printf '%02000d' 0"], {
-      maxOutputBytes: 1024,
-    });
+    // The output must arrive only after the shell has exited and been reaped (`kill -0` fails).
+    // A plain `printf` raced the cap: under load the parent read the output while printf was
+    // still running and SIGKILLed it, so exitCode was null (#7529).
+    using proc = execFileAsync(
+      "sh",
+      ["-c", "(while kill -0 $$ 2>/dev/null; do :; done; printf '%02000d' 0) & exit 0"],
+      { maxOutputBytes: 1024 }
+    );
     const child = (proc as unknown as { child: ChildProcess }).child;
 
     await expect(proc.result).rejects.toThrow(/more than 1024 bytes of output/);

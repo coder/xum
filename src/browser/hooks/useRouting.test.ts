@@ -9,26 +9,28 @@ import type { ProvidersConfigMap } from "@/common/orpc/types";
 import { getAppConfigStore } from "@/browser/stores/AppConfigStore";
 import { getProvidersConfigStore } from "@/browser/stores/ProvidersConfigStore";
 
+import { useMinThinkingLevels } from "./useMinThinkingLevels";
 import { useRouting } from "./useRouting";
+import { createTestApiClient, createTestConfig, type TestClientConfig } from "@/browser/testUtils";
 
-let providersConfig: ProvidersConfigMap | null = null;
+// providers.getConfig never resolves null; an empty map means no providers configured.
+let providersConfig: ProvidersConfigMap = {};
 let routePriority: string[] = ["direct"];
 let routeOverrides: Record<string, string> = {};
-let configGetConfig: () => Promise<{
-  routePriority: string[];
-  routeOverrides: Record<string, string>;
-}>;
+let configGetConfig: () => Promise<TestClientConfig>;
 let updateRoutePreferencesImpl: () => Promise<undefined>;
 
+// `never` items fit every event stream (the subscriptions here yield void).
 async function* emptyStream() {
   await Promise.resolve();
-  for (const item of [] as unknown[]) {
+  const items: never[] = [];
+  for (const item of items) {
     yield item;
   }
 }
 
 function createStubApiClient(): APIClient {
-  return {
+  return createTestApiClient({
     providers: {
       getConfig: () => Promise.resolve(providersConfig),
       onConfigChanged: () => Promise.resolve(emptyStream()),
@@ -38,7 +40,7 @@ function createStubApiClient(): APIClient {
       onConfigChanged: () => Promise.resolve(emptyStream()),
       updateRoutePreferences: () => updateRoutePreferencesImpl(),
     },
-  } as unknown as APIClient;
+  });
 }
 
 const stubClient = createStubApiClient();
@@ -61,10 +63,10 @@ describe("useRouting", () => {
     testWindow = new GlobalWindow({ url: "https://mux.example.com/" });
     globalThis.window = testWindow as unknown as Window & typeof globalThis;
     globalThis.document = globalThis.window.document;
-    providersConfig = null;
+    providersConfig = {};
     routePriority = ["direct"];
     routeOverrides = {};
-    configGetConfig = () => Promise.resolve({ routePriority, routeOverrides });
+    configGetConfig = () => Promise.resolve(createTestConfig({ routePriority, routeOverrides }));
     updateRoutePreferencesImpl = () => Promise.resolve(undefined);
   });
 
@@ -85,7 +87,7 @@ describe("useRouting", () => {
         apiKeySet: true,
         isEnabled: true,
         isConfigured: true,
-        models: [KNOWN_MODELS.GPT_54_MINI.providerModelId],
+        models: [KNOWN_MODELS.GPT_6_LUNA.providerModelId],
       },
     };
 
@@ -113,8 +115,85 @@ describe("useRouting", () => {
     });
   });
 
+  test.each([
+    { canonicalRoutes: { google: "agents-google" }, expected: "coder" },
+    { canonicalRoutes: undefined, expected: "direct" },
+  ])("routes Google through Coder only when canonicalRoutes maps it: %j", async (testCase) => {
+    const model = "google:gemini-3.8-flash";
+    providersConfig = {
+      coder: {
+        apiKeySet: false,
+        isEnabled: true,
+        isConfigured: true,
+        discoveredProviders: [{ name: "agents-google", type: "google" }],
+        canonicalRoutes: testCase.canonicalRoutes,
+      },
+    };
+    routePriority = ["coder", "direct"];
+    getProvidersConfigStore().setClient(stubClient);
+    getAppConfigStore().setClient(stubClient);
+    const { result } = renderHook(() => useRouting(), { wrapper });
+    // Anthropic's default-named instance proves the Coder config has loaded.
+    await waitFor(() =>
+      expect(result.current.resolveRoute(KNOWN_MODELS.OPUS.id).route).toBe("coder")
+    );
+
+    expect(result.current.availableRoutes(model).some((route) => route.route === "coder")).toBe(
+      testCase.expected === "coder"
+    );
+    expect(result.current.resolveRoute(model).route).toBe(testCase.expected);
+    expect(result.current.resolveAutoRoute(model).route).toBe(testCase.expected);
+    expect(result.current.resolveEffectiveRoute(model)).toBe(testCase.expected);
+  });
+
+  const coderFallbackCases: Array<{
+    availability: Partial<NonNullable<ProvidersConfigMap["coder"]>>;
+    override?: string;
+    expected: string;
+  }> = [
+    { availability: { isEnabled: false }, override: undefined, expected: "openrouter" },
+    {
+      availability: { discoveredModels: [], models: [] },
+      override: undefined,
+      expected: "openrouter",
+    },
+    {
+      availability: { removedModels: ["prod-openai/gpt-6-astra"] },
+      override: undefined,
+      expected: "openrouter",
+    },
+    { availability: { isEnabled: false }, override: "direct", expected: "direct" },
+    { availability: {}, override: "direct", expected: "coder" },
+  ];
+  test.each(coderFallbackCases)(
+    "resolves Pro's effective custom-instance route: %j",
+    async (testCase) => {
+      const model = "coder:prod-openai/gpt-6-astra";
+      providersConfig = {
+        openai: { apiKeySet: true, isEnabled: true, isConfigured: true },
+        openrouter: { apiKeySet: true, isEnabled: true, isConfigured: true },
+        coder: {
+          apiKeySet: false,
+          isEnabled: true,
+          isConfigured: true,
+          discoveredProviders: [{ name: "prod-openai", type: "openai" }],
+          // Capability overrides must not change the fallback's provider or route key.
+          models: [{ id: "prod-openai/gpt-6-astra", mappedToModel: "anthropic:claude-opus-4-6" }],
+          ...testCase.availability,
+        },
+      };
+      routePriority = ["openrouter", "direct"];
+      if (testCase.override) routeOverrides = { "openai:gpt-6-astra": testCase.override };
+      getProvidersConfigStore().setClient(stubClient);
+      getAppConfigStore().setClient(stubClient);
+      const { result } = renderHook(() => useRouting(), { wrapper });
+      await waitFor(() => expect(result.current.routePriority).toEqual(routePriority));
+      expect(result.current.resolveEffectiveRoute(model)).toBe(testCase.expected);
+    }
+  );
+
   test("hook instances share one config fetch via the AppConfigStore", async () => {
-    routeOverrides = { "openai:gpt-5.4": "mux-gateway" };
+    routeOverrides = { "openai:gpt-5.4": "openrouter" };
     let configFetchCount = 0;
     const baseGetConfig = configGetConfig;
     configGetConfig = () => {
@@ -149,10 +228,33 @@ describe("useRouting", () => {
     await waitFor(() => expect(result.current.routePriority).toEqual(["direct"]));
 
     act(() => {
-      result.current.setRoutePriority(["mux-gateway", "direct"]);
+      result.current.setRoutePriority(["openrouter", "direct"]);
     });
-    expect(result.current.routePriority).toEqual(["mux-gateway", "direct"]);
+    expect(result.current.routePriority).toEqual(["openrouter", "direct"]);
 
     await waitFor(() => expect(result.current.routePriority).toEqual(["direct"]));
+  });
+
+  test("a preferences-only update does not re-render routing or thinking-floor consumers", async () => {
+    getProvidersConfigStore().setClient(stubClient);
+    let renders = 0;
+    const { result } = renderHook(
+      () => {
+        renders++;
+        return [useRouting(), useMinThinkingLevels()] as const;
+      },
+      { wrapper }
+    );
+    await waitFor(() => expect(getAppConfigStore().getSnapshot()).not.toBeNull());
+    await waitFor(() => expect(result.current[0].routePriority).toEqual(["direct"]));
+    const rendersBefore = renders;
+
+    act(() => {
+      getAppConfigStore().updateOptimistically({
+        userPreferences: { appearance: { theme: "light" } },
+      });
+    });
+
+    expect(renders).toBe(rendersBefore);
   });
 });

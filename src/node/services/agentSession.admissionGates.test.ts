@@ -1,20 +1,11 @@
 import { describe, expect, it, mock, afterEach, spyOn } from "bun:test";
-import { EventEmitter } from "events";
-import type { AIService } from "@/node/services/aiService";
-import type { InitStateManager } from "@/node/services/initStateManager";
-import type { BackgroundProcessManager } from "@/node/services/backgroundProcessManager";
-import type { Config } from "@/node/config";
 import type { SendMessageError } from "@/common/types/errors";
 import { createMuxMessage } from "@/common/types/message";
-import { Ok } from "@/common/types/result";
-import { AgentSession, CONTEXT_MUTATION_SEND_BLOCKED_MESSAGE } from "./agentSession";
-import { createTestHistoryService } from "./testHistoryService";
+import { Err } from "@/common/types/result";
+import { CONTEXT_MUTATION_SEND_BLOCKED_MESSAGE, type AgentSessionAIService } from "./agentSession";
+import { createAgentSessionHarness } from "./agentSession.testHarness";
 
 const TEST_MODEL = "anthropic:claude-3-5-sonnet-latest";
-const config = {
-  srcDir: "/tmp",
-  getSessionDir: (_workspaceId: string) => "/tmp",
-} as unknown as Config;
 
 // r41/r42: the admissionEpochStale probe is a session-level backstop for
 // context-discarding mutations that complete while a send is between its
@@ -27,33 +18,18 @@ describe("AgentSession.sendMessage (admission gates)", () => {
   let historyCleanup: (() => Promise<void>) | undefined;
 
   async function createSessionHarness(workspaceId: string) {
-    const { historyService, cleanup } = await createTestHistoryService();
-    historyCleanup = cleanup;
-
-    const streamMessage = mock(() => Promise.resolve(Ok(undefined)));
-    const aiService = Object.assign(new EventEmitter(), {
-      isStreaming: mock((_workspaceId: string) => false),
-      stopStream: mock((_workspaceId: string) => Promise.resolve(Ok(undefined))),
-      streamMessage: streamMessage as unknown as AIService["streamMessage"],
-    }) as unknown as AIService;
-
-    return {
-      historyService,
-      streamMessage,
-      session: new AgentSession({
-        workspaceId,
-        config,
-        historyService,
-        aiService,
-        initStateManager: new EventEmitter() as unknown as InitStateManager,
-        backgroundProcessManager: {
-          cleanup: mock((_workspaceId: string) => Promise.resolve()),
-          setMessageQueued: mock((_workspaceId: string, _queued: boolean) => {
-            void _queued;
-          }),
-        } as unknown as BackgroundProcessManager,
-      }),
-    };
+    // Every gate refuses before streaming; a stream attempt surfaces as a failed send.
+    const streamMessage = mock<AgentSessionAIService["streamMessage"]>(() =>
+      Promise.resolve(Err({ type: "unknown", raw: "streamMessage must not be reached" }))
+    );
+    const harness = await createAgentSessionHarness({
+      workspaceId,
+      aiServiceOverrides: {
+        streamMessage,
+      },
+    });
+    historyCleanup = harness.cleanup;
+    return { historyService: harness.historyService, streamMessage, session: harness.session };
   }
 
   afterEach(async () => {
@@ -63,13 +39,14 @@ describe("AgentSession.sendMessage (admission gates)", () => {
   it("refuses at the pre-persist gate before any row lands when the epoch is stale", async () => {
     const workspaceId = "ws-epoch-prepersist";
     const { session, historyService, streamMessage } = await createSessionHarness(workspaceId);
-    const appendMany = spyOn(historyService, "appendManyToHistory");
+    const publication = spyOn(historyService, "acceptCompactionReplacement");
     let acceptedCalls = 0;
 
     const result = await session.sendMessage(
       "family trigger",
       { model: TEST_MODEL, agentId: "exec" },
       {
+        acceptanceOrigin: "automatic",
         synthetic: true,
         preTurnMessages: [
           createMuxMessage("family-payload-stale", "assistant", "untrusted payload", {
@@ -90,7 +67,7 @@ describe("AgentSession.sendMessage (admission gates)", () => {
     });
     // Pre-acceptance refusal: nothing persisted, nothing accepted, no stream.
     expect(acceptedCalls).toBe(0);
-    expect(appendMany).not.toHaveBeenCalled();
+    expect(publication).not.toHaveBeenCalled();
     expect(streamMessage).not.toHaveBeenCalled();
     const history = await historyService.getHistoryFromLatestBoundary(workspaceId);
     expect(history.success ? history.data : ["unexpected"]).toHaveLength(0);
@@ -99,13 +76,25 @@ describe("AgentSession.sendMessage (admission gates)", () => {
   it("invokes the cancellation hook when the caller probe goes stale before acceptance", async () => {
     const workspaceId = "ws-caller-stale-cancel";
     const { session, historyService, streamMessage } = await createSessionHarness(workspaceId);
-    const appendMany = spyOn(historyService, "appendManyToHistory");
+    let published = false;
+    const publish = historyService.acceptCompactionReplacement.bind(historyService);
+    spyOn(historyService, "acceptCompactionReplacement").mockImplementationOnce(
+      (id, capture, operation, observer) =>
+        publish(id, capture, operation, {
+          ...observer,
+          onCommitted: (receipt) => {
+            observer.onCommitted(receipt);
+            published = true;
+          },
+        })
+    );
     const canceled: string[] = [];
 
     const result = await session.sendMessage(
       "peer trigger",
       { model: TEST_MODEL, agentId: "exec" },
       {
+        acceptanceOrigin: "automatic",
         synthetic: true,
         preTurnMessages: [
           createMuxMessage("peer-payload-stale", "assistant", "untrusted payload", {
@@ -115,9 +104,8 @@ describe("AgentSession.sendMessage (admission gates)", () => {
         ],
         // Goes stale only once the pre-turn batch persisted: exercises the pre-horizon gate,
         // which must roll the rows back AND surface the refusal through the cancellation hook —
-        // a queued peer send's caller already returned success and this hook carries its budget
-        // refund; without it the reservation would leak.
-        admissionStale: () => appendMany.mock.calls.length > 0,
+        // a queued peer send's caller already returned success and learns of it only there.
+        admissionStale: () => published,
         onCanceled: (reason: string) => {
           canceled.push(reason);
         },
@@ -131,23 +119,33 @@ describe("AgentSession.sendMessage (admission gates)", () => {
     expect(history.success ? history.data : ["unexpected"]).toHaveLength(0);
   });
 
-  it("keeps the charge when a stale send's rollback did not commit", async () => {
+  it("does not report a stale send canceled when its rollback did not commit", async () => {
     const workspaceId = "ws-caller-stale-rollback-failed";
     const { session, historyService, streamMessage } = await createSessionHarness(workspaceId);
-    const appendMany = spyOn(historyService, "appendManyToHistory");
+    let published = false;
+    const publish = historyService.acceptCompactionReplacement.bind(historyService);
+    spyOn(historyService, "acceptCompactionReplacement").mockImplementationOnce(
+      (id, capture, operation, observer) =>
+        publish(id, capture, operation, {
+          ...observer,
+          onCommitted: (receipt) => {
+            observer.onCommitted(receipt);
+            published = true;
+          },
+        })
+    );
     // Rollback deletion fails and the rows verifiably REMAIN: the cancellation hook must not
-    // fire — a refunded reservation with durable rows would let the payload enter provider
-    // context after a resume while no longer counting against the sender's budget.
+    // fire, because the durable payload can still enter provider context after a resume.
     const deleteSpy = spyOn(historyService, "deleteMessages").mockImplementation(() =>
       Promise.resolve({ success: false as const, error: "sequence refresh failed" })
     );
     const canceled: string[] = [];
-    let preTurnRowsPersisted = 0;
 
     const result = await session.sendMessage(
       "peer trigger",
       { model: TEST_MODEL, agentId: "exec" },
       {
+        acceptanceOrigin: "automatic",
         synthetic: true,
         preTurnMessages: [
           createMuxMessage("peer-payload-stuck", "assistant", "untrusted payload", {
@@ -155,12 +153,9 @@ describe("AgentSession.sendMessage (admission gates)", () => {
             synthetic: true,
           }),
         ],
-        admissionStale: () => appendMany.mock.calls.length > 0,
+        admissionStale: () => published,
         onCanceled: (reason: string) => {
           canceled.push(reason);
-        },
-        onPreTurnRowsPersisted: () => {
-          preTurnRowsPersisted += 1;
         },
       }
     );
@@ -168,12 +163,8 @@ describe("AgentSession.sendMessage (admission gates)", () => {
 
     expect(result.success).toBe(false);
     expect(canceled).toHaveLength(0);
-    // The failed rollback must be PROPAGATED as persistence: the Err still reaches the caller's
-    // outer refund paths (direct failure branch / queued onAcceptedPreStreamFailure), and only
-    // this marker keeps their payload-guarded refunds from releasing the charge on durable rows.
-    expect(preTurnRowsPersisted).toBe(1);
     expect(streamMessage).not.toHaveBeenCalled();
-    // The rows stayed durable — consistent with the retained charge.
+    // The rows stayed durable.
     const history = await historyService.getHistoryFromLatestBoundary(workspaceId);
     expect(history.success && history.data.length > 0).toBe(true);
   });
@@ -192,6 +183,7 @@ describe("AgentSession.sendMessage (admission gates)", () => {
       "hello",
       { model: TEST_MODEL, agentId: "exec" },
       {
+        acceptanceOrigin: "automatic",
         synthetic: true,
         onAccepted: () => {
           acceptedCalls += 1;

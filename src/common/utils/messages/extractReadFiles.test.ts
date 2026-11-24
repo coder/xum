@@ -97,8 +97,17 @@ describe("extractReadFilePaths", () => {
             success: true,
             toolCalls: [
               { toolName: "file_read", args: { path: "/nested-read.ts" }, ok: true, bytes: 10 },
-              { toolName: "load", args: { path: "/loaded.jsonl", key: "data" } },
+              // loadActive compaction keeps the load result (no ok bit).
+              {
+                toolName: "load",
+                args: { path: "/loaded.jsonl", key: "data" },
+                result: { key: "data", bytes: 9, lines: 1 },
+              },
               // Failures and non-read nested calls are ignored.
+              // A malformed row with neither result nor ok must not be
+              // advertised as read (round 16): success is never inferred
+              // from absence.
+              { toolName: "file_read", args: { path: "/never-read.ts" } },
               { toolName: "file_read", args: { path: "/nested-failed.ts" }, error: "denied" },
               { toolName: "load", args: { path: "/load-failed.txt", key: "x" }, error: "missing" },
               { toolName: "bash", args: { path: "/not-a-read.sh" }, ok: true },
@@ -110,6 +119,17 @@ describe("extractReadFilePaths", () => {
                 args: { path: "/resolved-but-failed.ts" },
                 result: { success: false, error: "File not found" },
               },
+              // Corrupted persisted rows (r33): result PRESENCE alone must not
+              // advertise a read — null, primitive, and success-less results
+              // are all rejected; only the positive successful shape counts.
+              { toolName: "file_read", args: { path: "/corrupt-null.ts" }, result: null },
+              { toolName: "file_read", args: { path: "/corrupt-primitive.ts" }, result: 5 },
+              { toolName: "file_read", args: { path: "/corrupt-successless.ts" }, result: {} },
+              {
+                toolName: "file_read",
+                args: { path: "/classic-read.ts" },
+                result: { success: true, content: "x" },
+              },
             ],
           },
         },
@@ -120,9 +140,10 @@ describe("extractReadFilePaths", () => {
       codeExecutionMessage,
     ];
 
-    // Newest-first at every level: within the execution, /loaded.jsonl is
-    // chronologically after /nested-read.ts, so it surfaces first.
+    // Newest-first at every level: within the execution, /classic-read.ts is
+    // chronologically last, so it surfaces first.
     expect(extractReadFilePaths(messages)).toEqual([
+      "/classic-read.ts",
       "/loaded.jsonl",
       "/nested-read.ts",
       "/direct.ts",

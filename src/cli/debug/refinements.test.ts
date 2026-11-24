@@ -1,17 +1,19 @@
-import { afterEach, describe, expect, it, spyOn } from "bun:test";
+import { describe, expect, it } from "bun:test";
 
 import * as fsPromises from "node:fs/promises";
 import * as path from "node:path";
 import { appendRefinementEvent } from "@/node/services/refinement/refinementJournal";
 import { TestTempDir } from "@/node/services/tools/testHelpers";
-import { refinementsCommand } from "./refinements";
+
+const REPO_ROOT = path.resolve(import.meta.dir, "../../..");
+const DEBUG_CLI_ENTRY = path.join(import.meta.dir, "index.ts");
 
 /**
  * Fixture session: one skill-write row whose inverse deletes the file it
  * created, inside a `<root>/sessions/<ws>` layout so the confinement roots
  * resolve like a real mux home.
  */
-async function seedFixture(root: string): Promise<{ sessionDir: string; skillFile: string }> {
+async function seedFixture(root: string): Promise<{ skillFile: string }> {
   const sessionDir = path.join(root, "sessions", "ws-cli");
   const skillFile = path.join(root, "checkout", ".mux", "skills", "cli-skill", "SKILL.md");
   await fsPromises.mkdir(path.dirname(skillFile), { recursive: true });
@@ -24,69 +26,71 @@ async function seedFixture(root: string): Promise<{ sessionDir: string; skillFil
     inverse: { op: "delete-files", paths: [skillFile] },
     evidence: { toolName: "agent_skill_write" },
   });
-  return { sessionDir, skillFile };
+  return { skillFile };
+}
+
+/**
+ * Runs the real `bun debug refinements` entry point against `root`: the
+ * session dir is derived from XUM_ROOT exactly as for a user's home, so the
+ * test also covers index.ts's argument wiring and exit status.
+ */
+async function runRefinementsCli(
+  root: string,
+  args: string[]
+): Promise<{ stdoutLines: string[]; stderr: string; exitCode: number }> {
+  const env: Record<string, string | undefined> = { ...process.env, XUM_ROOT: root };
+  // The legacy alias is only a fallback, but clear it so an inherited value
+  // can never be what the child resolves.
+  delete env.MUX_ROOT;
+  const proc = Bun.spawn([process.execPath, DEBUG_CLI_ENTRY, "refinements", "ws-cli", ...args], {
+    cwd: REPO_ROOT,
+    env,
+    stdout: "pipe",
+    stderr: "pipe",
+  });
+  const [stdout, stderr, exitCode] = await Promise.all([
+    new Response(proc.stdout).text(),
+    new Response(proc.stderr).text(),
+    proc.exited,
+  ]);
+  return { stdoutLines: stdout.split("\n").filter((line) => line.length > 0), stderr, exitCode };
 }
 
 describe("debug refinements command", () => {
-  afterEach(() => {
-    // Reset to 0, not undefined: in Bun, assigning undefined does NOT clear a
-    // previously set nonzero exit code, which would leak a failing exit status
-    // into otherwise-green multi-file test runs.
-    process.exitCode = 0;
-  });
-
   it("lists rows and performs a rollback with lineage output", async () => {
     using tempDir = new TestTempDir("test-debug-refinements");
-    const { sessionDir, skillFile } = await seedFixture(tempDir.path);
-    const lines: string[] = [];
-    const logSpy = spyOn(console, "log").mockImplementation((line: string) => {
-      lines.push(line);
-    });
-    try {
-      await refinementsCommand("ws-cli", { sessionDir });
-      expect(lines).toHaveLength(1);
-      expect(lines[0]).toContain("skill");
-      expect(lines[0]).toContain("write cli-skill/SKILL.md");
-      const rowId = lines[0].split("  ")[0];
+    const { skillFile } = await seedFixture(tempDir.path);
 
-      lines.length = 0;
-      await refinementsCommand("ws-cli", { sessionDir, rollback: rowId });
-      // Earlier test files in the same process may have reset exitCode to 0,
-      // so assert "not failing" rather than "never touched".
-      expect(process.exitCode ?? 0).toBe(0);
-      expect(lines.some((line) => line === `deleted ${skillFile}`)).toBe(true);
-      expect(lines.some((line) => line.includes(`rollbackOf ${rowId}`))).toBe(true);
-      const stillExists = await fsPromises.access(skillFile).then(
-        () => true,
-        () => false
-      );
-      expect(stillExists).toBe(false);
+    const listed = await runRefinementsCli(tempDir.path, []);
+    expect(listed.exitCode).toBe(0);
+    expect(listed.stdoutLines).toHaveLength(1);
+    expect(listed.stdoutLines[0]).toContain("skill");
+    expect(listed.stdoutLines[0]).toContain("write cli-skill/SKILL.md");
+    const rowId = listed.stdoutLines[0].split("  ")[0];
 
-      // The list now shows the rollback row with its lineage.
-      lines.length = 0;
-      await refinementsCommand("ws-cli", { sessionDir });
-      expect(lines).toHaveLength(2);
-      expect(lines[1]).toContain(`rollbackOf=${rowId}`);
-    } finally {
-      logSpy.mockRestore();
-    }
-  });
+    const rolledBack = await runRefinementsCli(tempDir.path, ["--rollback", rowId]);
+    expect(rolledBack.exitCode).toBe(0);
+    expect(rolledBack.stdoutLines.some((line) => line === `deleted ${skillFile}`)).toBe(true);
+    expect(rolledBack.stdoutLines.some((line) => line.includes(`rollbackOf ${rowId}`))).toBe(true);
+    const stillExists = await fsPromises.access(skillFile).then(
+      () => true,
+      () => false
+    );
+    expect(stillExists).toBe(false);
+
+    // The list now shows the rollback row with its lineage.
+    const relisted = await runRefinementsCli(tempDir.path, []);
+    expect(relisted.exitCode).toBe(0);
+    expect(relisted.stdoutLines).toHaveLength(2);
+    expect(relisted.stdoutLines[1]).toContain(`rollbackOf=${rowId}`);
+  }, 30_000);
 
   it("reports refusals on stderr and sets a failing exit code", async () => {
     using tempDir = new TestTempDir("test-debug-refinements-refuse");
-    const { sessionDir } = await seedFixture(tempDir.path);
-    const logSpy = spyOn(console, "log").mockImplementation(() => undefined);
-    const errors: string[] = [];
-    const errorSpy = spyOn(console, "error").mockImplementation((line: string) => {
-      errors.push(line);
-    });
-    try {
-      await refinementsCommand("ws-cli", { sessionDir, rollback: "missing-id" });
-      expect(process.exitCode).toBe(1);
-      expect(errors.join("\n")).toContain("No refinement row");
-    } finally {
-      logSpy.mockRestore();
-      errorSpy.mockRestore();
-    }
-  });
+    await seedFixture(tempDir.path);
+
+    const refused = await runRefinementsCli(tempDir.path, ["--rollback", "missing-id"]);
+    expect(refused.exitCode).toBe(1);
+    expect(refused.stderr).toContain("No refinement row");
+  }, 30_000);
 });

@@ -494,7 +494,7 @@ export function BrowserViewport(props: BrowserViewportProps) {
             <button
               type="button"
               onClick={props.onRestart}
-              className="bg-accent hover:bg-accent/80 text-accent-foreground inline-flex items-center rounded-md px-3 py-1.5 text-xs font-medium transition-colors"
+              className="bg-accent hover:bg-accent-button-hover text-accent-foreground inline-flex items-center rounded-md px-3 py-1.5 text-xs font-medium transition-colors"
             >
               Restart
             </button>
