@@ -445,11 +445,11 @@ describe("BackupService against a real repository", () => {
     const backedUp = {
       agentAiDefaults: {
         exec: { modelString: "anthropic:claude-exec", thinkingLevel: "high" as const },
-        plan: { modelString: "openai:gpt-plan", advisorEnabled: true },
+        plan: { modelString: "openai:gpt-plan" },
       },
       defaultModel: "anthropic:claude-exec",
       hiddenModels: ["openai:gpt-old"],
-      advisorMaxUsesPerTurn: 2,
+      minThinkingLevelByModel: { "anthropic:claude-exec": "medium" as const },
       taskSettings: { maxParallelAgentTasks: 4, maxTaskNestingDepth: 2 },
     };
     await config.editConfig((current) => ({
@@ -465,7 +465,7 @@ describe("BackupService against a real repository", () => {
       agentAiDefaults: { exec: { modelString: "openai:gpt-local" } },
       defaultModel: "openai:gpt-local",
       hiddenModels: [],
-      advisorMaxUsesPerTurn: null,
+      minThinkingLevelByModel: {},
       heartbeatDefaultPrompt: "Local prompt",
       taskSettings: { maxParallelAgentTasks: 1, maxTaskNestingDepth: 1 },
       apiServerPort: 9999,
@@ -477,7 +477,7 @@ describe("BackupService against a real repository", () => {
     expect(loaded.agentAiDefaults).toMatchObject(backedUp.agentAiDefaults);
     expect(loaded.defaultModel).toBe(backedUp.defaultModel);
     expect(loaded.hiddenModels).toEqual(backedUp.hiddenModels);
-    expect(loaded.advisorMaxUsesPerTurn).toBe(backedUp.advisorMaxUsesPerTurn);
+    expect(loaded.minThinkingLevelByModel).toEqual(backedUp.minThinkingLevelByModel);
     expect(loaded.taskSettings).toMatchObject(backedUp.taskSettings);
     // Agents run the heartbeat prompt unattended, so it stays local like the port.
     expect(loaded.heartbeatDefaultPrompt).toBe("Local prompt");
@@ -497,10 +497,10 @@ describe("BackupService against a real repository", () => {
       ...current,
       agentAiDefaults: { exec: { modelString: "openai:gpt-local", thinkingLevel: "high" } },
       modelFallbacks: { "openai:gpt-local": { models: ["anthropic:claude-exec"] } },
-      advisorModelString: "openai:gpt-advisor",
+      minThinkingLevelByModel: { "openai:gpt-local": "high" },
       heartbeatDefaultPrompt: "Local prompt",
       chatTranscriptFullWidth: true,
-      defaultRuntime: "docker",
+      defaultIsolation: { project: "local", workspace: "docker" },
       apiServerPort: 9999,
     }));
     const changed = await service.preview(settings);
@@ -513,9 +513,10 @@ describe("BackupService against a real repository", () => {
     const loaded = config.loadConfigOrDefault();
     expect(loaded.agentAiDefaults).toEqual({});
     expect(loaded.modelFallbacks?.["openai:gpt-local"]).toBeUndefined();
-    expect(loaded.advisorModelString).toBeUndefined();
+    expect(loaded.minThinkingLevelByModel).toBeUndefined();
     expect(loaded.heartbeatDefaultPrompt).toBe("Local prompt");
     expect(loaded.chatTranscriptFullWidth).toBeFalsy();
+    expect(loaded.defaultIsolation).toBeUndefined();
     expect(loaded.defaultRuntime).toBeUndefined();
     expect(loaded.apiServerPort).toBe(9999);
 

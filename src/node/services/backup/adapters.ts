@@ -111,6 +111,7 @@ import {
   mergeBackupSettings,
   projectBackupSettings,
   readBackupSettings,
+  type BackupSettings,
 } from "./settingsProjection";
 
 /**
@@ -267,6 +268,37 @@ async function readProjectGitRemote(
   }
 }
 
+/**
+ * The config a restore of a preferences document writes over `current`: preferences merged, and
+ * the settings block's keys replaced. Merged against the config the caller read, so keys no
+ * backup carries keep their local values.
+ */
+function mergeRestoredConfig(
+  current: ProjectsConfig,
+  document: unknown,
+  settings: BackupSettings | undefined
+): ProjectsConfig {
+  const next: ProjectsConfig = {
+    ...current,
+    userPreferences: normalizeUserPreferences(
+      mergeBackupPreferences(current.userPreferences, document)
+    ),
+  };
+  return settings === undefined ? next : mergeBackupSettings(next, settings);
+}
+
+/**
+ * Whether two configs differ in anything a backup carries. Compared through the backup
+ * projections, so machine-local keys the load path normalizes differently stay out of it.
+ */
+function portableConfigDiffers(a: ProjectsConfig, b: ProjectsConfig): boolean {
+  return (
+    !serializeBackupPreferences(a.userPreferences ?? {}).equals(
+      serializeBackupPreferences(b.userPreferences ?? {})
+    ) || JSON.stringify(projectBackupSettings(a)) !== JSON.stringify(projectBackupSettings(b))
+  );
+}
+
 export function createBackupPayloadStore(options: { config: Config }): BackupPayloadStore {
   const muxRoot = options.config.rootDir;
 
@@ -275,10 +307,6 @@ export function createBackupPayloadStore(options: { config: Config }): BackupPay
   async function managedDir(repositoryRoot: string, managedPath: string): Promise<string> {
     const segments = managedPath.split("/").filter((segment) => segment !== "");
     return await resolveContainedPath(repositoryRoot, segments.join("/"));
-  }
-
-  function backupSettingsDiffer(a: ProjectsConfig, b: ProjectsConfig): boolean {
-    return JSON.stringify(projectBackupSettings(a)) !== JSON.stringify(projectBackupSettings(b));
   }
 
   async function localFilesByPath(contents: BackupContents): Promise<Map<string, BackupFile>> {
@@ -698,17 +726,13 @@ export function createBackupPayloadStore(options: { config: Config }): BackupPay
         if (file.path === "preferences.json") {
           const document: unknown = JSON.parse(file.content.toString("utf-8"));
           const localConfig = options.config.loadConfigOrDefault();
-          const local = localConfig.userPreferences;
-          const merged = mergeBackupPreferences(local, document);
           const backupSettings = readBackupSettings(document);
           unsupportedSettings = backupSettings.unsupported;
           if (
-            !serializeBackupPreferences(local).equals(serializeBackupPreferences(merged)) ||
-            (backupSettings.settings !== undefined &&
-              backupSettingsDiffer(
-                localConfig,
-                mergeBackupSettings(localConfig, backupSettings.settings)
-              ))
+            portableConfigDiffers(
+              localConfig,
+              mergeRestoredConfig(localConfig, document, backupSettings.settings)
+            )
           ) {
             changes.push({ status: "M", path: file.path });
           }
@@ -897,16 +921,11 @@ export function createBackupPayloadStore(options: { config: Config }): BackupPay
               // Merged against the config this edit reads, not a snapshot taken before the
               // restore: a whole-object write would otherwise discard preferences another
               // window saved meanwhile, including the machine-local keys no backup carries.
-              const next: ProjectsConfig = {
-                ...current,
-                userPreferences: normalizeUserPreferences(
-                  mergeBackupPreferences(current.userPreferences, result.backupPreferences)
-                ),
-              };
-              merged =
-                backupSettings.settings === undefined
-                  ? next
-                  : mergeBackupSettings(next, backupSettings.settings);
+              merged = mergeRestoredConfig(
+                current,
+                result.backupPreferences,
+                backupSettings.settings
+              );
               return merged;
             },
             // Inside the project restore's registration window the edit must ride that
@@ -914,16 +933,11 @@ export function createBackupPayloadStore(options: { config: Config }): BackupPay
             registration === null ? {} : { withinRegistrationLock: registration }
           );
           // editConfig rejects when the save fails (#4444); re-reading is belt and braces against a
-          // write another writer replaced. Compared through the backup projection because every key
-          // a restore can change is portable, so a lost write is visible there, while machine-local
-          // keys the load path normalizes differently stay out of the check.
-          const stored = options.config.loadConfigOrDefault();
+          // write another writer replaced. Every key a restore can change is portable, so a lost
+          // write is visible through the backup projections.
           if (
             merged !== undefined &&
-            (!serializeBackupPreferences(stored.userPreferences ?? {}).equals(
-              serializeBackupPreferences(merged.userPreferences)
-            ) ||
-              backupSettingsDiffer(stored, merged))
+            portableConfigDiffers(options.config.loadConfigOrDefault(), merged)
           ) {
             throw new BackupServiceError(
               "IO_ERROR",

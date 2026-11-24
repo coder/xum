@@ -1211,13 +1211,10 @@ export function BackupSection() {
         </div>
       ) : null}
 
-      {unsupportedSettings.length > 0 ? (
-        <div className="border-border-light text-muted rounded-md border p-3 text-xs">
-          This version does not understand some backed-up settings, so they keep their current
-          values here: <code className="text-foreground">{unsupportedSettings.join(", ")}</code>.
-          They were likely saved by a newer Xum; update and restore again to apply them.
-        </div>
-      ) : null}
+      <SkippedNotice
+        intro="This version does not understand these backed-up settings, so they keep their current values here. A newer Xum likely saved them; update and restore again to apply them:"
+        items={unsupportedSettings}
+      />
 
       <SkippedNotice intro="Some pinned artifacts were left out:" items={shelfSkipped} />
       <SkippedNotice

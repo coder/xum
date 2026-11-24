@@ -1826,15 +1826,16 @@ describe("BackupSection", () => {
         commandApprovals: [],
         projectImports: [],
         projectBundleSkipped: false,
-        unsupportedSettings: ["agentAiDefaults", "defaultRuntime"],
+        unsupportedSettings: ["agentAiDefaults", "defaultIsolation"],
         pushError: null,
       },
     });
     const canvas = within(view.container);
     await canvas.findByText("Settings backup");
-    expect(canvas.queryByText("agentAiDefaults, defaultRuntime")).toBeNull();
+    expect(canvas.queryByText("agentAiDefaults")).toBeNull();
 
     fireEvent.click(canvas.getByRole("button", { name: "Preview changes" }));
-    await canvas.findByText("agentAiDefaults, defaultRuntime");
+    await canvas.findByText("agentAiDefaults");
+    expect(canvas.getByText("defaultIsolation")).toBeTruthy();
   });
 });

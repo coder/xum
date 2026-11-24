@@ -5,27 +5,23 @@ import {
   AppConfigOnDiskSchema,
   GoalDefaultsSchema,
 } from "@/common/config/schemas/appConfigOnDisk";
-import { ADVISOR_DEFAULT_MAX_USES_PER_TURN } from "@/common/constants/advisor";
-import { LayoutPresetsConfigSchema } from "@/common/orpc/schemas/uiLayouts";
 import { AgentIdSchema } from "@/common/schemas/ids";
 import { normalizeAgentAiDefaults } from "@/common/types/agentAiDefaults";
 import type { ProjectsConfig } from "@/common/types/project";
 import { normalizeTaskSettings } from "@/common/types/tasks";
-import { coerceOpenAIReasoningMode, coerceThinkingLevel } from "@/common/types/thinking";
-import { isLayoutPresetsConfigEmpty, normalizeLayoutPresetsConfig } from "@/common/types/uiLayouts";
 import { isPlainObject } from "@/common/utils/isPlainObject";
+import { normalizeIsolationChoice } from "@/common/types/isolation";
 import { normalizeGoalDefaults } from "@/constants/goals";
 import {
+  applyPersistedDefaultIsolation,
   normalizeAiDefaultsModelStrings,
   normalizeMinThinkingLevelByModel,
   normalizeModelFallbacks,
   normalizeOptionalModelString,
   normalizeOptionalModelStringArray,
-  normalizeRuntimeEnablementId,
   normalizeRuntimeEnablementOverrides,
   parseOptionalHeartbeatIntervalMs,
-  parseOptionalNonEmptyString,
-  parseOptionalPositiveInteger,
+  resolvePersistedDefaultIsolation,
 } from "@/node/config";
 
 /**
@@ -33,20 +29,25 @@ import {
  * addition fails closed until it is listed here:
  * - bound to the machine or its network: apiServerBindHost, apiServerPort, apiServerServeWebUi,
  *   mdnsAdvertisementEnabled, mdnsServiceName, serverSshHost, serverAuthGithubOwner,
- *   defaultProjectDir, terminalDefaultShell, updateChannel, useSSH2Transport;
- * - secrets and enrollment: muxGovernorUrl, muxGovernorToken;
- * - derived from providers.jsonc credentials, which are never exported (see
- *   providerService.syncGatewayLifecycleEffect): routePriority, routeOverrides, and the legacy
- *   muxGatewayEnabled and muxGatewayModels;
+ *   defaultProjectDir, terminalDefaultShell, updateChannel, useSSH2Transport, keepScreenAwake,
+ *   agentResourceLimits, agentResourceLimitsEnabled;
+ * - derived from providers.jsonc credentials, which are never exported: routePriority,
+ *   routeOverrides;
+ * - agent sandbox policy: agentSandbox. A repository-controlled value could loosen the sandbox
+ *   every later agent command runs in;
  * - destructive archive policies: coderWorkspaceArchiveBehavior and worktreeArchiveBehavior
  *   (with their legacy deleteWorktreeOnArchive and stopCoderWorkspaceOnArchive spellings). A
  *   repository-controlled "delete" would make every later archive remove worktrees and Coder
  *   workspaces, and unpushed work with them, with no prompt naming the policy;
  * - agent-executed text: heartbeatDefaultPrompt. A repository-controlled prompt would run
  *   unattended in every workspace whose heartbeat has no message of its own;
- * - save-time projections and internal state: subagentAiDefaults, preferredCompactionModel
+ * - not yet reviewed for portability: autoModelRouting, toolSearchEnabled, bashAiProxyEnabled,
+ *   agentHeartbeatsEnabled, evaluationDefaults;
+ * - save-time projections and internal state: defaultRuntime (the legacy mirror config derives
+ *   from defaultIsolation), subagentAiDefaults, preferredCompactionModel
  *   (unused), projects (the project bundle), viewedSplashScreens, migrations, writeId,
- *   settingsBackup, onePasswordAccountName.
+ *   settingsBackup, onePasswordAccountName, legacyOnePasswordAccountName, and the retired
+ *   advisor settings (inert downgrade data).
  * userPreferences has its own projection, projectBackupPreferences.
  */
 const BACKED_UP_SETTINGS_KEYS = [
@@ -55,19 +56,13 @@ const BACKED_UP_SETTINGS_KEYS = [
   "hiddenModels",
   "minThinkingLevelByModel",
   "modelFallbacks",
-  "advisorModelString",
-  "advisorThinkingLevel",
-  "advisorReasoningMode",
-  "advisorMaxUsesPerTurn",
-  "advisorMaxOutputTokens",
   "taskSettings",
   "heartbeatDefaultIntervalMs",
   "goalDefaults",
   "chatTranscriptFullWidth",
   "llmDebugLogs",
   "runtimeEnablement",
-  "defaultRuntime",
-  "layoutPresets",
+  "defaultIsolation",
 ] as const satisfies ReadonlyArray<keyof ProjectsConfig & keyof typeof AppConfigOnDiskSchema.shape>;
 
 type BackedUpSettingsKey = (typeof BACKED_UP_SETTINGS_KEYS)[number];
@@ -76,8 +71,7 @@ type BackedUpSettingsKey = (typeof BACKED_UP_SETTINGS_KEYS)[number];
  * A backup's settings block. Every key an export writes is present, so a value the user reset
  * to its default (cleared agent overrides, deleted fallback chains) round-trips as that default
  * rather than as a gap the restore would fill from the target. `null` is the JSON spelling of
- * an unset value, except for advisorMaxUsesPerTurn, where the app itself uses null for
- * "unlimited" and an unset cap therefore exports as the default cap. A key that is absent, as in
+ * an unset value. A key that is absent, as in
  * a block an older build wrote, keeps the local value.
  */
 export type BackupSettings = {
@@ -110,23 +104,13 @@ const NORMALIZE: { [K in BackedUpSettingsKey]: (value: unknown) => ProjectsConfi
   hiddenModels: normalizeOptionalModelStringArray,
   minThinkingLevelByModel: normalizeMinThinkingLevelByModel,
   modelFallbacks: normalizeModelFallbacks,
-  advisorModelString: parseOptionalNonEmptyString,
-  advisorThinkingLevel: coerceThinkingLevel,
-  advisorReasoningMode: coerceOpenAIReasoningMode,
-  // null is how config.json spells an explicit "unlimited" cap and is kept as written.
-  advisorMaxUsesPerTurn: (value) => (value === null ? null : parseOptionalPositiveInteger(value)),
-  advisorMaxOutputTokens: (value) => (value === null ? null : parseOptionalPositiveInteger(value)),
   taskSettings: normalizeTaskSettings,
   heartbeatDefaultIntervalMs: parseOptionalHeartbeatIntervalMs,
   goalDefaults: (value) => normalizeGoalDefaults(GoalDefaultsSchema.safeParse(value).data),
   chatTranscriptFullWidth: (value) => value === true,
   llmDebugLogs: (value) => value === true,
   runtimeEnablement: normalizeRuntimeEnablementOverrides,
-  defaultRuntime: normalizeRuntimeEnablementId,
-  layoutPresets: (value) => {
-    const normalized = normalizeLayoutPresetsConfig(value);
-    return isLayoutPresetsConfigEmpty(normalized) ? undefined : normalized;
-  },
+  defaultIsolation: normalizeIsolationChoice,
 };
 
 function isEmptySpelling(value: unknown): boolean {
@@ -142,12 +126,10 @@ const ModelStringSchema = z.string().refine(acceptedBy(normalizeOptionalModelStr
 
 /**
  * Where the on-disk schema accepts values load-time normalization rejects (any string is a model
- * string, at the top level and inside each agent's defaults; any id is a runtime; any keybind is
- * a slot), the field schema is tightened to what the normalizer accepts. Otherwise a damaged or
+ * string, at the top level and inside each agent's defaults; any id is a runtime), the field schema is tightened to what the normalizer accepts. Otherwise a damaged or
  * newer-build value would pass the schema, normalize to unset, and reset the target's setting,
  * when the contract is to keep the local value and report the key as unsupported. Empty
- * spellings (`""`, `[]`, `{}`, no slots) still canonicalize to unset. layoutPresets is unknown on
- * disk; the strict schema the layouts API saves through is used.
+ * spellings (`""`, `[]`, `{}`) still canonicalize to unset.
  */
 const FIELD_SCHEMA_OVERRIDES: Partial<Record<BackedUpSettingsKey, z.ZodType>> = {
   agentAiDefaults: z.record(
@@ -167,9 +149,6 @@ const FIELD_SCHEMA_OVERRIDES: Partial<Record<BackedUpSettingsKey, z.ZodType>> = 
   runtimeEnablement: AppConfigOnDiskSchema.shape.runtimeEnablement
     .unwrap()
     .refine(acceptedBy(normalizeRuntimeEnablementOverrides)),
-  layoutPresets: LayoutPresetsConfigSchema.refine(
-    (value) => normalizeLayoutPresetsConfig(value).slots.length === value.slots.length
-  ),
 };
 
 /**
@@ -205,11 +184,6 @@ export function projectBackupSettings(config: ProjectsConfig): BackupSettings {
   for (const key of BACKED_UP_SETTINGS_KEYS) {
     setSetting(projected, key, NORMALIZE[key](config[key]));
   }
-  // The advisor reads null as "unlimited" and unset as the default cap, so an unset cap cannot
-  // take the block's null spelling: a default source would switch the target to unlimited.
-  if (config.advisorMaxUsesPerTurn === undefined) {
-    projected.advisorMaxUsesPerTurn = ADVISOR_DEFAULT_MAX_USES_PER_TURN;
-  }
   return copyJson(projected);
 }
 
@@ -244,6 +218,14 @@ export function mergeBackupSettings(
   const merged: ProjectsConfig = { ...current };
   for (const key of BACKED_UP_SETTINGS_KEYS) {
     if (key in settings) assignSetting(merged, key, settings[key]);
+  }
+  if ("defaultIsolation" in settings) {
+    // Load and save resolve the default from defaultIsolation, falling back to the legacy
+    // defaultRuntime mirror, so a stale mirror would bring back a default the backup cleared.
+    applyPersistedDefaultIsolation(
+      merged,
+      resolvePersistedDefaultIsolation({ defaultIsolation: merged.defaultIsolation })
+    );
   }
   if (settings.hiddenModels != null) {
     // As Config.updateModelPreferences does: the restored list is now the user's, so the

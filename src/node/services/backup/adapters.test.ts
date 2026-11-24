@@ -1219,11 +1219,11 @@ describe("backup adapters", () => {
           thinkingLevel: "high" as const,
           subagent: { modelString: "openai:gpt-sub" },
         },
-        plan: { modelString: "openai:gpt-plan", advisorEnabled: true },
+        plan: { modelString: "openai:gpt-plan" },
       },
       defaultModel: "anthropic:claude-exec",
       hiddenModels: ["openai:gpt-old"],
-      advisorMaxUsesPerTurn: 2,
+      taskSettings: { maxParallelAgentTasks: 4, maxTaskNestingDepth: 2 },
     };
     config.state = { projects: new Map(), ...backedUp, apiServerPort: 4321 };
     const gitRepo = createBackupGitRepo({ cacheRoot });
@@ -1246,7 +1246,7 @@ describe("backup adapters", () => {
       agentAiDefaults: { exec: { modelString: "openai:gpt-local" } },
       defaultModel: "openai:gpt-local",
       hiddenModels: ["openai:gpt-old"],
-      advisorMaxUsesPerTurn: 2,
+      taskSettings: { maxParallelAgentTasks: 4, maxTaskNestingDepth: 2 },
       apiServerPort: 9999,
       terminalDefaultShell: "/bin/fish",
     };

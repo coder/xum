@@ -1042,7 +1042,7 @@ function setProjectAgentResourceLimits(project: ProjectConfig, value: unknown): 
  * backend yet (e.g. ssh × docker) mirrors its nearest supported runtime so old builds still get a
  * usable default. Returns no fields when neither is set, so callers delete both.
  */
-function resolvePersistedDefaultIsolation(record: {
+export function resolvePersistedDefaultIsolation(record: {
   defaultIsolation?: unknown;
   defaultRuntime?: unknown;
 }): { defaultIsolation: IsolationChoice; defaultRuntime: RuntimeEnablementId | undefined } | null {
@@ -1059,7 +1059,7 @@ function resolvePersistedDefaultIsolation(record: {
 }
 
 /** Write the canonical isolation default and its legacy mirror onto `target`, or delete both. */
-function applyPersistedDefaultIsolation(
+export function applyPersistedDefaultIsolation(
   target: { defaultIsolation?: IsolationChoice; defaultRuntime?: RuntimeEnablementId },
   resolved: ReturnType<typeof resolvePersistedDefaultIsolation>
 ): void {

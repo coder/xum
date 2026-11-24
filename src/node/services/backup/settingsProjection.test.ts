@@ -1,9 +1,7 @@
 import { describe, expect, it } from "bun:test";
 import type { ProjectsConfig } from "@/common/types/project";
 import { DEFAULT_TASK_SETTINGS } from "@/common/types/tasks";
-import { DEFAULT_LAYOUT_PRESETS_CONFIG } from "@/common/types/uiLayouts";
 import { DEFAULT_GOAL_DEFAULTS } from "@/constants/goals";
-import { ADVISOR_DEFAULT_MAX_USES_PER_TURN } from "@/common/constants/advisor";
 import {
   mergeBackupSettings,
   projectBackupSettings,
@@ -17,20 +15,13 @@ const UNSET_EXPORT = {
   hiddenModels: null,
   minThinkingLevelByModel: null,
   modelFallbacks: null,
-  advisorModelString: null,
-  advisorThinkingLevel: null,
-  advisorReasoningMode: null,
-  // null would mean "unlimited" to the advisor, so the default cap stands in for unset.
-  advisorMaxUsesPerTurn: ADVISOR_DEFAULT_MAX_USES_PER_TURN,
-  advisorMaxOutputTokens: null,
   taskSettings: DEFAULT_TASK_SETTINGS,
   heartbeatDefaultIntervalMs: null,
   goalDefaults: DEFAULT_GOAL_DEFAULTS,
   chatTranscriptFullWidth: false,
   llmDebugLogs: false,
   runtimeEnablement: null,
-  defaultRuntime: null,
-  layoutPresets: null,
+  defaultIsolation: null,
 };
 
 describe("settingsProjection", () => {
@@ -42,18 +33,13 @@ describe("settingsProjection", () => {
           thinkingLevel: "high",
           subagent: { modelString: "openai:gpt-sub", thinkingLevel: "low" },
         },
-        plan: { modelString: "openai:gpt-plan", reasoningMode: "pro", advisorEnabled: true },
+        plan: { modelString: "openai:gpt-plan", reasoningMode: "pro" },
         review: { enabled: false },
       },
       defaultModel: "anthropic:claude-exec",
       hiddenModels: ["openai:gpt-old"],
       minThinkingLevelByModel: { "openai:gpt-plan": "medium" },
       modelFallbacks: { "anthropic:claude-exec": { models: ["openai:gpt-plan"] } },
-      advisorModelString: "openai:gpt-advisor",
-      advisorThinkingLevel: "xhigh",
-      advisorReasoningMode: "pro",
-      advisorMaxUsesPerTurn: 3,
-      advisorMaxOutputTokens: null,
       taskSettings: {
         ...DEFAULT_TASK_SETTINGS,
         maxParallelAgentTasks: 4,
@@ -69,7 +55,7 @@ describe("settingsProjection", () => {
       chatTranscriptFullWidth: true,
       llmDebugLogs: false,
       runtimeEnablement: { docker: false },
-      defaultRuntime: "worktree",
+      defaultIsolation: { project: "local", workspace: "worktree" },
     } satisfies Partial<ProjectsConfig>;
     const config: ProjectsConfig = {
       projects: new Map([["/repo", { workspaces: [] }]]),
@@ -80,8 +66,7 @@ describe("settingsProjection", () => {
       coderWorkspaceArchiveBehavior: "delete",
       terminalDefaultShell: "/bin/fish",
       updateChannel: "nightly",
-      muxGovernorUrl: "https://governor.example.com",
-      muxGovernorToken: "governor-secret",
+      keepScreenAwake: true,
       heartbeatDefaultPrompt: "Check in",
       routePriority: ["anthropic"],
       routeOverrides: { "anthropic:claude-exec": "direct" },
@@ -92,8 +77,7 @@ describe("settingsProjection", () => {
 
     const projected = projectBackupSettings(config);
 
-    expect(projected).toEqual({ ...portable, layoutPresets: null });
-    expect(JSON.stringify(projected)).not.toContain("governor-secret");
+    expect(projected).toEqual(portable);
     // A copy, not a view: editing the projection must not reach the live config.
     expect(projected.agentAiDefaults).not.toBe(config.agentAiDefaults);
   });
@@ -107,7 +91,6 @@ describe("settingsProjection", () => {
         projects: new Map(),
         agentAiDefaults: {},
         hiddenModels: undefined,
-        layoutPresets: DEFAULT_LAYOUT_PRESETS_CONFIG,
         chatTranscriptFullWidth: undefined,
         taskSettings: DEFAULT_TASK_SETTINGS,
         goalDefaults: DEFAULT_GOAL_DEFAULTS,
@@ -124,11 +107,9 @@ describe("settingsProjection", () => {
       projects: new Map(),
       agentAiDefaults: { exec: { modelString: "openai:gpt-local" } },
       modelFallbacks: { "openai:gpt-local": { models: ["anthropic:claude-exec"] } },
-      advisorModelString: "openai:gpt-advisor",
-      advisorMaxUsesPerTurn: 2,
       chatTranscriptFullWidth: true,
+      defaultIsolation: { project: "local", workspace: "docker" },
       defaultRuntime: "docker",
-      layoutPresets: { version: 2, slots: [{ slot: 1 }] },
       apiServerPort: 4321,
     };
 
@@ -139,32 +120,26 @@ describe("settingsProjection", () => {
 
     expect(merged.agentAiDefaults).toEqual({});
     expect(merged.modelFallbacks).toBeUndefined();
-    expect(merged.advisorModelString).toBeUndefined();
-    expect(merged.advisorMaxUsesPerTurn).toBe(ADVISOR_DEFAULT_MAX_USES_PER_TURN);
     expect(merged.chatTranscriptFullWidth).toBe(false);
+    expect(merged.defaultIsolation).toBeUndefined();
+    // The legacy mirror goes with it, or load would resolve the default from it again.
     expect(merged.defaultRuntime).toBeUndefined();
-    expect(merged.layoutPresets).toBeUndefined();
     expect(merged.apiServerPort).toBe(4321);
     // The round trip closes: the restored target exports what the source exported.
     expect(projectBackupSettings(merged)).toEqual(UNSET_EXPORT);
   });
 
-  it("keeps the advisor's unlimited cap distinct from its default", () => {
-    // A source at the default cap must not restore as unlimited, and unlimited must survive.
-    const unlimited = projectBackupSettings({ projects: new Map(), advisorMaxUsesPerTurn: null });
-    expect(unlimited.advisorMaxUsesPerTurn).toBeNull();
-    const target: ProjectsConfig = { projects: new Map(), advisorMaxUsesPerTurn: null };
-    const fromDefault = readBackupSettings({
-      settings: projectBackupSettings({ projects: new Map() }),
-    }).settings!;
-    expect(mergeBackupSettings(target, fromDefault).advisorMaxUsesPerTurn).toBe(
-      ADVISOR_DEFAULT_MAX_USES_PER_TURN
+  it("restores the default isolation together with the legacy runtime older builds read", () => {
+    const merged = mergeBackupSettings(
+      {
+        projects: new Map(),
+        defaultIsolation: { project: "local", workspace: "docker" },
+        defaultRuntime: "docker",
+      },
+      { defaultIsolation: { project: "local", workspace: "worktree" } }
     );
-    const fromUnlimited = readBackupSettings({ settings: unlimited }).settings!;
-    expect(
-      mergeBackupSettings({ projects: new Map(), advisorMaxUsesPerTurn: 5 }, fromUnlimited)
-        .advisorMaxUsesPerTurn
-    ).toBeNull();
+    expect(merged.defaultIsolation).toEqual({ project: "local", workspace: "worktree" });
+    expect(merged.defaultRuntime).toBe("worktree");
   });
 
   it("replaces the keys a sparse block carries and keeps the rest of the local config", () => {
@@ -184,7 +159,6 @@ describe("settingsProjection", () => {
         agentAiDefaults: { plan: { modelString: "anthropic:claude-plan" } },
         hiddenModels: [],
         taskSettings: { maxParallelAgentTasks: 2 },
-        layoutPresets: { version: 2, slots: [] },
       },
     }).settings!;
     const merged = mergeBackupSettings(current, sparse);
@@ -195,7 +169,6 @@ describe("settingsProjection", () => {
     expect(merged.apiServerPort).toBe(4321);
     expect(merged.terminalDefaultShell).toBe("/bin/fish");
     expect(merged.taskSettings).toEqual({ ...DEFAULT_TASK_SETTINGS, maxParallelAgentTasks: 2 });
-    expect(merged.layoutPresets).toBeUndefined();
     expect(merged.migrations).toEqual({
       daybreakModelsHidden: true,
       hiddenModelsInitialized: true,
@@ -276,34 +249,20 @@ describe("settingsProjection", () => {
       settings: {
         agentAiDefaults: { exec: { thinkingLevel: "bogus" } },
         heartbeatDefaultIntervalMs: 1,
-        // The on-disk schema leaves this key unknown; a version this build cannot migrate would
-        // otherwise normalize to empty and delete the target's presets.
-        layoutPresets: { version: 3, slots: [{ slot: 1 }] },
         defaultModel: "anthropic:claude-plan",
       },
     });
-    expect(read.unsupported).toEqual([
-      "agentAiDefaults",
-      "heartbeatDefaultIntervalMs",
-      "layoutPresets",
-    ]);
+    expect(read.unsupported).toEqual(["agentAiDefaults", "heartbeatDefaultIntervalMs"]);
     expect(read.settings).toEqual({ defaultModel: "anthropic:claude-plan" });
-    for (const layoutPresets of ["garbage", { version: 2, slots: "corrupt" }]) {
-      expect(readBackupSettings({ settings: { layoutPresets } }).unsupported).toEqual([
-        "layoutPresets",
-      ]);
-    }
 
     const current: ProjectsConfig = {
       projects: new Map(),
       agentAiDefaults: { exec: { modelString: "openai:gpt-local" } },
       heartbeatDefaultIntervalMs: 900_000,
-      layoutPresets: { version: 2, slots: [{ slot: 1 }] },
     };
     const merged = mergeBackupSettings(current, read.settings!);
     expect(merged.agentAiDefaults).toEqual(current.agentAiDefaults);
     expect(merged.heartbeatDefaultIntervalMs).toBe(900_000);
-    expect(merged.layoutPresets).toEqual(current.layoutPresets);
     expect(merged.defaultModel).toBe("anthropic:claude-plan");
 
     expect(readBackupSettings({ settings: null })).toEqual({
@@ -320,7 +279,6 @@ describe("settingsProjection", () => {
       hiddenModels: ["anthropic:claude-plan", "garbage"],
       modelFallbacks: { "openai:gpt-a": { models: ["openai:gpt-a"] } },
       runtimeEnablement: { "runtime-from-a-newer-build": false },
-      layoutPresets: { version: 2, slots: [{ slot: 1, keybindOverride: { key: "a" } }] },
     };
     const read = readBackupSettings({ settings: rejected });
     expect(read.unsupported).toEqual(Object.keys(rejected));
@@ -342,7 +300,6 @@ describe("settingsProjection", () => {
           hiddenModels: [],
           modelFallbacks: {},
           runtimeEnablement: {},
-          layoutPresets: { version: 2, slots: [] },
         },
       })
     ).toEqual({
@@ -351,7 +308,6 @@ describe("settingsProjection", () => {
         hiddenModels: [],
         modelFallbacks: null,
         runtimeEnablement: null,
-        layoutPresets: null,
       },
       unsupported: [],
     });
@@ -371,7 +327,6 @@ describe("settingsProjection", () => {
     for (const agentAiDefaults of [
       { exec: { modelString: "garbage" } },
       { exec: { modelString: "openai:gpt-exec", subagent: { modelString: "garbage" } } },
-      { plan: { modelString: "mux-gateway:openai" } },
     ]) {
       const read = readBackupSettings({
         settings: { agentAiDefaults, defaultModel: "anthropic:claude-plan" },
