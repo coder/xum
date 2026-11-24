@@ -156,11 +156,20 @@ final class WorkspaceInfoStore {
         usageLoaded = true
     }
 
-    /// Follows the timing snapshot stream until the calling task is cancelled.
+    /// Follows the timing snapshot stream until the calling task is cancelled, reconnecting
+    /// with backoff when it drops.
     func followTiming() async {
-        do {
-            for try await ev in client.subscribe("workspace/stats/subscribe", ws) { timing = TimingStats(json: ev) }
-        } catch {}
+        var backoff: UInt64 = 1
+        while !Task.isCancelled {
+            do {
+                for try await ev in client.subscribe("workspace/stats/subscribe", ws) {
+                    backoff = 1
+                    timing = TimingStats(json: ev)
+                }
+            } catch {}
+            try? await Task.sleep(nanoseconds: backoff * 1_000_000_000)
+            backoff = min(backoff * 2, 15)
+        }
     }
 
     func loadArtifacts() async {

@@ -52,22 +52,40 @@ final class AppModel {
 
     /// A server with only local or custom models must not get a fixed Anthropic default: its
     /// first send would be refused. The server's own default wins, else its first usable model.
-    func loadModels() async {
-        guard let c = servers.currentClient else { return }
+    /// Returns false when the server could not be asked (worth retrying).
+    @discardableResult
+    func loadModels() async -> Bool {
+        guard let c = servers.currentClient else { return true }
         let serverID = servers.currentID
-        guard let providers = try? await c.call("providers/getConfig") else { return }
+        guard let providers = try? await c.call("providers/getConfig") else { return false }
         let serverDefault = (try? await c.call("config/getConfig"))?["defaultModel"]?.string
         // A switch while these calls ran started a newer load for the new server.
-        guard servers.currentID == serverID else { return }
+        guard servers.currentID == serverID else { return true }
         var models = ModelName.catalog(providers: providers)
         // The server's own default is valid by its routing even when this catalog misses it.
         if let d = serverDefault, !d.isEmpty, !models.contains(d) { models.insert(d, at: 0) }
         serverModels = models
-        guard !models.isEmpty else { return }
+        guard !models.isEmpty else { return true }
         if let d = serverDefault, models.contains(d) {
             defaultModel = d
         } else if !models.contains(defaultModel) {
             defaultModel = models[0]
+        }
+        return true
+    }
+
+    private var modelsTask: Task<Void, Never>?
+
+    /// A brief outage at connect must not leave the previous server's default and the built-in
+    /// catalog in place: retry with backoff until the server answers (or another server is picked).
+    private func startLoadingModels() {
+        modelsTask?.cancel()
+        modelsTask = Task { [weak self] in
+            var delay: UInt64 = 1
+            while let self, !Task.isCancelled, !(await self.loadModels()) {
+                try? await Task.sleep(nanoseconds: delay * 1_000_000_000)
+                delay = min(delay * 2, 30)
+            }
         }
     }
     var defaultAgent = "exec"
@@ -97,7 +115,7 @@ final class AppModel {
         list = l
         l.start()
         serverModels = []
-        Task { await loadModels() }
+        startLoadingModels()
     }
 
     func switchServer(_ id: String) {

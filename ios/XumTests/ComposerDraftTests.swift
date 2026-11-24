@@ -119,6 +119,24 @@ struct ComposerDraftTests {
         server.finishSend()
     }
 
+    @Test(arguments: [("hellonext", true), ("help", false)])
+    func keysTypedDuringTheLookupFollowTheSentText(typed: String, typedAfter: Bool) async throws {
+        let server = FakeServer()
+        server.holdLookups = true
+        let d = draft(server)
+        d.setText("hello")
+        let send = Task { try await d.send(message: "hello", options: [:]) }
+        await settle()
+        d.setText(typed)
+        server.releaseLookups()
+        try await send.value
+        let begun = try #require(server.bodies("drafts/beginSend").first)
+        #expect(begun["text"]?.string == typed)
+        // Only an append keeps the sent text a prefix the backend can cut exactly.
+        #expect((begun["localTake"]?["kind"]?.string == "typed-after") == typedAfter)
+        server.finishSend()
+    }
+
     @Test func anInFlightSendIsNeverLookedUp() async throws {
         let server = FakeServer()
         let d = draft(server)

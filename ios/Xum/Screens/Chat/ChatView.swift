@@ -17,6 +17,9 @@ struct ChatView: View {
         pickedModel.flatMap { model.modelChoices.contains($0) ? $0 : nil } ?? model.defaultModel
     }
     @State private var thinking: ThinkingLevel = .medium
+    /// The user picked an agent, model or thinking level here: the workspace's saved settings
+    /// no longer replace the composer's.
+    @State private var settingsEdited = false
     /// The inspected call is looked up in the store on each render, so a call that is still
     /// running keeps its output and state current in the open inspector.
     @State private var selectedToolId: String?
@@ -66,6 +69,9 @@ struct ChatView: View {
         // back in the composer, then let the server drop its held copy.
         .onChange(of: store?.restoredInput?.seq) { takeRestoredInput() }
         .onChange(of: model.unsentFirstMessages[workspaceId] != nil) { takeUnsentFirstMessage() }
+        // A chat opened right after create or fork gets its metadata later, and the first send
+        // saves its agent and settings after that.
+        .onChange(of: savedSettings) { if !settingsEdited { seedSettings() } }
         // Opening a chat does not answer it: rescan so a question or plan stays in the Inbox.
         .onDisappear { if let list = model.list { Task { await list.scan(workspaceId) } } }
         // Regular width (iPhone Duo inner display): the tool detail is a persistent side panel
@@ -149,6 +155,8 @@ struct ChatView: View {
               let content = r["data"]?["content"]?.string, store?.latestPlanToolId == toolId else { return }
         planFile = (toolId, content)
     }
+
+    private var savedSettings: [JSONValue?] { [workspace?.raw["agentId"], workspace?.raw["aiSettingsByAgent"]] }
 
     /// Agent/model/thinking start from the workspace's last selected agent (metadata `agentId`)
     /// and its saved per-agent settings, then app defaults.
@@ -343,6 +351,7 @@ struct ChatView: View {
                 fileContent: planFile?.toolId == tool.id ? planFile?.content : nil,
                 onImplement: {
                     // The composer moves to Exec with it, so the next message does not go back to Plan.
+                    settingsEdited = true
                     applySettings(for: "exec")
                     implementing = true
                     let file = planFile?.toolId == tool.id ? planFile?.content : nil
@@ -390,9 +399,9 @@ struct ChatView: View {
                 Composer(
                     text: Binding(get: { store.draft.text }, set: { store.draft.setText($0) }),
                     // Each agent has its own saved model and thinking, as Implement applies them.
-                    agent: Binding(get: { agent }, set: { if $0 != agent { applySettings(for: $0) } }),
-                    modelId: Binding(get: { modelId }, set: { pickedModel = $0 }),
-                    thinking: $thinking,
+                    agent: Binding(get: { agent }, set: { if $0 != agent { settingsEdited = true; applySettings(for: $0) } }),
+                    modelId: Binding(get: { modelId }, set: { settingsEdited = true; pickedModel = $0 }),
+                    thinking: Binding(get: { thinking }, set: { settingsEdited = true; thinking = $0 }),
                     placeholder: store.isStreaming ? "Queue a follow-up" : "Message \(workspace?.displayName ?? "agent")",
                     isStreaming: store.isStreaming,
                     contextFraction: store.contextTokens.map { min(1, Double($0) / Double(ModelName.contextWindow(store.lastModel ?? modelId))) },

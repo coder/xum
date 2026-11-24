@@ -50,6 +50,9 @@ final class ComposerDraft {
     private var receiverId: String?
     private var issuing: Set<String> = []
     private var lookingUpReceiver = false
+    /// The web's send mark (#6405): the text the last edit wrote while a send looks up its
+    /// receiver, and whether every edit since the tap only appended to the sent text.
+    private var sendMark: (last: String, intact: Bool)?
     private var resending: [String: String] = [:]
     private var lastStatus: [String: String] = [:]
     /// Answers for sends whose reply just came back, kept until their sender reads them (the
@@ -154,6 +157,7 @@ final class ComposerDraft {
 
     func setText(_ new: String) {
         guard new != text else { return }
+        if let m = sendMark { sendMark = (new, m.intact && text == m.last && new.hasPrefix(m.last)) }
         text = new
         edit += 1
         scheduleWrite()
@@ -212,6 +216,7 @@ final class ComposerDraft {
         // runs would send the same text again under another id.
         guard !lookingUpReceiver else { return }
         lookingUpReceiver = true
+        sendMark = (text, text == message)
         retriesStopped = false
         retryAttempt = 0
         let receiver: String
@@ -219,9 +224,15 @@ final class ComposerDraft {
             receiver = try await currentReceiver()
         } catch {
             lookingUpReceiver = false
+            sendMark = nil
             throw error
         }
         lookingUpReceiver = false
+        // Keys typed during the lookup follow the sent text: take exactly that prefix, and let
+        // the backend repeat that take (localTake) instead of its whitespace rule, which cannot
+        // split `hello` from `hellonext`.
+        let typedAfter = sendMark.map { $0.intact && $0.last == text } ?? false
+        sendMark = nil
         let sendId = UUID().uuidString.lowercased()
         var request: [String: JSONValue] = options
         request.removeValue(forKey: "sendId")
@@ -231,18 +242,21 @@ final class ComposerDraft {
         writeTask?.cancel()
         issuing.insert(sendId)
         // The composer shows what the user types from here on; the draft write takes the sent text.
-        text = ""
+        let after = typedAfter ? String(visible.dropFirst(message.count)) : ""
+        text = after
         edit += 1
         let taken = edit
+        var body: [String: JSONValue] = [
+            "scope": scope,
+            "pendingSend": ["sendId": .string(sendId), "receiverId": .string(receiver), "text": .string(message),
+                            "attachmentIds": [], "request": pending.request],
+            "attachments": [],
+            "text": .string(visible),
+            "basisSends": basisSends,
+        ]
+        if typedAfter { body["localTake"] = ["kind": "typed-after"] }
         do {
-            let v = try await call("drafts/beginSend", [
-                "scope": scope,
-                "pendingSend": ["sendId": .string(sendId), "receiverId": .string(receiver), "text": .string(message),
-                                "attachmentIds": [], "request": pending.request],
-                "attachments": [],
-                "text": .string(visible),
-                "basisSends": basisSends,
-            ])
+            let v = try await call("drafts/beginSend", .object(body))
             if edit == taken { savedEdit = taken }
             applyView(v)
             if dirty { scheduleWrite() }
@@ -251,7 +265,8 @@ final class ComposerDraft {
             // The write may have landed with its reply lost: show the text again, and let the
             // next write and lookup settle the entry the backend may hold.
             undone[sendId] = pending
-            text = Self.join(visible, text)
+            // Keys typed after the take still follow the sent text.
+            text = !after.isEmpty && text.hasPrefix(after) ? message + text : Self.join(visible, text)
             edit += 1
             scheduleWrite()
             throw error
