@@ -117,7 +117,8 @@ function isCanonical(key: BackedUpSettingsKey, value: unknown): boolean {
  * Per-key on-disk schemas rather than one picked object: the on-disk schema is passthrough,
  * which would carry any key of a repository-controlled document into the config. Where
  * normalization keeps values lookups can never match, the schema is tightened: a per-model
- * floor needs a model-string key, and a fallback chain model-string sources and targets.
+ * floor needs a model-string key, a fallback chain model-string sources and targets, and the
+ * evaluator a model string. (Auto routing's schema already checks its models.)
  */
 const isModelString = (model: string) => normalizeOptionalModelString(model) === model;
 
@@ -132,6 +133,9 @@ const FIELD_SCHEMA_OVERRIDES: Partial<Record<BackedUpSettingsKey, z.ZodType>> = 
         ([source, chain]) => isModelString(source) && chain.models.every(isModelString)
       )
     ),
+  evaluationDefaults: AppConfigOnDiskSchema.shape.evaluationDefaults
+    .unwrap()
+    .refine((value) => value.model === undefined || isModelString(value.model)),
 };
 
 function isSupported(key: BackedUpSettingsKey, value: unknown): boolean {
@@ -167,6 +171,15 @@ export function projectBackupSettings(config: ProjectsConfig): BackupSettings {
   return copyJson(projected);
 }
 
+/**
+ * A key this build has never heard of is most likely a newer build's portable setting, so the
+ * user should hear the restore kept the local value. Keys this build knows and keeps local (an
+ * older export's heartbeat prompt) stay silent.
+ */
+function unknownSettingsKeys(block: Record<string, unknown>): string[] {
+  return Object.keys(block).filter((key) => !(key in AppConfigOnDiskSchema.shape));
+}
+
 /** Reads the `settings` block of a preferences document. */
 export function readBackupSettings(document: unknown): BackupSettingsRead {
   if (!isPlainObject(document) || document.settings === undefined) {
@@ -187,7 +200,7 @@ export function readBackupSettings(document: unknown): BackupSettingsRead {
       unsupported.push(key);
     }
   }
-  return { settings, unsupported };
+  return { settings, unsupported: [...unsupported, ...unknownSettingsKeys(block)] };
 }
 
 /** Each key the block carries replaces the local value; keys it lacks keep the local value. */

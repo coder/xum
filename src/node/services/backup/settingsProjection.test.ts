@@ -228,7 +228,12 @@ describe("settingsProjection", () => {
           runtimeEnablement: { worktree: false },
         },
       })
-    ).toEqual({ settings: { defaultModel: "anthropic:claude-plan" }, unsupported: [] });
+    ).toEqual({
+      settings: { defaultModel: "anthropic:claude-plan" },
+      // Keys this build has no setting for may be a newer build's portable settings, so the
+      // restore names them; known local keys stay silent.
+      unsupported: ["muxGovernorToken", "unknownKey"],
+    });
   });
 
   it("keeps the local value for fields this build does not understand and names them", () => {
@@ -314,6 +319,7 @@ describe("settingsProjection", () => {
         { ...routing, tiers: [{ ...tier, fieldFromANewerBuild: true }, ...routing.tiers.slice(1)] },
       ],
       ["evaluationDefaults", {}],
+      ["evaluationDefaults", { model: "garbage" }],
     ] as const) {
       expect(readBackupSettings({ settings: { [key]: value } })).toEqual({
         settings: {},
