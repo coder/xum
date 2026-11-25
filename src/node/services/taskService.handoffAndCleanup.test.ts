@@ -1900,6 +1900,7 @@ describe("TaskService", () => {
       const report = await waiter;
       expect(report).toEqual({
         reportMarkdown: "# Proposed workflow plan\n\nDo the tiny safe change.\n",
+        carriesProjectSkillContent: false,
         title: "Proposed plan",
         planFilePath: planPath,
         model: "openai:gpt-4o-mini",
@@ -1988,6 +1989,7 @@ describe("TaskService", () => {
       const report = await taskService.waitForAgentReport(childId, { timeoutMs: 5_000 });
       expect(report).toEqual({
         reportMarkdown: "# Interrupted workflow plan\n\nStill complete.\n",
+        carriesProjectSkillContent: false,
         title: "Proposed plan",
         planFilePath: planPath,
         model: "openai:gpt-4o-mini",
@@ -3087,7 +3089,11 @@ describe("TaskService", () => {
       timeoutMs: 10,
       requestingWorkspaceId: parentId,
     });
-    expect(report).toEqual({ reportMarkdown: "real report", title: "done" });
+    expect(report).toEqual({
+      carriesProjectSkillContent: true,
+      reportMarkdown: "real report",
+      title: "done",
+    });
   });
 
   test("handoff kickoff sendMessage failure keeps task status as running for restart recovery", async () => {

@@ -128,6 +128,33 @@ export interface SettledStepOutcome {
 export type OnStepSettled = (step: SettledStepBudget) => Promise<SettledStepOutcome>;
 
 /**
+ * Context handed to a routed project-skill turn's consent gate. `midStream`
+ * marks a per-step (prepareStep) invocation, whose refusal surfaces through
+ * the stream's own error path; `stepMessages` are that step's provider-facing
+ * messages — tool results appended by EARLIER steps of the same stream can
+ * carry project skill content the request scan at assembly never saw.
+ */
+export interface PreDispatchConsentGateContext {
+  midStream?: boolean;
+  stepMessages?: readonly ModelMessage[];
+  /**
+   * A continuous-compaction prefix swapped into this stream carries project
+   * skill content kept under trust (ContinuousPrefixSwap.carriesProjectSkillContent):
+   * its rows are ModelMessages the step scan cannot classify.
+   */
+  swappedPrefixCarriesProjectSkillContent?: boolean;
+  /**
+   * The request's tool descriptions advertise project-scope skills kept under
+   * trust (agent_skill_read lists each skill's repository-controlled
+   * description): project content no row of the request carries.
+   */
+  toolDescriptionsCarryProjectSkillContent?: boolean;
+}
+export type PreDispatchConsentGate = (
+  context?: PreDispatchConsentGateContext
+) => Promise<SendMessageError | null>;
+
+/**
  * Per-model request pieces for a refusal-fallback swap, rebuilt by TurnRequestBuilder so
  * provider-specific message preparation, provider options, and headers match a
  * first-class send of the fallback model (reusing the source model's request
@@ -273,6 +300,8 @@ export interface StreamRequestConfig {
   model: LanguageModel;
   modelString: string;
   messages: ModelMessage[];
+  /** Per-step consent verdict for routed project-skill turns (see StreamRequestOptions). */
+  preDispatchConsentGate?: PreDispatchConsentGate;
   /** Provider-ready system instructions from TurnContextAssembler. */
   system?: Instructions;
   tools?: Record<string, Tool>;

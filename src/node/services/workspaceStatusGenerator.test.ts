@@ -1,6 +1,8 @@
 import * as http from "node:http";
 import type { AddressInfo } from "node:net";
+import type { LanguageModel } from "ai";
 import { afterEach, beforeEach, describe, expect, spyOn, test } from "bun:test";
+import { Ok } from "@/common/types/result";
 import { Config, ProvidersConfigStore } from "@/node/config";
 import { AIService } from "./aiService";
 import { HistoryService } from "./historyService";
@@ -84,6 +86,48 @@ describe("generateWorkspaceStatus error paths", () => {
       // retrying so a future config change recovers without a new message.
       expect(result.error.reachedProvider).toBe(false);
     }
+  });
+
+  test("aborts before the provider request when the transcript went stale during model creation", async () => {
+    // The caller re-verifies its transcript before calling, but model
+    // construction is an await of its own: the re-verification passed in as
+    // beforeDispatch runs after it, and a stale verdict must stop the whole
+    // generation — no request, no further candidate with the same text.
+    let created = 0;
+    const fakeAiService = {
+      getProvidersConfig: () => ({}),
+      createModelWithPinnedOptions: (modelString: string) => {
+        created += 1;
+        return Promise.resolve(
+          Ok({
+            model: {
+              doStream: () => {
+                throw new Error("the stale transcript must not be sent");
+              },
+            } as unknown as LanguageModel,
+            metadataModel: "test:model",
+            // The options snapshot the model was created from: the same thinking level.
+            optionsModelString: modelString,
+            optionsProvidersConfig: {},
+          })
+        );
+      },
+    } as unknown as Parameters<typeof generateWorkspaceStatus>[2];
+
+    const result = await generateWorkspaceStatus(
+      "hello",
+      ["test:model", "test:other"],
+      fakeAiService,
+      {
+        beforeDispatch: () => Promise.resolve(false),
+      }
+    );
+    expect(result.success).toBe(false);
+    if (!result.success) {
+      expect(result.error.staleTranscript).toBe(true);
+      expect(result.error.reachedProvider).toBe(false);
+    }
+    expect(created).toBe(1);
   });
 });
 

@@ -745,6 +745,13 @@ export const SETTING_DEFINITIONS = {
     description: "When a model refuses to respond, retry the turn with other models in order.",
     keywords: ["refuses", "retry", "fallback chain"],
   },
+  "model-classes": {
+    section: "models",
+    label: "Model classes",
+    description:
+      "Size classes for per-skill model routing: a skill bound to a class runs on its model.",
+    keywords: ["skill", "skills", "model class", "routing", "frontmatter"],
+  },
   "auto-routing": {
     section: "models",
     label: "Auto routing tiers",
