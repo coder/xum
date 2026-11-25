@@ -109,9 +109,11 @@ describe("Config snapshots", () => {
       const after = config.loadConfigOrDefault();
       expect(after.projects.get(projectPath)?.workspaces[0].title).toBe("Changed");
       expect(before.projects.get(projectPath)?.workspaces[0].title).toBeUndefined();
+      // The edit's read, the byte comparison before its rename (assertConfigFileUnchanged), and
+      // the reload.
       expect(
         read.mock.calls.filter(([file]) => file === path.join(root, "config.json"))
-      ).toHaveLength(2);
+      ).toHaveLength(3);
       expect(await config.configFileWriteGeneration()).not.toBe(generation);
       expect(config.loadConfigOrDefault()).toBe(after);
     } finally {
@@ -375,7 +377,9 @@ describe("Config snapshots", () => {
       expect(readerTurns).toBeGreaterThan(1);
       // The floor: the edit's fresh read under the lock, and one read that publishes the
       // saved file. Dropping still-valid snapshots made it 4.
-      expect(read.mock.calls.filter(([file]) => file === configPath)).toHaveLength(2);
+      // Two parses (the edit's read and the reload) and the byte comparison before the edit's
+      // rename (assertConfigFileUnchanged).
+      expect(read.mock.calls.filter(([file]) => file === configPath)).toHaveLength(3);
     } finally {
       reading = false;
       read.mockRestore();
@@ -951,11 +955,11 @@ describe("Config snapshots", () => {
         "getWorkspaceMetadataById(last id)":
           "1 31 1 1 | 0 1 1 0 | 0 1 1 0 | 1 31 1 1 | 0 1 1 0 | 1 31 1 1 | 0 1 1 0",
         "editConfig, same-value edit":
-          "0 54 1 2 | 0 54 1 2 | 0 54 1 2 | 0 54 1 2 | 0 54 1 2 | 0 54 1 2 | 0 54 1 2",
+          "0 54 1 3 | 0 54 1 3 | 0 54 1 3 | 0 54 1 3 | 0 54 1 3 | 0 54 1 3 | 0 54 1 3",
         "editConfig, then loadConfigOrDefault":
-          "0 78 2 3 | 0 54 2 2 | 0 54 2 2 | 0 78 2 3 | 0 54 2 2 | 0 78 2 3 | 0 54 2 2",
+          "0 78 2 4 | 0 54 2 3 | 0 54 2 3 | 0 78 2 4 | 0 54 2 3 | 0 78 2 4 | 0 54 2 3",
         "editConfig, reader on every event-loop turn":
-          "0 78 1 3 | 0 54 1 2 | 0 54 1 2 | 0 78 1 3 | 0 54 1 2 | 0 78 1 3 | 0 54 1 2",
+          "0 78 1 4 | 0 54 1 3 | 0 54 1 3 | 0 78 1 4 | 0 54 1 3 | 0 78 1 4 | 0 54 1 3",
       });
     });
 
@@ -969,19 +973,19 @@ describe("Config snapshots", () => {
         "findWorkspace(last id)":
           "1 35 1 1 | 0 0 1 0 | 0 0 1 0 | 1 35 1 1 | 0 0 1 0 | 1 35 1 1 | 0 0 1 0",
         "getAllWorkspaceMetadata, full build":
-          "0 71 2 2 | 0 35 1 1 | 0 7 1 0 | 0 35 1 1 | 0 7 1 0 | 0 35 1 1 | 0 7 1 0",
+          "0 71 2 3 | 0 35 1 1 | 0 7 1 0 | 0 35 1 1 | 0 7 1 0 | 0 35 1 1 | 0 7 1 0",
         "getAllWorkspaceMetadata, last-known probes":
-          "0 71 2 2 | 0 35 1 1 | 0 7 1 0 | 0 35 1 1 | 0 7 1 0 | 0 35 1 1 | 0 7 1 0",
+          "0 71 2 3 | 0 35 1 1 | 0 7 1 0 | 0 35 1 1 | 0 7 1 0 | 0 35 1 1 | 0 7 1 0",
         "getAllWorkspaceMetadata, registry memo":
-          "0 71 2 2 | 0 35 1 1 | 0 0 1 0 | 0 35 1 1 | 0 0 1 0 | 0 35 1 1 | 0 0 1 0",
+          "0 71 2 3 | 0 35 1 1 | 0 0 1 0 | 0 35 1 1 | 0 0 1 0 | 0 35 1 1 | 0 0 1 0",
         "getWorkspaceMetadataById(last id)":
           "1 36 1 1 | 0 1 1 0 | 0 1 1 0 | 1 36 1 1 | 0 1 1 0 | 1 36 1 1 | 0 1 1 0",
         "editConfig, same-value edit":
-          "0 63 1 2 | 0 63 1 2 | 0 63 1 2 | 0 63 1 2 | 0 63 1 2 | 0 63 1 2 | 0 63 1 2",
+          "0 63 1 3 | 0 63 1 3 | 0 63 1 3 | 0 63 1 3 | 0 63 1 3 | 0 63 1 3 | 0 63 1 3",
         "editConfig, then loadConfigOrDefault":
-          "0 91 2 3 | 0 63 2 2 | 0 63 2 2 | 0 91 2 3 | 0 63 2 2 | 0 91 2 3 | 0 63 2 2",
+          "0 91 2 4 | 0 63 2 3 | 0 63 2 3 | 0 91 2 4 | 0 63 2 3 | 0 91 2 4 | 0 63 2 3",
         "editConfig, reader on every event-loop turn":
-          "0 91 1 3 | 0 63 1 2 | 0 63 1 2 | 0 91 1 3 | 0 63 1 2 | 0 91 1 3 | 0 63 1 2",
+          "0 91 1 4 | 0 63 1 3 | 0 63 1 3 | 0 91 1 4 | 0 63 1 3 | 0 91 1 4 | 0 63 1 3",
       });
     });
   });
