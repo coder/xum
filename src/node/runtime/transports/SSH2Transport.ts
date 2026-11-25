@@ -465,14 +465,23 @@ export class SSH2Transport implements SSHTransport {
   async openReverseForward(remotePort: number, localPort: number): Promise<ReverseForward> {
     // A dedicated connection, like OpenSSH's `ssh -N`: see openDedicatedConnection.
     const client = await ssh2ConnectionPool.openDedicatedConnection(this.config);
-    const closed = new Promise<void>((resolve) => client.once("close", () => resolve()));
+    let connectionClosed = false;
+    const closed = new Promise<void>((resolve) =>
+      client.once("close", () => {
+        connectionClosed = true;
+        resolve();
+      })
+    );
     routeForwardedConnections(client, localPort);
     try {
       await new Promise<void>((resolve, reject) => {
-        // forwardIn fails only when the host answers the request with a refusal.
-        client.forwardIn("127.0.0.1", remotePort, (err) =>
-          err ? reject(new ReverseForwardRefusedError(err.message)) : resolve()
-        );
+        client.forwardIn("127.0.0.1", remotePort, (err) => {
+          if (!err) return resolve();
+          // Only the host's own answer is a refusal. ssh2 fails a request that got no answer
+          // ("No response from server") through this same callback, but only after it emitted
+          // 'close'. That is a failed connection, which the proxy retries sooner than a refusal.
+          reject(connectionClosed ? err : new ReverseForwardRefusedError(err.message));
+        });
       });
     } catch (error) {
       client.destroy();

@@ -8,6 +8,7 @@ import { Server, utils, type Connection } from "ssh2";
 
 import type { SSHConnectionConfig } from "../sshConnectionPool";
 import { SSH2Transport } from "./SSH2Transport";
+import { ReverseForwardRefusedError } from "./SSHTransport";
 
 // ECDSA keys: ssh2's ed25519 generator emits an unparseable key ~0.4% of the time under Bun.
 const newPrivateKey = () => utils.generateKeyPairSync("ecdsa", { bits: 256 }).private;
@@ -26,7 +27,9 @@ afterEach(async () => {
 });
 
 /** An in-process sshd that accepts `tcpip-forward`, like a real host with forwarding on. */
-async function startSshServer(options: { refuseForward?: boolean } = {}): Promise<Harness> {
+async function startSshServer(
+  options: { refuseForward?: boolean; dropOnForward?: boolean } = {}
+): Promise<Harness> {
   let latest: Connection | undefined;
   const open = new Set<Connection>();
   const allClosed = () =>
@@ -43,6 +46,10 @@ async function startSshServer(options: { refuseForward?: boolean } = {}): Promis
     conn.on("request", (accept, reject, name, info) => {
       const bind = info as { bindAddr: string; bindPort: number };
       if (name === "tcpip-forward") {
+        if (options.dropOnForward) {
+          conn.end(); // the connection goes away before the request is answered
+          return;
+        }
         if (options.refuseForward) {
           reject?.();
           return;
@@ -132,7 +139,22 @@ describe("SSH2Transport.openReverseForward", () => {
     } catch (error) {
       failure = error;
     }
+    expect(failure).toBeInstanceOf(ReverseForwardRefusedError);
+  });
+
+  it("does not call a connection that drops before the answer a refusal", async () => {
+    // A refusal makes the proxy wait minutes before it asks this host again, a failed
+    // connection only seconds: only the host's own answer is a refusal.
+    const ssh = await startSshServer({ dropOnForward: true });
+    const transport = new SSH2Transport(ssh.config);
+    let failure: unknown;
+    try {
+      await transport.openReverseForward(24570, 1);
+    } catch (error) {
+      failure = error;
+    }
     expect(failure).toBeInstanceOf(Error);
+    expect(failure).not.toBeInstanceOf(ReverseForwardRefusedError);
   });
 
   it("settles closed when the SSH connection drops", async () => {
