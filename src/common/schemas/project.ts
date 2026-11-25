@@ -361,6 +361,10 @@ export const WorkspaceConfigSchema = z.object({
     description:
       "Set by a backend's archive of this workspace before it lists the sub-agents it cascades over or takes any destructive step. A sub-agent creation under it (or under any of its descendants) refuses while its owner process is live; the archive clears it when it commits or gives up.",
   }),
+  taskReportAttemptId: z.string().optional().meta({
+    description:
+      "The attempt whose report the row carries (att_ + 16 hex), written with `reportedAt` by every report. Server-owned. Lets the stream-end decision tell an attempt's own report from one it inherited, even when a failure turned the reported row interrupted and a report turned it back. Absent on rows reported before it existed.",
+  }),
   taskTerminalFailure: z.object({ attemptId: z.string(), errorType: z.string() }).optional().meta({
     description:
       "The attempt a terminal stream failure (e.g. model_refusal) ended, written with its interrupted status. Applies only while taskAttemptId still names that attempt.",

@@ -862,11 +862,14 @@ function normalizeProjectKind(value: unknown): "user" | "system" | undefined {
  * would read as a pre-identity entry). The bad value is replaced by a valid id derived from it —
  * identical on every load, so readers and CAS writers agree before and after the healed value is
  * persisted — and the attempt is marked unproven (its lineage cannot be vouched for). A non-task
- * row simply drops the value.
+ * row simply drops the value. A malformed report binding (`taskReportAttemptId`) is dropped.
  */
 function healMalformedTaskAttemptId(
   persisted: Record<string, unknown> & { id?: unknown; parentWorkspaceId?: unknown }
 ): void {
+  // A malformed report binding (hand edit, corruption) reads as absent: the stream-end decision
+  // then applies the status rule alone, as it does for every row reported before the field existed.
+  if (hasMalformedAttemptId(persisted.taskReportAttemptId)) delete persisted.taskReportAttemptId;
   if (!Object.hasOwn(persisted, "taskAttemptId") || persisted.taskAttemptId === undefined) return;
   if (isTaskAttemptId(persisted.taskAttemptId)) return;
   if (typeof persisted.parentWorkspaceId !== "string" || persisted.parentWorkspaceId.length === 0) {
@@ -879,6 +882,18 @@ function healMalformedTaskAttemptId(
     .digest("hex");
   persisted.taskAttemptId = `att_${digest.slice(0, 16)}`;
   persisted.taskAttemptUnproven = true;
+}
+
+function hasMalformedAttemptId(value: unknown): boolean {
+  return value !== undefined && !isTaskAttemptId(value);
+}
+
+/** The row's attempt id or its report binding is set and is not an attempt id. */
+function hasMalformedAttemptIds(persisted: Record<string, unknown>): boolean {
+  return (
+    hasMalformedAttemptId(persisted.taskAttemptId) ||
+    hasMalformedAttemptId(persisted.taskReportAttemptId)
+  );
 }
 
 /** #4983: the metadata flag for a delegated target the startup resolver flagged. */
@@ -928,8 +943,7 @@ function normalizePersistedWorkspace(
   const hasBestOf = Object.hasOwn(persisted, "bestOf");
   // Children read experiments from ExperimentsService; a spawn-time snapshot must not linger.
   const hasLegacyTaskExperiments = Object.hasOwn(persisted, "taskExperiments");
-  const hasMalformedTaskAttemptId =
-    persisted.taskAttemptId !== undefined && !isTaskAttemptId(persisted.taskAttemptId);
+  const hasMalformedTaskAttemptId = hasMalformedAttemptIds(persisted);
   // A malformed removal marker (hand edit, corruption) is dropped rather than kept: every task
   // admission refuses while one is set, and the removal could not judge its owner, so the
   // workspace could neither be used nor removed.
@@ -5846,6 +5860,8 @@ export class Config {
           taskPromptSendId: existing.taskPromptSendId,
           taskAttemptRetiredBy: existing.taskAttemptRetiredBy,
           taskTerminalFailure: existing.taskTerminalFailure,
+          // Written only by a report (with reportedAt): a metadata round trip never drops it.
+          taskReportAttemptId: existing.taskReportAttemptId,
           taskReservationTombstones: existing.taskReservationTombstones,
           pendingRemoval: existing.pendingRemoval,
           pendingArchive: existing.pendingArchive,
