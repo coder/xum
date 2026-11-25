@@ -47,6 +47,13 @@ const TAB_CONFIG_DEF = {
     defaultOrder: 30,
     paletteKeywords: ["agents", "agents.md", "claude.md", "instructions", "prompt", "context"],
   },
+  plan: {
+    description: "The plan the agent wrote for this chat",
+    name: "Plan",
+    contentClassName: "overflow-hidden p-0",
+    defaultOrder: 33,
+    paletteKeywords: ["plan", "propose_plan", "planning"],
+  },
   goal: {
     description: "Give the agent a goal and track its progress",
     name: "Goal",

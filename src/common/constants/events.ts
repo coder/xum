@@ -138,6 +138,12 @@ export const CUSTOM_EVENTS = {
   OPEN_GOAL_TAB: "mux:openGoalTab",
 
   /**
+   * Event to open the right-sidebar Plan tab ("/plan open", the Stats tab's plan row).
+   * Detail: { workspaceId: string; focus: boolean }
+   */
+  OPEN_PLAN_TAB: "mux:openPlanTab",
+
+  /**
    * Open (and focus) a New tab in the focused right-sidebar pane, the same path as "+" and the
    * keyboard shortcut. Detail: { workspaceId: string }
    */
@@ -230,6 +236,12 @@ export interface CustomEventPayloads {
     workspaceId: string;
     /** Set synchronously by the plan card that started the action. */
     handled: boolean;
+    /**
+     * Set with `handled`: settles with the action's failure message, or null when it started.
+     * The card shows a failure under itself; a caller that can cover the transcript (the narrow
+     * layout's full-screen Plan tab) reports it too.
+     */
+    outcome?: Promise<string | null>;
   };
   [CUSTOM_EVENTS.FOCUS_BACKGROUND_PROCESSES]: {
     workspaceId: string;
@@ -282,6 +294,11 @@ export interface CustomEventPayloads {
   [CUSTOM_EVENTS.OPEN_GOAL_TAB]: {
     workspaceId: string;
     openCompleteInput?: boolean;
+  };
+  [CUSTOM_EVENTS.OPEN_PLAN_TAB]: {
+    workspaceId: string;
+    /** The panel takes focus once it renders (see openPlanTab). */
+    focus: boolean;
   };
   [CUSTOM_EVENTS.OPEN_NEW_SIDEBAR_TAB]: {
     workspaceId: string;

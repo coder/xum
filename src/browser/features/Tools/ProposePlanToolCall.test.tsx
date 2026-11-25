@@ -1001,6 +1001,31 @@ describe("ProposePlanToolCall", () => {
       window.dispatchEvent(request);
       expect(request.detail.handled).toBe(true);
       await waitFor(() => expect(sendMessageCalls).toHaveLength(1));
+      expect(await request.detail.outcome).toBeNull();
+    });
+
+    test("a palette request's outcome settles with the action's failure", async () => {
+      startInPlanMode();
+      mockApi = createMockApi({
+        sendMessage: () =>
+          Promise.resolve({
+            success: false,
+            error: { type: "invalid_model_string", message: "Model openai:gpt-5.2 is not allowed" },
+          }),
+      });
+      const view = renderCompletedPlan();
+
+      const request = createCustomEvent(CUSTOM_EVENTS.RUN_LATEST_PLAN_ACTION, {
+        workspaceId: WORKSPACE_ID,
+        handled: false,
+      });
+      window.dispatchEvent(request);
+      expect(request.detail.handled).toBe(true);
+      expect(await request.detail.outcome).toContain("Model openai:gpt-5.2 is not allowed");
+      // The card still shows it under itself.
+      await waitFor(() =>
+        expect(view.getByRole("alert").textContent).toContain("Model openai:gpt-5.2 is not allowed")
+      );
     });
   });
 
