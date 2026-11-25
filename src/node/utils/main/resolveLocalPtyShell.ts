@@ -1,8 +1,8 @@
-import { spawnSync } from "child_process";
 import { accessSync, constants, statSync } from "fs";
 import path from "path";
 
 import { DEFAULT_WINDOWS_PATHEXT } from "@/constants/windowsPathExt";
+import { findExecutableOnPath } from "@/node/utils/findExecutableOnPath";
 import { getBashPath } from "@/node/utils/main/bashPath";
 
 export interface ResolvedPtyShell {
@@ -20,18 +20,10 @@ export interface ResolveLocalPtyShellParams {
   getBashPath: () => string;
 }
 
-function defaultIsCommandAvailable(platform: NodeJS.Platform): (command: string) => boolean {
+function defaultIsCommandAvailable(env: NodeJS.ProcessEnv): (command: string) => boolean {
   return (command: string) => {
-    if (!command) return false;
-
-    try {
-      const result = spawnSync(platform === "win32" ? "where" : "which", [command], {
-        stdio: "ignore",
-      });
-      return result.status === 0;
-    } catch {
-      return false;
-    }
+    if (!command || command.includes("/") || command.includes("\\")) return false;
+    return findExecutableOnPath(command, { env }) !== null;
   };
 }
 
@@ -144,7 +136,7 @@ export function resolveLocalPtyShell(
 ): ResolvedPtyShell {
   const platform = params.platform ?? process.platform;
   const env = params.env ?? process.env;
-  const isCommandAvailable = params.isCommandAvailable ?? defaultIsCommandAvailable(platform);
+  const isCommandAvailable = params.isCommandAvailable ?? defaultIsCommandAvailable(env);
   const isPathAccessible = params.isPathAccessible ?? defaultIsPathAccessible;
   const getBashPathFn = params.getBashPath ?? getBashPath;
 

@@ -284,7 +284,7 @@ export const ImmersiveMinimap: React.FC<ImmersiveMinimapProps> = (props) => {
   }
 
   return (
-    <div className="h-full w-6 shrink-0 bg-[var(--color-bg-dark)]" data-testid="immersive-minimap">
+    <div className="bg-dark h-full w-6 shrink-0" data-testid="immersive-minimap">
       <canvas
         ref={canvasRef}
         className="h-full w-full cursor-pointer"

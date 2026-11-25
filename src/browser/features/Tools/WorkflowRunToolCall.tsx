@@ -990,14 +990,14 @@ function WorkflowTaskReportDialogContent(props: {
           <span>Task report</span>
           <span className="text-muted flex flex-wrap items-baseline gap-2 text-[11px] font-normal">
             <span>{props.title}</span>
-            <code className="rounded bg-[var(--color-bg-tertiary)] px-1.5 py-0.5 font-mono text-[10px] leading-none">
+            <code className="bg-surface-tertiary rounded px-1.5 py-0.5 font-mono text-[10px] leading-none">
               {props.taskId}
             </code>
           </span>
         </DialogTitle>
       </DialogHeader>
 
-      <div className="min-h-0 flex-1 overflow-y-auto rounded bg-[var(--color-bg-secondary)] p-3">
+      <div className="bg-background-secondary min-h-0 flex-1 overflow-y-auto rounded p-3">
         <MarkdownRenderer content={props.reportMarkdown} />
       </div>
     </DialogContent>

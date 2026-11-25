@@ -414,7 +414,7 @@ export const BashToolCall: React.FC<BashToolCallProps> = ({
             <div className="flex items-center gap-2 text-[11px]">
               <Layers size={12} className="text-muted shrink-0" />
               <span className="text-muted">Background process</span>
-              <code className="rounded bg-[var(--color-bg-tertiary)] px-1.5 py-0.5 font-mono text-[10px]">
+              <code className="bg-surface-tertiary rounded px-1.5 py-0.5 font-mono text-[10px]">
                 {backgroundProcessId}
               </code>
             </div>

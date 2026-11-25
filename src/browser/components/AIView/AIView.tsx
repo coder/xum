@@ -40,11 +40,9 @@ const IncompatibleWorkspaceView: React.FC<{ message: string; className?: string 
       <div className="mb-4 flex justify-center">
         <AlertTriangle aria-hidden="true" className="text-warning h-10 w-10" />
       </div>
-      <h2 className="mb-2 text-xl font-semibold text-[var(--color-text-primary)]">
-        Incompatible Workspace
-      </h2>
-      <p className="mb-4 text-[var(--color-text-secondary)]">{message}</p>
-      <p className="text-sm text-[var(--color-text-tertiary)]">
+      <h2 className="text-content-primary mb-2 text-xl font-semibold">Incompatible Workspace</h2>
+      <p className="text-content-secondary mb-4">{message}</p>
+      <p className="text-muted text-sm">
         You can delete this workspace and create a new one, or upgrade xum to use it.
       </p>
     </div>

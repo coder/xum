@@ -3515,8 +3515,6 @@ export function getAvailableTools(
     enableReviewPane?: boolean;
     /** Whether task_apply_git_patch is available (false in scratch chats). Defaults to true. */
     enableGitPatches?: boolean;
-    /** @deprecated Xum global tools are always included. */
-    enableMuxGlobalAgentsTools?: boolean;
   } = {}
 ): string[] {
   const [provider] = modelString.split(":");

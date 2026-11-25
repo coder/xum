@@ -214,7 +214,6 @@
     --color-subtle: hsl(0 0% 60%); /* #999 - subtle */
     --color-dim: hsl(0 0% 42%); /* #666 - dimmed */
     --color-light: hsl(0 0% 83%); /* #d4d4d4 - light */
-    --color-text-lighter: hsl(0 0% 87%); /* #dddddd - lighter text */
     --color-lighter: hsl(0 0% 90%); /* #e5e5e5 - lighter */
     --color-bright: hsl(0 0% 80%); /* #cccccc - bright */
     --color-subdued: hsl(0 0% 60%); /* #9a9a9a - subdued */
@@ -358,8 +357,6 @@
        sidebar's overview card beside it on laptop widths (see globals.css). */
     --container-chat: 48rem;
   }
-
-  --plan-mode-rgb: 31, 107, 184;
 
   /* The folded iPhone Duo's cover display keeps an 84 pt status column on the right of its 466 pt
      width. iOS 27.1 reports it as `env(safe-area-inset-right)`; iOS 27.2 reports nothing and lays
