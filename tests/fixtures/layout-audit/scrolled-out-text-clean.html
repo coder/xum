@@ -1,0 +1,60 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width,initial-scale=1" />
+    <title>Text scrolled out of a panel, with an opaque block after the panel</title>
+    <style>
+      * {
+        box-sizing: border-box;
+      }
+      :root {
+        font-family: system-ui, sans-serif;
+        color: #1b2630;
+        background: #eef1f3;
+      }
+      body {
+        margin: 0;
+        padding: 24px;
+      }
+      main {
+        width: min(620px, 100%);
+        padding: 30px;
+        background: #fff;
+        border: 1px solid #bac6cd;
+      }
+      /* Taller than its box: the rows below the first two are scrolled out of sight. */
+      .list {
+        height: 110px;
+        overflow-y: auto;
+        border: 1px solid #aebbc4;
+      }
+      .list p {
+        margin: 0;
+        padding: 12px 18px;
+        font-size: 18px;
+        line-height: 1.3;
+      }
+      /* The block that fills the space where the scrolled-out rows would lie. */
+      .after {
+        height: 600px;
+        padding: 18px;
+        background: #fff;
+        border: 1px solid #aebbc4;
+      }
+    </style>
+  </head>
+  <body>
+    <main>
+      <h1>Activity</h1>
+      <div class="list">
+        <p>First: the nightly import finished without errors.</p>
+        <p>Second: three reports were shared with your team.</p>
+        <p>Third: your storage use went up by four percent.</p>
+        <p>Fourth: two sign-ins came from a new device today.</p>
+        <p>Fifth: the weekly summary is ready to download.</p>
+      </div>
+      <div class="after">Archive</div>
+    </main>
+  </body>
+</html>
