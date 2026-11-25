@@ -58,6 +58,16 @@ afterEach(() => {
   rmSync(repo, { recursive: true, force: true });
 });
 
+test("untracked source files are warned about, not silently skipped", () => {
+  write("src/demo/untracked.ts", "export const unused = 1;\n");
+
+  const result = check("HEAD");
+
+  expect(result.status).toBe(0);
+  expect(result.err).toContain("warning");
+  expect(result.err).toContain("src/demo/untracked.ts");
+});
+
 test("a renamed file keeps its functions' identity", () => {
   git("mv", "src/demo/route.ts", "src/demo/router.ts");
   git("commit", "-q", "-m", "rename");
