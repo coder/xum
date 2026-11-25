@@ -274,6 +274,26 @@ describe("BackupService against a real repository", () => {
     expect(allowed.success).toBe(true);
   });
 
+  it("holds a skill's Markdown file with JSON text and an escaped token until the exact payload is approved", async () => {
+    // A skill's .md file is published without review. The token follows `\n` in the JSON text,
+    // so no word boundary precedes it in the raw text.
+    const token = `ghp_${"a".repeat(36)}`;
+    const jsonText = JSON.stringify({ response: `line one\n${token}` });
+    await writeFixtureFile(muxRoot, "skills/demo/response.md", jsonText);
+
+    const blocked = await service.push(settings);
+    expect(blocked.success).toBe(false);
+    if (blocked.success) throw new Error("Expected the secret scan to block the push");
+    expect(blocked.error.code).toBe("SECRET_DETECTED");
+    expect(blocked.error.files).toEqual(["skills/demo/response.md"]);
+    expect(await runGit(["--git-dir", originPath, "rev-list", "--count", "--all"])).toBe("0");
+
+    const allowed = await service.push(settings, {
+      approvedSecretDigest: blocked.error.secretApproval ?? undefined,
+    });
+    expect(allowed.success).toBe(true);
+  });
+
   it("gates a low-entropy MCP URL credential until the exact payload is approved", async () => {
     const url = "https://user:hunter2@example.com/mcp?api_key=abc123";
     await writeFixtureFile(muxRoot, "mcp.jsonc", JSON.stringify({ servers: { private: { url } } }));
