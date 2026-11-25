@@ -10189,15 +10189,9 @@ export class AgentSession {
     return this.messageQueue.hasManualUserInput() || this.coordinator.manualFollowUpPending;
   }
 
-  /**
-   * User input the goal never advances over: queued or held input, or the user's dequeued
-   * manual send still preparing (it leaves the queue before it publishes, and a failed
-   * preparation restores it to the composer).
-   */
+  /** User input the goal never advances over: see hasPendingUserInput. */
   private userInputBlocksGoalAdvancement(): boolean {
-    return (
-      this.hasPendingUserInput() || this.preparingQueuedInput?.attempt.acceptanceOrigin === "manual"
-    );
+    return this.hasPendingUserInput();
   }
 
   /**
@@ -11875,9 +11869,17 @@ export class AgentSession {
   }
 
   /** Pending work only: withdrawn (aborted) entries still occupy the queue but never start a turn. */
-  /** The user's manual input is queued or held here: disposing this session would lose it. */
+  /**
+   * The user's manual input is queued, held or still preparing here: disposing this session would
+   * lose it. A dequeued manual send leaves the queue before it publishes, and a failed preparation
+   * restores it to the composer.
+   */
   hasPendingUserInput(): boolean {
-    return this.messageQueue.hasManualUserInput() || this.heldInputs.length > 0;
+    return (
+      this.messageQueue.hasManualUserInput() ||
+      this.heldInputs.length > 0 ||
+      this.preparingQueuedInput?.attempt.acceptanceOrigin === "manual"
+    );
   }
 
   /** See MessageQueue.promotedToolEndWouldLead. */
