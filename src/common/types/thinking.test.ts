@@ -13,8 +13,9 @@ import {
 } from "./thinking";
 
 describe("Gemini thinking labels", () => {
-  test("labels Neon's native xhigh as XHIGH and keeps other Gemini models at MAX", () => {
+  test("labels Neon's and Hydrogen's native xhigh as XHIGH and keeps other Gemini models at MAX", () => {
     expect(getThinkingDisplayLabel("xhigh", "google:gemini-4-neon")).toBe("XHIGH");
+    expect(getThinkingDisplayLabel("xhigh", "google:gemini-4-hydrogen")).toBe("XHIGH");
     expect(getThinkingDisplayLabel("xhigh", "google-vertex:gemini-4-neon")).toBe("XHIGH");
     expect(getThinkingDisplayLabel("xhigh", "google:gemini-4-carbon")).toBe("MAX");
   });

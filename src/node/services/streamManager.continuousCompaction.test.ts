@@ -1170,8 +1170,11 @@ describe("continuous prefix prepareStep and journal", () => {
       sent: undefined,
     },
   ])(
-    "prefix replay keeps the tool-call thought signatures of $route",
+    "prefix rebuild of a signed source row sends $route only that route's signature",
     async ({ requestProviderOptions, sent }) => {
+      // Compaction copies carry no signatures (stripPrefixBoundReplayFromTailCopy), so this
+      // hand-built signed row pins only that the rebuild never hands one route's signature
+      // to another.
       const journal = journalFixture();
       journal.requestProviderOptions = requestProviderOptions;
       journal.prefixSourceRows = [

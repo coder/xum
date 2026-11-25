@@ -14,24 +14,51 @@ function withoutAnthropicReplayData(part: MuxPart): MuxPart {
     : rest;
 }
 
+// `vertex` is the Vertex SDK's legacy namespace: unchecked history can still hold it, and
+// request building replays it as googleVertex (sanitizeReasoningReplayMetadata).
+const GEMINI_SIGNATURE_NAMESPACES = ["google", "googleVertex", "vertex"] as const;
+
+function withoutGeminiThoughtSignatures(part: MuxPart): MuxPart {
+  if (part.type === "dynamic-tool") {
+    // A tool call's providerOptions hold only Gemini thought signatures (ToolCallReplayMetadata).
+    if (part.providerOptions === undefined) return part;
+    const { providerOptions: _signatures, ...rest } = part;
+    return rest;
+  }
+  if (part.type !== "reasoning" || part.providerOptions === undefined) return part;
+  const providerOptions = { ...part.providerOptions };
+  const signed = GEMINI_SIGNATURE_NAMESPACES.filter((namespace) =>
+    Object.hasOwn(providerOptions, namespace)
+  );
+  if (signed.length === 0) return part;
+  for (const namespace of signed) Reflect.deleteProperty(providerOptions, namespace);
+  const { providerOptions: _options, ...rest } = part;
+  return Object.keys(providerOptions).length > 0 ? { ...rest, providerOptions } : rest;
+}
+
 /**
- * Remove Anthropic replay data from a keep-tail copy (regular RLM and continuous
- * compaction). Preserved thinking binds each signed block to its prefix (system,
- * tools and every earlier message). The summary replaced the rows that preceded
- * the tail, so the tail's thinking is bound to a prefix that no longer exists:
- * Anthropic would reject the request (400) or drop the blocks.
+ * Remove prefix-bound replay data from a keep-tail copy (regular RLM and continuous
+ * compaction, whose static copies also build the continuous prefix swap). Anthropic
+ * preserved thinking and Gemini thought signatures are bound to the prefix they were
+ * produced after (system, tools and every earlier message). The summary replaced the
+ * rows that preceded the tail, so that prefix no longer exists: Anthropic would reject
+ * the request (400) or drop the blocks, and Gemini 4 Hydrogen rejects a signature whose
+ * prefix changed (400) unless the request asks it to drop them.
  *
- * Only the replay data goes (signature, redactedData, legacy top-level signature).
- * The parts stay, so step indices stay valid and visible continuous copies still
- * show the thinking text. Request building (stripUnsignedAnthropicReasoning) then
- * leaves the unsigned parts out of Anthropic requests. Other providers' reasoning
- * keeps its replay data.
+ * Only the replay data goes (Anthropic signature, redactedData and legacy top-level
+ * signature; Gemini thoughtSignature on reasoning parts and tool calls). The parts stay,
+ * so step indices stay valid and visible continuous copies still show the thinking text.
+ * Request building (stripUnsignedAnthropicReasoning) then leaves the unsigned parts out
+ * of Anthropic requests. Gemini returns 400 for a missing signature only on a function
+ * call in the active turn, and a copy is never in it: a user row, or the [CONTINUE]
+ * sentinel that request building adds after a partial row, always follows the copies
+ * before the next model response. OpenAI and xAI reasoning keeps its replay data.
  */
-export function stripAnthropicThinkingFromTailCopy(message: MuxMessage): MuxMessage {
+export function stripPrefixBoundReplayFromTailCopy(message: MuxMessage): MuxMessage {
   if (message.role !== "assistant") return message;
   let changed = false;
   const parts = message.parts.map((part) => {
-    const stripped = withoutAnthropicReplayData(part);
+    const stripped = withoutGeminiThoughtSignatures(withoutAnthropicReplayData(part));
     if (stripped !== part) changed = true;
     return stripped;
   });

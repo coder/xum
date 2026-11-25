@@ -1,6 +1,6 @@
 import { describe, expect, it } from "bun:test";
 import type { MuxMessage } from "@/common/types/message";
-import { stripAnthropicThinkingFromTailCopy } from "./tailCopyThinking";
+import { stripPrefixBoundReplayFromTailCopy } from "./tailCopyThinking";
 
 type Part = MuxMessage["parts"][number];
 
@@ -11,8 +11,21 @@ const openaiReasoning: Part = {
 };
 const text = (value: string): Part => ({ type: "text", text: value });
 
-describe("stripAnthropicThinkingFromTailCopy", () => {
-  it("removes Anthropic replay data but keeps every part and the step indices", () => {
+describe("stripPrefixBoundReplayFromTailCopy", () => {
+  it("removes Anthropic and Gemini replay data but keeps every part and the step indices", () => {
+    const signedCall: Part = {
+      type: "dynamic-tool",
+      toolCallId: "call-1",
+      toolName: "bash",
+      state: "output-available",
+      input: { script: "ls" },
+      output: "README.md",
+      providerOptions: {
+        coderGoogle: { thoughtSignature: "c" },
+        google: { thoughtSignature: "g" },
+        googleVertex: { thoughtSignature: "v" },
+      },
+    };
     const message: MuxMessage = {
       id: "a1",
       role: "assistant",
@@ -28,17 +41,33 @@ describe("stripAnthropicThinkingFromTailCopy", () => {
             google: { thoughtSignature: "g" },
           },
         },
+        {
+          type: "reasoning",
+          text: "gemini",
+          providerOptions: {
+            googleVertex: { thoughtSignature: "v" },
+            openai: { reasoningEncryptedContent: "enc" },
+          },
+        },
+        signedCall,
         openaiReasoning,
         text("answer"),
       ],
       metadata: { model: "anthropic:claude", stepStartPartIndices: [0, 2] },
     };
-    const stripped = stripAnthropicThinkingFromTailCopy(message);
+    const stripped = stripPrefixBoundReplayFromTailCopy(message);
+    const { providerOptions: _signatures, ...unsignedCall } = signedCall;
     expect(stripped.parts).toEqual([
       { type: "reasoning", text: "signed" },
       { type: "reasoning", text: "" },
       { type: "reasoning", text: "legacy" },
-      { type: "reasoning", text: "both", providerOptions: { google: { thoughtSignature: "g" } } },
+      { type: "reasoning", text: "both" },
+      {
+        type: "reasoning",
+        text: "gemini",
+        providerOptions: { openai: { reasoningEncryptedContent: "enc" } },
+      },
+      unsignedCall,
       openaiReasoning,
       text("answer"),
     ]);
@@ -46,14 +75,42 @@ describe("stripAnthropicThinkingFromTailCopy", () => {
     // The source row is never mutated: the original stays above the boundary.
     expect(message.parts[0]).toMatchObject({ providerOptions: { anthropic: { signature: "s" } } });
     expect(message.parts[2]).toMatchObject({ signature: "legacy-sig" });
+    expect(message.parts[5]).toMatchObject({
+      providerOptions: { google: { thoughtSignature: "g" } },
+    });
   });
 
-  it("leaves rows without Anthropic replay data unchanged", () => {
+  it("removes a signature in the legacy vertex namespace", () => {
+    // Persisted rows are read with unchecked casts, so a copy can still carry this namespace.
+    const legacyOptions = { vertex: { thoughtSignature: "legacy-v" }, openai: { itemId: "rs_2" } };
+    const message: MuxMessage = {
+      id: "a2",
+      role: "assistant",
+      parts: [{ type: "reasoning", text: "legacy", providerOptions: legacyOptions }],
+    };
+    expect(stripPrefixBoundReplayFromTailCopy(message).parts).toEqual([
+      { type: "reasoning", text: "legacy", providerOptions: { openai: { itemId: "rs_2" } } },
+    ]);
+  });
+
+  it("leaves rows without prefix-bound replay data unchanged", () => {
     const openaiRow: MuxMessage = {
       id: "a2",
       role: "assistant",
-      parts: [openaiReasoning, { type: "reasoning", text: "no replay data" }, text("answer")],
+      parts: [
+        openaiReasoning,
+        { type: "reasoning", text: "no replay data" },
+        {
+          type: "dynamic-tool",
+          toolCallId: "call-2",
+          toolName: "bash",
+          state: "output-available",
+          input: { script: "ls" },
+          output: "README.md",
+        },
+        text("answer"),
+      ],
     };
-    expect(stripAnthropicThinkingFromTailCopy(openaiRow)).toBe(openaiRow);
+    expect(stripPrefixBoundReplayFromTailCopy(openaiRow)).toBe(openaiRow);
   });
 });

@@ -21,6 +21,7 @@ import {
 import { selectRollingCut, type RollingCut } from "@/common/utils/compaction/rollingCut";
 import { estimateMuxMessageTokens } from "@/common/utils/messages/keepRecentTail";
 import { isModelHiddenMessage } from "@/common/utils/messages/modelHiddenMessages";
+import { stripModelProviderPrefixes } from "@/common/types/thinking";
 import {
   isDurableContextBoundaryMarker,
   sliceMessagesFromLatestCompactionBoundary,
@@ -32,6 +33,8 @@ import { log } from "./log";
 export interface ContinuousCompactionContext {
   enabled: boolean;
   model: string;
+  /** `model` with a custom entry's mappedToModel alias resolved (resolveModelForMetadata). */
+  capabilityModel?: string;
   contextWindowTokens: number;
   thresholdPercent: number;
   systemMessageTokens?: number;
@@ -40,6 +43,21 @@ export interface ContinuousCompactionContext {
 
 type Phase = "on-send" | "mid-stream" | "stream-end";
 type Verdict = "none" | "applied" | "fallback";
+
+/**
+ * Whether this observation may swap the request prefix under the running turn.
+ * Gemini 4 Hydrogen binds each thought signature to the request prefix it followed and
+ * returns 400 when a same-model replay changes that prefix (its Agent Platform guide;
+ * Xum cannot send prefix_mismatch_behavior DROP). A mid-stream swap replaces the prefix
+ * under the live steps, whose function calls must keep their signatures: Gemini also
+ * returns 400 for an active-turn call without one. So a Hydrogen turn takes the durable
+ * fallback instead: it stops, applies the compaction and continues after a user turn.
+ */
+function maySwapPrefix(context: ContinuousCompactionContext & { phase: Phase }): boolean {
+  const model = stripModelProviderPrefixes(context.capabilityModel ?? context.model);
+  return context.phase === "mid-stream" && !model.startsWith("gemini-4-hydrogen");
+}
+
 interface StreamSnapshot {
   messageId: string;
   parts: MuxMessage["parts"];
@@ -281,7 +299,7 @@ export class ContinuousCompactor {
       const staged = this.staged;
       const rows = await this.readSnapshot();
       if (rows && this.isValid(staged, rows) && this.wouldFit(staged, rows, context)) {
-        if (context.phase === "mid-stream" && (await this.activateSwap(staged, rows, context)))
+        if (maySwapPrefix(context) && (await this.activateSwap(staged, rows, context)))
           return "none";
         const applied =
           context.phase === "mid-stream"

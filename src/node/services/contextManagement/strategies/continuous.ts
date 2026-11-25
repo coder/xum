@@ -3,6 +3,7 @@ import type { SendMessageOptions, ProvidersConfigMap } from "@/common/orpc/types
 import type { MuxMessage, CompactionFollowUpRequest } from "@/common/types/message";
 import { FORCE_COMPACTION_BUFFER_PERCENT } from "@/common/constants/ui";
 import { getEffectiveContextLimit } from "@/common/utils/compaction/contextLimit";
+import { resolveModelForMetadata } from "@/common/utils/providers/modelEntries";
 import { isAnthropic1MEffectivelyEnabled } from "@/common/utils/ai/providerOptions";
 import { injectPostCompactionAttachments } from "@/browser/utils/messages/modelMessageTransform";
 import { estimateMuxMessageTokens } from "@/common/utils/messages/keepRecentTail";
@@ -166,6 +167,7 @@ export class ContinuousStrategy {
         !this.host.coordinator.editReserved &&
         !this.host.isWorkspaceArchivedOnDisk(),
       model,
+      capabilityModel: this.resolveCapabilityModel(model),
       contextWindowTokens:
         getEffectiveContextLimit(
           model,
@@ -178,6 +180,18 @@ export class ContinuousStrategy {
           ?.systemMessageTokens ?? this.host.state.systemMessageTokens,
       sendOptions: options,
     };
+  }
+
+  /**
+   * `model` with a mappedToModel alias resolved. The prefix swap guard reads it mid-stream, so
+   * the running request's config snapshot resolves it: an alias edited while the stream runs
+   * cannot hide the model that request was built for.
+   */
+  private resolveCapabilityModel(model: string): string {
+    return resolveModelForMetadata(
+      model,
+      this.host.state.stream?.providersConfig ?? this.host.state.providersConfig
+    );
   }
 
   /** Persisted threshold changed: drop a staged fold whose model now has a different threshold. */

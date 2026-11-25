@@ -56,7 +56,7 @@ import {
   getKeepRecentTailStartHistorySequence,
 } from "@/common/utils/messages/keepRecentTail";
 import { createPreservedTailCopyMessageId } from "@/node/services/utils/messageIds";
-import { stripAnthropicThinkingFromTailCopy } from "@/common/utils/compaction/tailCopyThinking";
+import { stripPrefixBoundReplayFromTailCopy } from "@/common/utils/compaction/tailCopyThinking";
 import { isModelHiddenMessage } from "@/common/utils/messages/modelHiddenMessages";
 import { readPersistedPluginHookContext } from "@/common/utils/messages/pluginHookContext";
 import {
@@ -1326,9 +1326,9 @@ export class CompactionHandler {
           }
         : source?.mcpPromptSnapshot;
 
-    // Preserved thinking: the tail's Anthropic thinking is bound to the pre-summary
-    // prefix, so the copy drops its replay data (see stripAnthropicThinkingFromTailCopy).
-    return stripAnthropicThinkingFromTailCopy({
+    // The tail's Anthropic thinking and Gemini thought signatures are bound to the
+    // pre-summary prefix, so the copy drops them (see stripPrefixBoundReplayFromTailCopy).
+    return stripPrefixBoundReplayFromTailCopy({
       ...row,
       id: copyId,
       metadata: {

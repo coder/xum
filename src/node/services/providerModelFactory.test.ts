@@ -6237,6 +6237,7 @@ describe("ProviderModelFactory.createEvaluationModel", () => {
   // which Gemini 4 models reject; older Gemini models keep the SDK mapping.
   it.each([
     ["google:gemini-4-neon", "low"],
+    ["google:gemini-4-hydrogen", "low"],
     ["google:gemini-4-carbon", "low"],
     ["google:gemini-3-flash", "minimal"],
   ] as const)(

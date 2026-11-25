@@ -78,14 +78,14 @@ export function isGeminiFlashMinimalRejectingModelName(modelName: string): boole
 
 /**
  * True for Gemini models with no minimal thinking level, so Xum cannot expose "off":
- * Gemini 3.8 Flash (rejects minimal) and Gemini 4 Argon, Carbon and Neon (document no
- * minimal level; Carbon and Neon return HTTP 400 for minimal).
+ * Gemini 3.8 Flash (rejects minimal) and Gemini 4 Argon, Carbon, Neon and Hydrogen (document
+ * no minimal level; Carbon, Neon and Hydrogen return HTTP 400 for minimal).
  * @param modelName Provider model ID without the provider prefix.
  */
 export function isGeminiNoOffModelName(modelName: string): boolean {
   return (
     isGeminiFlashMinimalRejectingModelName(modelName) ||
-    /^gemini-4-(?:argon|carbon|neon)/.test(modelName.trim().toLowerCase())
+    /^gemini-4-(?:argon|carbon|neon|hydrogen)/.test(modelName.trim().toLowerCase())
   );
 }
 
@@ -106,7 +106,7 @@ function geminiNoOffPolicy(modelName: string): ThinkingPolicy {
  * - openai:gpt-6-luna → ["off", "low", "medium", "high", "xhigh", "max"] (6 levels)
  * - openai:gpt-5.6 / -sol / -terra / -luna → ["off", "low", "medium", "high", "xhigh", "max"]
  * - Gemini 3.8 Flash / Gemini 4 Argon / Carbon → ["low", "medium", "high"] (no minimal, so no "off")
- * - Gemini 4 Neon → ["low", "medium", "high", "xhigh"] (native XHIGH, no minimal)
+ * - Gemini 4 Neon / Hydrogen → ["low", "medium", "high", "xhigh"] (native XHIGH, no minimal)
  * - Older Gemini Flash chat variants → ["off", "low", "medium", "high"]
  * - gemini-3 Pro variants → ["low", "high"] (thinking level only)
  * - xai:grok-4.7 / xai:grok-4.6 → ["low", "medium", "high", "xhigh"] (reasoning cannot be disabled)
@@ -191,8 +191,8 @@ function getExplicitThinkingPolicy(modelString: string): ThinkingPolicy | null {
     return ["off", "low", "medium", "high", "xhigh", "max"];
   }
 
-  // Gemini 3.8 Flash and Gemini 4 Argon/Carbon/Neon have no "minimal" level, so thinking cannot be
-  // disabled; "off" clamps to "low". Neon alone adds a native XHIGH level.
+  // Gemini 3.8 Flash and Gemini 4 Argon/Carbon/Neon/Hydrogen have no "minimal" level, so thinking
+  // cannot be disabled; "off" clamps to "low". Neon and Hydrogen add a native XHIGH level.
   if (isGeminiNoOffModelName(withoutProviderNamespace)) {
     return geminiNoOffPolicy(withoutProviderNamespace);
   }
@@ -363,8 +363,8 @@ export function resolveEffectiveThinkingLevel(
   const capabilityModel = resolveModelForMetadata(modelString, providersConfig ?? null);
   // Gemini 3.8 Flash rejects "minimal" and GPT-6 Astra rejects "none", so an
   // unset/"off" level must clamp here too; otherwise the tracked level would say
-  // "off" while the adapter sends "low". Gemini 4 Argon, Carbon and Neon have no "off" either: an
-  // unclamped "off" sends no thinkingConfig and the model thinks at its own default.
+  // "off" while the adapter sends "low". Gemini 4 Argon, Carbon, Neon and Hydrogen have no "off"
+  // either: an unclamped "off" sends no thinkingConfig and the model thinks at its own default.
   return ALWAYS_ON_FIVE_LEVEL_MODELS.some((matches) => matches(capabilityModel)) ||
     isGlm53Model(capabilityModel) ||
     isGeminiNoOffModelName(stripModelProviderPrefixes(capabilityModel))

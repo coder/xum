@@ -27,7 +27,7 @@ import {
   type AgentSessionHarness,
   type StreamLifecycle,
 } from "./agentSession.testHarness";
-import type { ContinuousCompactor } from "./continuousCompactor";
+import type { ContinuousCompactionContext, ContinuousCompactor } from "./continuousCompactor";
 import type { CompactionToken, TurnCoordinator } from "./turnCoordinator";
 import * as fileLock from "@/node/utils/concurrency/fileLock";
 import { historyWriteLockPath } from "./workspaceRemoval";
@@ -42,6 +42,7 @@ const sendOptions: SendMessageOptions = { model, agentId: "exec" };
 
 interface ContinuousStrategyInternals {
   continuousCompactor: ContinuousCompactor;
+  getContinuousCompactionContext(model: string): ContinuousCompactionContext;
   runContinuousCompactionObservation<T>(
     observe: (token: CompactionToken) => Promise<T>
   ): Promise<T | undefined>;
@@ -209,6 +210,33 @@ describe("AgentSession continuous compaction wiring", () => {
     );
     expect(result.success).toBe(true);
   }
+
+  test("the compaction context resolves a mapped model alias for capability checks", async () => {
+    const h = await setup();
+    const mapped: ProvidersConfigMap = {
+      google: {
+        apiKeySet: true,
+        isEnabled: true,
+        isConfigured: true,
+        models: [{ id: "team-hydrogen", mappedToModel: "google:gemini-4-hydrogen" }],
+      },
+    };
+    const liveConfig = spyOn(h.aiService, "getProvidersConfig").mockReturnValue(mapped);
+    const strategy = continuous(h.session);
+    const context = strategy.getContinuousCompactionContext("google:team-hydrogen");
+    expect(context.model).toBe("google:team-hydrogen");
+    expect(context.capabilityModel).toBe("google:gemini-4-hydrogen");
+    // The alias is removed while a request built with it streams: that request's snapshot decides.
+    internals(h.session).activeStreamContext = {
+      modelString: "google:team-hydrogen",
+      providersConfig: mapped,
+    };
+    liveConfig.mockReturnValue({});
+    expect(strategy.getContinuousCompactionContext("google:team-hydrogen").capabilityModel).toBe(
+      "google:gemini-4-hydrogen"
+    );
+    internals(h.session).activeStreamContext = undefined;
+  });
 
   describe("eager compaction physical lifetime", () => {
     async function setupEager() {

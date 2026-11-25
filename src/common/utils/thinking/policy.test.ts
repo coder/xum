@@ -365,6 +365,8 @@ describe("getThinkingPolicyForModel", () => {
       "openrouter:google/gemini-3.8-flash",
       "google:gemini-4-argon",
       "google:gemini-4-carbon",
+      "google:gemini-4-hydrogen",
+      "openrouter:google/gemini-4-hydrogen",
       "google-vertex:gemini-4-carbon-cyber-permissive",
       "google:gemini-4-neon",
     ]) {
@@ -568,8 +570,13 @@ describe("getThinkingPolicyForModel", () => {
     }
   });
 
-  test("returns low/medium/high/xhigh (no off) for Gemini 4 Neon", () => {
-    for (const model of ["google:gemini-4-neon", "google-vertex:gemini-4-neon"]) {
+  test("returns low/medium/high/xhigh (no off) for Gemini 4 Neon and Hydrogen", () => {
+    for (const model of [
+      "google:gemini-4-neon",
+      "google-vertex:gemini-4-neon",
+      "google:gemini-4-hydrogen",
+      "openrouter:google/gemini-4-hydrogen",
+    ]) {
       expect(getThinkingPolicyForModel(model)).toEqual(["low", "medium", "high", "xhigh"]);
       expect(enforceThinkingPolicy(model, "off")).toBe("low");
       expect(enforceThinkingPolicy(model, "xhigh")).toBe("xhigh");
