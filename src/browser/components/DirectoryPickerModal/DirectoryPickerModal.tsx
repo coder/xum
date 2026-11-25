@@ -13,10 +13,50 @@ import { Input } from "@/browser/components/Input/Input";
 import type { FileTreeNode } from "@/common/utils/git/numstatParser";
 import { DirectoryTree } from "../DirectoryTree/DirectoryTree";
 import { useLiveAPI } from "@/browser/contexts/API";
+import { isConnectionLostError } from "@/browser/contexts/connectionLink";
 import { formatKeybind, isMac } from "@/browser/utils/ui/keybinds";
 import { getErrorMessage } from "@/common/utils/errors";
 
 const OPEN_KEYBIND = { key: "o", ctrl: true };
+
+/** What a failed listDirectory shows. A missing folder offers to create it. */
+function listDirectoryFailure(error: unknown): { error: string; canCreateFolder: boolean } {
+  const errorMessage = typeof error === "string" ? error : "Unknown error";
+  // Detect "no such file or directory" to offer folder creation
+  if (errorMessage.includes("ENOENT") || errorMessage.includes("no such file or directory")) {
+    return { error: "Folder doesn't exist.", canCreateFolder: true };
+  }
+  return { error: `Failed to load directory: ${errorMessage}`, canCreateFolder: false };
+}
+
+/**
+ * The selected row: its index, and the entry path on it (null for the ".." row). The path keeps
+ * the selection on the same directory when the visible entries change (hidden files toggled, or a
+ * reconnect reload that lists other directories); the index is the fallback when it is gone.
+ */
+interface Selection {
+  index: number;
+  path: string | null;
+}
+
+interface DirectoryEntry {
+  name: string;
+  path: string;
+}
+
+/** The row index to show for `selection` among `entries` (row 0 is ".." with a parent). */
+function resolveSelectedIndex(
+  selection: Selection,
+  entries: DirectoryEntry[],
+  hasParentEntry: boolean
+): number {
+  const offset = hasParentEntry ? 1 : 0;
+  const found = entries.findIndex((entry) => entry.path === selection.path);
+  if (selection.path != null && found !== -1) return found + offset;
+  // Fallback: clamp to the new bounds.
+  const maxIndex = hasParentEntry ? entries.length : Math.max(entries.length - 1, 0);
+  return Math.max(0, Math.min(selection.index, maxIndex));
+}
 
 interface DirectoryPickerModalProps {
   isOpen: boolean;
@@ -40,11 +80,24 @@ export const DirectoryPickerModal: React.FC<DirectoryPickerModalProps> = ({
   const [pathInput, setPathInput] = useState(initialPath || "");
   // Default off (component stays mounted between opens).
   const [showHiddenFiles, setShowHiddenFiles] = useState(false);
-  const [selectedIndex, setSelectedIndex] = useState(0);
+  const [selection, setSelection] = useState<Selection>({ index: 0, path: null });
   const treeRef = useRef<HTMLDivElement>(null);
+  // The directory shown (set on a successful load only): a reconnect reloads it (#6383). A click
+  // while offline loads nothing, so it must not move this.
+  const currentPathRef = useRef(initialPath || ".");
+  // Whether this open ran its setup, so it runs once per open (#6383): a reconnect (a new client)
+  // or a new initialPath while open (Add Project loads its clone default late) must not redo it.
+  const isSetUpRef = useRef(false);
+  // The client the shown directory was loaded with: a new one reloads it.
+  const loadedClientRef = useRef<typeof liveApi>(null);
+  // Only the latest load may show its result: a reconnect reload that answers after a later
+  // navigation must not move the tree back.
+  const loadSeqRef = useRef(0);
 
+  // `keepSelection`: a reload of the same directory, which keeps the typed path and selection.
   const loadDirectory = useCallback(
-    async (path: string) => {
+    async (path: string, keepSelection = false) => {
+      const seq = ++loadSeqRef.current;
       if (!liveApi) {
         setError("Not connected to server");
         return;
@@ -55,31 +108,34 @@ export const DirectoryPickerModal: React.FC<DirectoryPickerModalProps> = ({
 
       try {
         const result = await liveApi.general.listDirectory({ path });
+        if (seq !== loadSeqRef.current) return;
 
         if (!result.success) {
-          const errorMessage = typeof result.error === "string" ? result.error : "Unknown error";
-          // Detect "no such file or directory" to offer folder creation
-          const isNotFound =
-            errorMessage.includes("ENOENT") || errorMessage.includes("no such file or directory");
-          if (isNotFound) {
-            setCanCreateFolder(true);
-            setError("Folder doesn't exist.");
-          } else {
-            setError(`Failed to load directory: ${errorMessage}`);
-          }
+          const failure = listDirectoryFailure(result.error);
+          setCanCreateFolder(failure.canCreateFolder);
+          setError(failure.error);
           setRoot(null);
           return;
         }
 
         setRoot(result.data);
+        currentPathRef.current = result.data.path;
+        if (keepSelection) return;
         setPathInput(result.data.path);
-        setSelectedIndex(0);
+        setSelection({ index: 0, path: null });
       } catch (err) {
+        if (seq !== loadSeqRef.current) return;
+        // A lost connection says nothing about the directory: keep the shown tree, and the
+        // reconnect reloads it (#6383).
+        if (isConnectionLostError(err)) {
+          setError("Not connected to server");
+          return;
+        }
         const message = getErrorMessage(err);
         setError(`Failed to load directory: ${message}`);
         setRoot(null);
       } finally {
-        setIsLoading(false);
+        if (seq === loadSeqRef.current) setIsLoading(false);
       }
     },
     [liveApi]
@@ -87,11 +143,25 @@ export const DirectoryPickerModal: React.FC<DirectoryPickerModalProps> = ({
 
   // Sync pathInput with initialPath when modal opens (component stays mounted)
   useEffect(() => {
-    if (!isOpen) return;
-    setPathInput(initialPath || "");
-    setShowHiddenFiles(false);
-    void loadDirectory(initialPath || ".");
-  }, [isOpen, initialPath, loadDirectory]);
+    if (!isOpen) {
+      isSetUpRef.current = false;
+      return;
+    }
+    const isNewClient = loadedClientRef.current !== liveApi;
+    loadedClientRef.current = liveApi;
+    if (!isSetUpRef.current) {
+      isSetUpRef.current = true;
+      // Opened offline, the reconnect loads the initial directory.
+      currentPathRef.current = initialPath || ".";
+      setPathInput(initialPath || "");
+      setShowHiddenFiles(false);
+      void loadDirectory(initialPath || ".");
+      return;
+    }
+    // A new client (reconnect) while open: reload the shown directory, and keep what the user
+    // typed or selected. While offline (no client), keep the shown directory as it is.
+    if (isNewClient && liveApi) void loadDirectory(currentPathRef.current, true);
+  }, [isOpen, initialPath, liveApi, loadDirectory]);
 
   const handleNavigateTo = useCallback(
     (path: string) => {
@@ -121,15 +191,9 @@ export const DirectoryPickerModal: React.FC<DirectoryPickerModalProps> = ({
       try {
         const result = await liveApi.general.listDirectory({ path: trimmedInput });
         if (!result.success) {
-          const errorMessage = typeof result.error === "string" ? result.error : "Unknown error";
-          const isNotFound =
-            errorMessage.includes("ENOENT") || errorMessage.includes("no such file or directory");
-          if (isNotFound) {
-            setCanCreateFolder(true);
-            setError("Folder doesn't exist.");
-          } else {
-            setError(`Failed to load directory: ${errorMessage}`);
-          }
+          const failure = listDirectoryFailure(result.error);
+          setCanCreateFolder(failure.canCreateFolder);
+          setError(failure.error);
           setRoot(null);
           return;
         }
@@ -221,6 +285,12 @@ export const DirectoryPickerModal: React.FC<DirectoryPickerModalProps> = ({
       .filter((child) => child.isDirectory)
       .filter((child) => showHiddenFiles || !child.name.startsWith("."))
       .map((child) => ({ name: child.name, path: child.path })) ?? [];
+  const hasParentEntry = Boolean(root?.path);
+  const selectedIndex = resolveSelectedIndex(selection, entries, hasParentEntry);
+  const handleSelectedIndexChange = (index: number) => {
+    const entryIndex = hasParentEntry ? index - 1 : index;
+    setSelection({ index, path: entries[entryIndex]?.path ?? null });
+  };
 
   const shortcutLabel = isMac() ? "⌘O" : formatKeybind(OPEN_KEYBIND);
 
@@ -248,43 +318,8 @@ export const DirectoryPickerModal: React.FC<DirectoryPickerModalProps> = ({
             <Checkbox
               checked={showHiddenFiles}
               onCheckedChange={(checked) => {
-                const nextShowHiddenFiles = checked === true;
-                setShowHiddenFiles(nextShowHiddenFiles);
-
-                // Preserve selection when possible. If hidden entries are inserted/removed ahead
-                // of the current selection, keeping the same raw index can jump to the wrong row.
-                setSelectedIndex((prev) => {
-                  if (!root) return 0;
-
-                  const hasParentEntry = Boolean(root.path);
-                  if (hasParentEntry && prev === 0) return 0;
-
-                  const previousVisibleEntries = root.children
-                    .filter((child) => child.isDirectory)
-                    .filter((child) => showHiddenFiles || !child.name.startsWith("."));
-
-                  const selectedEntryIndex = hasParentEntry ? prev - 1 : prev;
-                  const selectedEntryPath = previousVisibleEntries[selectedEntryIndex]?.path;
-
-                  const nextVisibleEntries = root.children
-                    .filter((child) => child.isDirectory)
-                    .filter((child) => nextShowHiddenFiles || !child.name.startsWith("."));
-
-                  if (selectedEntryPath) {
-                    const nextEntryIndex = nextVisibleEntries.findIndex(
-                      (child) => child.path === selectedEntryPath
-                    );
-                    if (nextEntryIndex !== -1) {
-                      return hasParentEntry ? nextEntryIndex + 1 : nextEntryIndex;
-                    }
-                  }
-
-                  // Fallback: clamp to the new bounds.
-                  const maxIndex = hasParentEntry
-                    ? nextVisibleEntries.length
-                    : Math.max(nextVisibleEntries.length - 1, 0);
-                  return Math.max(0, Math.min(prev, maxIndex));
-                });
+                // The selection follows its directory (see Selection).
+                setShowHiddenFiles(checked === true);
               }}
             />
             Show hidden files
@@ -317,7 +352,7 @@ export const DirectoryPickerModal: React.FC<DirectoryPickerModalProps> = ({
             onNavigateParent={handleNavigateParent}
             onConfirm={() => void handleConfirm()}
             selectedIndex={selectedIndex}
-            onSelectedIndexChange={setSelectedIndex}
+            onSelectedIndexChange={handleSelectedIndexChange}
           />
         </div>
         <DialogFooter>
