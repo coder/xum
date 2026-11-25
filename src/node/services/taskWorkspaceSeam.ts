@@ -286,6 +286,11 @@ export interface RemovalCheckoutOptions {
 export interface ArchiveCascadePreflight {
   targetPaths: string[];
   subagents: Array<{ workspaceId: string; title: string; paths: string[] }>;
+  /**
+   * Sub-agents whose checkout the "delete" policy deletes, with the branch that keeps their
+   * commits. Present only for a forced archive: otherwise the preflight refuses instead.
+   */
+  deletedCheckouts?: Array<{ workspaceId: string; title: string; branch: string }>;
 }
 
 export interface ArchiveWorkspaceOptions {
@@ -295,6 +300,13 @@ export interface ArchiveWorkspaceOptions {
    * sub-agent's work (#4930).
    */
   acknowledgedSubagentUntrackedPaths?: Record<string, string[]>;
+  /**
+   * The sub-agent workspace IDs whose checkout the "delete" behavior may delete although
+   * forbidWorktreeCheckoutDeletion is off. A forced archive lists them under its locks, so a
+   * sub-agent that appears later (another backend created it) is refused, like the untracked
+   * files nobody acknowledged. Without a list, forbidWorktreeCheckoutDeletion alone decides.
+   */
+  acknowledgedSubagentCheckoutDeletions?: string[];
   /**
    * Refuse to archive when the effective worktree archive behavior would delete the checkout
    * ("delete"). Model-facing callers set this so a concurrent settings flip cannot turn an
@@ -743,7 +755,8 @@ export interface WorkspaceLifecycleHost {
   ): Promise<Result<ArchivePreflightResult>>;
   preflightArchiveCascade(
     workspaceId: string,
-    worktreeArchiveBehavior: WorktreeArchiveBehavior
+    worktreeArchiveBehavior: WorktreeArchiveBehavior,
+    options?: { forced?: boolean }
   ): Promise<Result<ArchiveCascadePreflight>>;
   acquirePreInterruptionArchiveHold(
     workspaceId: string,

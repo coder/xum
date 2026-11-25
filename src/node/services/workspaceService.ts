@@ -252,6 +252,7 @@ import {
 } from "@/node/runtime/devcontainerCli";
 import {
   archiveDeletesManagedWorktree,
+  archiveRemovesExternalAppEnvironment,
   isWorktreeRuntime,
 } from "@/node/runtime/worktreeLifecycleHooks";
 import {
@@ -543,6 +544,7 @@ import {
   searchFileCompletions,
   type FileCompletionsIndex,
 } from "@/node/services/fileCompletionsIndex";
+import { FORCED_ARCHIVE_SUBAGENT_CHANGED_REFUSAL } from "@/node/services/forcedArchiveLoss";
 import { taskQueueDebug } from "@/node/services/taskQueueDebug";
 import {
   getSubagentGitPatchMboxPath,
@@ -1089,6 +1091,35 @@ function remoteBoxArchiveBehavior(
   coderWorkspaceArchiveBehavior: CoderWorkspaceArchiveBehavior
 ): CoderWorkspaceArchiveBehavior {
   return isDedicatedCoderRuntime(metadata?.runtimeConfig) ? coderWorkspaceArchiveBehavior : "keep";
+}
+
+const EXTERNAL_APP_ARCHIVE_REFUSAL =
+  "A native terminal or external editor was opened for this workspace and its lifetime cannot be tracked; the archive policy would remove the checkout or stop the dedicated remote Coder workspace under it. Ask the user to archive this workspace manually.";
+
+/** The live activity of a workspace that its archive would terminate, as the sink words it. */
+function liveActivityLabels(live: WorkspaceLiveActivity): string[] {
+  const labels: Array<[boolean, string]> = [
+    [live.streaming, "an active stream"],
+    [live.queuedMessages, "queued messages"],
+    [live.terminalSessions, "open terminal sessions"],
+    [live.desktopViewers, "an open desktop viewer or popout"],
+  ];
+  return labels.filter(([active]) => active).map(([, label]) => label);
+}
+
+/**
+ * Whether a cascaded sub-agent's archive must refuse the "delete" behavior. A caller that lists the
+ * sub-agents it accepts (a forced archive) still refuses one that is not on the list.
+ */
+function forbidsSubagentCheckoutDeletion(
+  options: ArchiveWorkspaceOptions | undefined,
+  subagentId: string
+): boolean {
+  const acknowledged = options?.acknowledgedSubagentCheckoutDeletions;
+  return (
+    options?.forbidWorktreeCheckoutDeletion === true ||
+    (acknowledged != null && !acknowledged.includes(subagentId))
+  );
 }
 
 /**
@@ -11656,26 +11687,33 @@ export class WorkspaceService
    * sub-agents, it also lists the target's own lossy paths: the cascade archives the sub-agents
    * first, so the target's refusal at the sink would come after they were archived. The sink
    * rechecks each workspace, so a file created after this scan still refuses.
+   * A forced archive lists the sub-agents whose checkout the "delete" policy deletes in
+   * deletedCheckouts instead of refusing. It also refuses here, before anything is archived, a
+   * sub-agent that the sink would refuse later (live activity, an external editor or terminal),
+   * because the cascade archives the deeper sub-agents first and their deletions cannot be undone.
    */
   async preflightArchiveCascade(
     workspaceId: string,
-    worktreeArchiveBehavior: WorktreeArchiveBehavior
+    worktreeArchiveBehavior: WorktreeArchiveBehavior,
+    options?: { forced?: boolean }
   ): Promise<Result<ArchiveCascadePreflight>> {
     const descendants = this.listUnarchivedDescendants(workspaceId);
     if (descendants.length === 0) return Ok({ targetPaths: [], subagents: [] });
-    if (descendants.some((descendant) => descendant.active)) {
-      return Err(ACTIVE_DESCENDANT_ARCHIVE_ERROR);
-    }
+    const blocked = await this.refuseBlockedCascade(descendants, worktreeArchiveBehavior, options);
+    if (blocked != null) return Err(blocked);
     const subagents: ArchiveCascadePreflight["subagents"] = [];
+    const deletedCheckouts: NonNullable<ArchiveCascadePreflight["deletedCheckouts"]> = [];
     for (const descendant of descendants) {
       const label = `sub-agent ${descendant.title} (${descendant.workspaceId})`;
       if (worktreeArchiveBehavior === "delete") {
-        const metadata = await this.aiService.getWorkspaceMetadata(descendant.workspaceId);
-        if (!metadata.success) return Err(`Cannot archive ${label}: ${metadata.error}`);
-        if (archiveDeletesManagedWorktree(metadata.data, worktreeArchiveBehavior)) {
-          return Err(
-            `Worktree archive behavior is set to "Delete checkout", which would irreversibly delete the checkout of ${label} without user confirmation. Ask the user to archive this workspace manually or switch the archive behavior to "Keep" or "Snapshot".`
-          );
+        const deletion = await this.preflightCascadeCheckoutDeletion(descendant, label, options);
+        if (!deletion.success) return Err(deletion.error);
+        if (deletion.data != null) {
+          deletedCheckouts.push({
+            workspaceId: descendant.workspaceId,
+            title: descendant.title,
+            branch: deletion.data,
+          });
         }
         continue;
       }
@@ -11698,7 +11736,95 @@ export class WorkspaceService
     return Ok({
       targetPaths: target.data.kind === "confirm-lossy-untracked-files" ? target.data.paths : [],
       subagents,
+      deletedCheckouts,
     });
+  }
+
+  /**
+   * Under the "delete" behavior: the branch of this sub-agent when archiving deletes its
+   * checkout, which keeps the commits (null when it deletes nothing). It refuses when it would,
+   * unless the caller is a forced archive.
+   */
+  private async preflightCascadeCheckoutDeletion(
+    descendant: WorkspaceRemovalDescendant,
+    label: string,
+    options: { forced?: boolean } | undefined
+  ): Promise<Result<string | null>> {
+    const metadata = await this.aiService.getWorkspaceMetadata(descendant.workspaceId);
+    if (!metadata.success) return Err(`Cannot archive ${label}: ${metadata.error}`);
+    if (!archiveDeletesManagedWorktree(metadata.data, "delete")) return Ok(null);
+    if (options?.forced !== true) {
+      return Err(
+        `Worktree archive behavior is set to "Delete checkout", which would irreversibly delete the checkout of ${label} without user confirmation. Ask the user to archive this workspace manually or switch the archive behavior to "Keep" or "Snapshot".`
+      );
+    }
+    return Ok(metadata.data.name);
+  }
+
+  /**
+   * Why a cascade cannot start, or null: a sub-agent is active, or (a forced archive) one that
+   * the sink would refuse later is busy.
+   */
+  private async refuseBlockedCascade(
+    descendants: WorkspaceRemovalDescendant[],
+    worktreeArchiveBehavior: WorktreeArchiveBehavior,
+    options: { forced?: boolean } | undefined
+  ): Promise<string | null> {
+    if (descendants.some((descendant) => descendant.active)) return ACTIVE_DESCENDANT_ARCHIVE_ERROR;
+    if (options?.forced !== true) return null;
+    for (const descendant of descendants) {
+      const refusal = await this.refuseBusyCascadeSubagent(descendant, worktreeArchiveBehavior);
+      if (refusal != null) return refusal;
+    }
+    return null;
+  }
+
+  /** What a cascaded sub-agent still runs that its archive would terminate, as the sink words it. */
+  private async liveSubagentActivity(workspaceId: string): Promise<string[]> {
+    const labels = liveActivityLabels(this.listLiveWorkspaceActivity(workspaceId));
+    if (await this.hasRunningBackgroundBashProcesses(workspaceId)) {
+      labels.push("running background bash processes");
+    }
+    const integration = this.agentTaskIntegration;
+    // mutation-equivalent: a cascade has sub-agents only when the task integration is set
+    const durable = await integration?.hasActiveTopLevelWorkflowRunsForWorkspace(workspaceId);
+    if (hasInProcessWorkflowWork(workspaceId) || durable === true) {
+      labels.push("a workflow run starting or running");
+    }
+    return labels;
+  }
+
+  /**
+   * The sink's refusals for a cascaded sub-agent that do not depend on a race: live activity
+   * (including workflow runs) that archiving would terminate, and a native terminal or external
+   * editor whose lifetime cannot be tracked while the archive removes the checkout.
+   */
+  private async refuseBusyCascadeSubagent(
+    descendant: WorkspaceRemovalDescendant,
+    worktreeArchiveBehavior: WorktreeArchiveBehavior
+  ): Promise<string | null> {
+    const id = descendant.workspaceId;
+    const label = `sub-agent ${descendant.title} (${id})`;
+    const activity = await this.liveSubagentActivity(id);
+    if (activity.length > 0) {
+      return `Cannot archive ${label}: it has live activity (${activity.join(", ")}) that archiving would terminate. Wait for it to finish or ask the user to archive manually.`;
+    }
+    const metadata = await this.aiService.getWorkspaceMetadata(id);
+    if (!metadata.success) return `Cannot archive ${label}: ${metadata.error}`;
+    const removesEnvironment = archiveRemovesExternalAppEnvironment({
+      needsSnapshotCapture: this.isSnapshotArchiveEligibilityMutationSensitive(
+        id,
+        worktreeArchiveBehavior,
+        metadata.data
+      ),
+      remoteBoxBehavior: "keep",
+      worktreeArchiveBehavior,
+      metadata: metadata.data,
+    });
+    if (removesEnvironment && (await this.hasUntrackableExternalAppOpen(id))) {
+      return `Cannot archive ${label}: ${EXTERNAL_APP_ARCHIVE_REFUSAL}`;
+    }
+    return null;
   }
 
   /**
@@ -11953,7 +12079,7 @@ export class WorkspaceService
       {
         // A model-facing caller's fail-closed checks apply to every sub-agent (#4930); the
         // user-facing archive passes none of them.
-        forbidWorktreeCheckoutDeletion: options?.forbidWorktreeCheckoutDeletion,
+        forbidWorktreeCheckoutDeletion: forbidsSubagentCheckoutDeletion(options, descendantId),
         refuseLiveUserActivity: options?.refuseLiveUserActivity,
         forbidCoderWorkspaceDeletion: options?.forbidCoderWorkspaceDeletion,
         worktreeArchiveBehaviorOverride: worktreeArchiveBehavior,
@@ -11962,10 +12088,12 @@ export class WorkspaceService
       }
     );
     if (!result.success) return result.error;
+    if (result.data.kind === "archived") return null;
     // Untracked files that the user did not confirm (or that appeared after the confirmation)
-    // refuse; the dialog's retry preflights again and lists them.
-    return result.data.kind === "archived"
-      ? null
+    // refuse; the dialog's retry preflights again and lists them. A forced archive has no dialog:
+    // it lists the files itself, so a file that changed since means someone still works there.
+    return options?.acknowledgedSubagentCheckoutDeletions != null
+      ? FORCED_ARCHIVE_SUBAGENT_CHANGED_REFUSAL
       : "its untracked files would be lost by the snapshot archive and were not confirmed; archive again to review them";
   }
 
@@ -12210,17 +12338,21 @@ export class WorkspaceService
       // the managed worktree — or stop a dedicated remote Coder workspace the user may still
       // be connected to through such an app — a model-driven archive must not pull the
       // environment out from under a user's live shell or editor. Mirrors the lifecycle
-      // caller's early refusal against the same pinned behavior reads. ("delete" for a
-      // dedicated Coder workspace is refused outright above, so non-"keep" here means stop.)
-      const stopsDedicatedCoderWorkspace = remoteBoxBehavior !== "keep";
+      // caller's early refusal against the same pinned behavior reads. Only a caller that does
+      // not forbid the "delete" behaviors (a forced archive) reaches this check under them, and
+      // a live external app must still stop it: non-"keep" for a dedicated Coder workspace
+      // means stop or delete.
       if (
         options?.refuseLiveUserActivity === true &&
-        (needsSnapshotCapture || stopsDedicatedCoderWorkspace) &&
+        archiveRemovesExternalAppEnvironment({
+          needsSnapshotCapture,
+          remoteBoxBehavior,
+          worktreeArchiveBehavior,
+          metadata: beforeArchiveMetadata,
+        }) &&
         (await this.hasUntrackableExternalAppOpen(workspaceId))
       ) {
-        return Err(
-          "A native terminal or external editor was opened for this workspace and its lifetime cannot be tracked; the archive policy would remove the checkout or stop the dedicated remote Coder workspace under it. Ask the user to archive this workspace manually."
-        );
+        return Err(EXTERNAL_APP_ARCHIVE_REFUSAL);
       }
 
       // #4476: an archive that deletes the checkout (snapshot or delete behavior) refuses while

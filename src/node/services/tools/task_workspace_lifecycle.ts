@@ -9,8 +9,8 @@ import {
 import { isWorkspaceTurnTaskId } from "@/node/services/taskHandleStore";
 import { parseToolResult, requireWorkspaceId, requireWorkspaceTurnManager } from "./toolUtils";
 
-// Only the reversible verbs survive the #3825 restoration; task_remove is the
-// sole irreversible verb for child cleanup.
+// Only archive and unarchive survive the #3825 restoration; task_remove is the only verb that
+// removes a workspace record. Archive can still delete saved state, but only under `force`.
 type LifecycleAction = "archive" | "unarchive";
 
 interface LifecycleTarget {
@@ -64,6 +64,8 @@ export const createTaskWorkspaceLifecycleTool: ToolFactory = (config: ToolConfig
       const ownerWorkspaceId = requireWorkspaceId(config, "task_workspace_lifecycle");
       const workspaceTurnManager = requireWorkspaceTurnManager(config, "task_workspace_lifecycle");
       const interruptActive = args.interrupt_active === true;
+      // Unarchive deletes nothing, so it ignores force instead of rejecting a harmless flag.
+      const force = args.force === true;
 
       const seen = new Set<string>();
       const targets = args.targets.map(normalizeTarget).filter((target) => {
@@ -100,7 +102,7 @@ export const createTaskWorkspaceLifecycleTool: ToolFactory = (config: ToolConfig
                 const result = await workspaceTurnManager.archiveOwnedWorkspaceTurnWorkspace(
                   ownerWorkspaceId,
                   target,
-                  { interruptActive }
+                  { interruptActive, force }
                 );
                 return result.success
                   ? result.data
