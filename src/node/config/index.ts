@@ -4644,22 +4644,61 @@ export class Config {
         }
       };
 
+      // The marker mutation is irreversible work under the lock, like the
+      // field save (which asserts inside editConfig): on platforms without
+      // process birth identity a holder stalled past the lease can have been
+      // displaced by a peer that already completed a newer toggle, and
+      // recreating or removing the peer's marker would undo it. Re-validate
+      // ownership immediately before touching the marker. The two records
+      // must agree before we report success — a lost marker breaks the
+      // downgrade guarantee for an opt-out, and a stale marker overrides an
+      // explicit re-enable.
+      const syncTelemetryOptOutMarker = async (): Promise<void> => {
+        try {
+          await lock.assertStillOwned();
+        } catch {
+          await rollBackTelemetryState();
+          throw new Error(
+            "Lost the configuration lock before the telemetry opt-out marker could be updated; re-open Settings to confirm the current value."
+          );
+        }
+        try {
+          this.setTelemetryOptOutMarker(!enabled);
+        } catch {
+          await rollBackTelemetryState();
+          throw new Error(
+            "Could not update the telemetry opt-out marker file; the setting was not changed."
+          );
+        }
+      };
+
+      // The config.json write is the step every listener sees: this process
+      // notifies after it, and a peer backend sharing this home watches
+      // config.json, never the marker. So the effective state must be final
+      // once that write lands. An enable removes the marker first: a peer
+      // re-reading on the field write would otherwise still see the opt-out
+      // marker, and nothing would tell it once the marker went. A disable
+      // writes the field first (it alone reads disabled), then the marker.
+      if (enabled) {
+        await syncTelemetryOptOutMarker();
+      }
+
       try {
         await this.editConfig((config) => {
           // Persist the choice EXPLICITLY in both directions (no sparsify-on-
-          // enable): a crash between this verified write and the marker sync
-          // must leave a field the startup reconciliation can repair FROM — an
-          // absent field with a stale marker is indistinguishable from the
-          // downgrade-survivor state and would restart opted out despite a
-          // successful re-enable. Absent still means enabled-by-default for
-          // configs that never touched the toggle.
+          // enable): the startup reconciliation repairs the marker only FROM
+          // an explicit field (a crash between a disable's verified write and
+          // its marker sync, or a stale marker left beside an enable) — an
+          // absent field with a marker is indistinguishable from the
+          // downgrade-survivor state. Absent still means enabled-by-default
+          // for configs that never touched the toggle.
           config.telemetryEnabled = enabled;
           return config;
         }, withinRegistrationLock);
       } catch {
         // editConfig rejects when the save does not land (#4752): the same
-        // "not changed" contract as the strict re-read below, and nothing to
-        // roll back beyond the marker the failed write never reached.
+        // "not changed" contract as the strict re-read below. The rollback
+        // restores the marker an enable already removed.
         await rollBackTelemetryState();
         throw new Error(
           "Failed to persist the telemetry preference to config.json; the setting was not changed."
@@ -4694,38 +4733,9 @@ export class Config {
         );
       }
 
-      // The marker mutation is irreversible work under the lock, like the
-      // field save (which asserts inside editConfig): on platforms without
-      // process birth identity a holder stalled past the lease can have been
-      // displaced by a peer that already completed a newer toggle, and
-      // recreating or removing the peer's marker would undo it. Re-validate
-      // ownership immediately before touching the marker.
-      try {
-        await lock.assertStillOwned();
-      } catch {
-        await rollBackTelemetryState();
-        throw new Error(
-          "Lost the configuration lock before the telemetry opt-out marker could be updated; re-open Settings to confirm the current value."
-        );
+      if (!enabled) {
+        await syncTelemetryOptOutMarker();
       }
-      // Sync the downgrade-surviving sidecar marker only after the config
-      // write verified: the marker is a backstop, never the primary record.
-      // The two records must agree before we report success — a lost marker
-      // breaks the downgrade guarantee for an opt-out, and a stale marker
-      // overrides an explicit re-enable.
-      try {
-        this.setTelemetryOptOutMarker(!enabled);
-      } catch {
-        await rollBackTelemetryState();
-        throw new Error(
-          "Could not update the telemetry opt-out marker file; the setting was not changed."
-        );
-      }
-      // The nested field edit already notified, but that event fired BEFORE
-      // the marker sync — a peer client reading marker-aware getConfig() on it
-      // could still see the old effective state (stale marker). Emit again now
-      // that the full field/marker transaction is complete.
-      this.notifyConfigChanged();
     });
   }
 

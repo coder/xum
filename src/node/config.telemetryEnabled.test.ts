@@ -384,31 +384,63 @@ describe("Config telemetryEnabled persistence", () => {
     );
   });
 
-  it("notifies clients again after the marker sync completes", async () => {
+  /**
+   * What a peer backend sharing the home reads right after each config.json save of `config`: its
+   * watch covers config.json only, so that is the one moment it re-reads.
+   */
+  function recordPeerReadsAfterSaves(config: Config, failFirstSave = false) {
+    const peer = new Config(tempDir);
+    const reads: boolean[] = [];
+    const withSave = config as unknown as {
+      saveConfig: (c: unknown, expectedStatKey: string) => Promise<void>;
+    };
+    const originalSave = withSave.saveConfig.bind(config);
+    let failNext = failFirstSave;
+    const saveSpy = spyOn(withSave, "saveConfig").mockImplementation(
+      async (c: unknown, expectedStatKey: string) => {
+        if (failNext) {
+          failNext = false;
+          throw new Error("ENOSPC");
+        }
+        await originalSave(c, expectedStatKey);
+        reads.push(peer.isTelemetryDisabledByConfig());
+      }
+    );
+    return { reads, restore: () => saveSpy.mockRestore() };
+  }
+
+  it("a re-enable removes the marker before the config.json write a peer sees", async () => {
     const config = new Config(tempDir);
     await config.setTelemetryEnabledPersisted(false);
     expect(fsSync.existsSync(path.join(tempDir, "telemetry_opt_out"))).toBe(true);
 
-    // The nested field edit notifies before the marker is touched; a peer
-    // reading marker-aware state on that early event would still see the old
-    // effective value, so a final post-transaction notification must fire
-    // once the marker agrees with the field.
-    const markerStateAtNotify: boolean[] = [];
-    const notifiable = config as unknown as { notifyConfigChanged: () => void };
-    const originalNotify = notifiable.notifyConfigChanged.bind(config);
-    const notifySpy = spyOn(notifiable, "notifyConfigChanged").mockImplementation(() => {
-      markerStateAtNotify.push(fsSync.existsSync(path.join(tempDir, "telemetry_opt_out")));
-      originalNotify();
-    });
+    const peer = recordPeerReadsAfterSaves(config);
     try {
       await config.setTelemetryEnabledPersisted(true);
     } finally {
-      notifySpy.mockRestore();
+      peer.restore();
     }
+    // A peer re-reading on the field write sees the re-enable; nothing would
+    // tell it about a marker removed after that write.
+    expect(peer.reads).toEqual([false]);
+  });
 
-    expect(markerStateAtNotify.length).toBeGreaterThanOrEqual(2);
-    // The last notification observes the completed transaction: marker gone.
-    expect(markerStateAtNotify[markerStateAtNotify.length - 1]).toBe(false);
+  it("a failed re-enable restores the opt-out it removed first", async () => {
+    // Downgrade survivor: the marker is the only record of the opt-out.
+    const config = new Config(tempDir);
+    config.setTelemetryOptOutMarker(true);
+    expect(config.isTelemetryDisabledByConfig()).toBe(true);
+
+    const peer = recordPeerReadsAfterSaves(config, true);
+    try {
+      await rejectionOf(config.setTelemetryEnabledPersisted(true));
+    } finally {
+      peer.restore();
+    }
+    // The enable removed the marker before its field write failed: the
+    // rollback writes the opt-out back, field and downgrade backstop alike.
+    expect(peer.reads).toEqual([true]);
+    expect(fsSync.existsSync(path.join(tempDir, "telemetry_opt_out"))).toBe(true);
   });
 
   it("round-trips the opt-out through editConfig saves and reports it", async () => {
