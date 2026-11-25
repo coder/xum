@@ -2,16 +2,20 @@
 // records each wait and returns at once, so the wait sequence is asserted without waiting.
 //
 // Runs in CI's unit lane (scripts/test-unit-ci.sh); locally: bun test ./scripts/retry.test.ts
-import { afterEach, beforeEach, describe, expect, test } from "bun:test";
+import { afterEach, beforeEach, describe, expect, setDefaultTimeout, test } from "bun:test";
 import { mkdtemp, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import * as path from "node:path";
-import { runScript, writeExecutable, type RunResult } from "./ci/runScript";
+import {
+  SPAWNING_TEST_TIMEOUT_MS,
+  runScript,
+  writeExecutable,
+  type RunResult,
+} from "./ci/runScript";
+
+setDefaultTimeout(SPAWNING_TEST_TIMEOUT_MS);
 
 const RETRY = path.resolve(import.meta.dir, "retry.sh");
-
-// A test whose command really sleeps (4 s here) needs more than bun's 5 s default on a busy host.
-const SLOW_TEST_MS = 30_000;
 
 let work: string;
 
@@ -86,27 +90,23 @@ describe("exponential backoff", () => {
     expect(await lines("sleeps")).toEqual(["2", "4", "8", "16", "32", "60", "60", "60"]);
   });
 
-  test(
-    "stops when the next wait would end after the budget, counting the wait",
-    async () => {
-      // Each try takes 1 s, so the wait before try 4 (16 s) is the first to pass the 15 s budget.
-      // A budget check that ignored the wait would run on until the tries alone took 15 s.
-      const result = await retry([
-        "--max-backoff-secs",
-        "60",
-        "--budget-secs",
-        "15",
-        "0",
-        "2",
-        await command({ seconds: 1 }),
-      ]);
-      expect(result.exitCode).toBe(1);
-      expect(result.stdout).toContain("15s budget is spent");
-      expect(await lines("runs")).toHaveLength(4);
-      expect(await lines("sleeps")).toEqual(["2", "4", "8"]);
-    },
-    SLOW_TEST_MS
-  );
+  test("stops when the next wait would end after the budget, counting the wait", async () => {
+    // Each try takes 1 s, so the wait before try 4 (16 s) is the first to pass the 15 s budget.
+    // A budget check that ignored the wait would run on until the tries alone took 15 s.
+    const result = await retry([
+      "--max-backoff-secs",
+      "60",
+      "--budget-secs",
+      "15",
+      "0",
+      "2",
+      await command({ seconds: 1 }),
+    ]);
+    expect(result.exitCode).toBe(1);
+    expect(result.stdout).toContain("15s budget is spent");
+    expect(await lines("runs")).toHaveLength(4);
+    expect(await lines("sleeps")).toEqual(["2", "4", "8"]);
+  });
 
   test("gives up at once on a fatal status", async () => {
     const result = await retry([
@@ -154,10 +154,16 @@ describe.skipIf(!Bun.which("timeout") && !Bun.which("gtimeout"))(
       }
     }
 
-    test(
-      "cuts each later try off at what is left of the budget, not at the whole budget",
-      async () => {
-        await stubTimeout();
+    // bash counts `$SECONDS` in whole seconds, and retry.sh reads it twice (when it starts the budget
+    // and when it cuts a try), so a second boundary between the two reads takes one second off a cut:
+    // 8 for 9. A host that stalls the script for longer takes more off. So one cut can be anything
+    // from 5 to 9. Of three runs at least one has no stall, so the largest first cut is the whole
+    // budget. A budget that is off by one second (remaining - 1, + 1, - 2, + 2) never cuts at 9.
+    test("cuts each later try off at what is left of the budget, not at the whole budget", async () => {
+      await stubTimeout();
+      for (let run = 0; run < 3; run++) {
+        // `command` counts its runs in the file `runs`: start each run with a new count.
+        await rm(path.join(work, "runs"), { force: true });
         const result = await retry([
           "--budget-secs",
           "9",
@@ -166,34 +172,43 @@ describe.skipIf(!Bun.which("timeout") && !Bun.which("gtimeout"))(
           await command({ succeedOn: 2, seconds: 2 }),
         ]);
         expect(result.exitCode).toBe(0);
-        const seconds = (await lines("cuts")).map((cut) => Number(cut.split(" ")[2]));
-        expect(seconds).toHaveLength(2);
-        expect(seconds[0]).toBe(9);
-        expect(seconds[1]).toBeLessThanOrEqual(7);
-        expect(seconds[1]).toBeGreaterThan(0);
-      },
-      SLOW_TEST_MS
-    );
+      }
+      const seconds = (await lines("cuts")).map((cut) => Number(cut.split(" ")[2]));
+      expect(seconds).toHaveLength(6);
+      const firsts = [seconds[0], seconds[2], seconds[4]];
+      for (const first of firsts) {
+        expect(first).toBeGreaterThanOrEqual(5);
+        expect(first).toBeLessThanOrEqual(9);
+      }
+      expect(Math.max(...firsts)).toBe(9);
+      // The second try follows a try that took 2 s, so it is cut off at 7 s or less, never at 9.
+      for (const second of [seconds[1], seconds[3], seconds[5]]) {
+        expect(second).toBeGreaterThan(0);
+        expect(second).toBeLessThanOrEqual(7);
+      }
+    });
 
     test("kills a try that ignores the TERM 5 seconds after the cut", async () => {
       await stubTimeout();
-      await retry(["--budget-secs", "9", "0", "0", await command({ succeedOn: 1 })]);
-      expect(await lines("cuts")).toEqual(["-k 5 9"]);
+      // The same rule as the test above: each cut is 5 to 9, and one of three runs cuts at 9.
+      for (let run = 0; run < 3; run++) {
+        await retry(["--budget-secs", "9", "0", "0", await command({ succeedOn: 1 })]);
+      }
+      const cuts = await lines("cuts");
+      expect(cuts).toHaveLength(3);
+      for (const cut of cuts) expect(cut).toMatch(/^-k 5 [5-9]$/);
+      expect(cuts).toContain("-k 5 9");
     });
 
-    test(
-      "still cuts a try off when nothing is left of the budget",
-      async () => {
-        // `timeout 0` means no limit. With a budget of 0 the first try starts with 0 seconds left,
-        // and retry.sh must still cut it off (at 1 second) instead of letting it run to its end.
-        const started = Date.now();
-        const result = await retry(["--budget-secs", "0", "0", "1", "/bin/sleep", "15"]);
-        expect(result.exitCode).toBe(1);
-        expect(result.stdout).toContain("exit 124");
-        expect(Date.now() - started).toBeLessThan(10_000);
-      },
-      SLOW_TEST_MS
-    );
+    test("still cuts a try off when nothing is left of the budget", async () => {
+      // `timeout 0` means no limit. With a budget of 0 the first try starts with 0 seconds left,
+      // and retry.sh must still cut it off (at 1 second) instead of letting it run to its end.
+      const started = Date.now();
+      const result = await retry(["--budget-secs", "0", "0", "1", "/bin/sleep", "15"]);
+      expect(result.exitCode).toBe(1);
+      expect(result.stdout).toContain("exit 124");
+      expect(Date.now() - started).toBeLessThan(10_000);
+    });
   }
 );
 
