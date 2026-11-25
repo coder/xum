@@ -332,10 +332,10 @@ describe("TaskService.waitForAgentReport before the split", () => {
   test.each<[string, Read[], boolean, string, number]>([
     ["the row is removed, a report persisted", [removed, found], false, "report", 2],
     ["the row is removed, a failure persisted", [removed, none], true, FAILURE, 2],
-    ["the row is removed, nothing persisted", [removed, none], false, "Error", 2],
+    ["the row is removed, nothing persisted", [removed, none], false, "TaskNotFoundError", 2],
     ["the row reports, a report persisted", [reported, found], false, "report", 2],
     ["the row reports, a failure persisted", [reported, none], true, FAILURE, 2],
-    ["the row reports, nothing persisted", [reported, none], false, "Error", 2],
+    ["the row reports, nothing persisted", [reported, none], false, "TaskNotFoundError", 2],
     ["a report persisted, the row still interrupted", [none, found], false, "report", 2],
     ["the stream ends during the second read", [none, after(endStream)], false, LAUNCH_ERROR, 2],
     ["the stream ends during the first read", [after(endStream)], false, LAUNCH_ERROR, 1],
@@ -763,7 +763,7 @@ describe("TaskService.waitForAgentReport before the split", () => {
     const result = await outcome(h.start({ requestingWorkspaceId: undefined }));
 
     expect({ result, reads: h.reads.mock.calls, ...h.snapshot() }).toEqual({
-      result: "Error",
+      result: "TaskNotFoundError",
       reads: [[CHILD, undefined]],
       ...RELEASED,
     });

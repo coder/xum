@@ -167,21 +167,65 @@ export function formatSubagentReportUserMessage(params: {
   });
 }
 
+// Error types are Xum's own tokens (lowercase words joined by underscores). Anything else is not
+// copied into the row: a persisted artifact is the one place a caller can hand in other text.
+const SUBAGENT_FAILURE_ERROR_TYPE_PATTERN = /^[a-z0-9_]+$/;
+
+/**
+ * The `<error_message>` body of a failure row: Xum's own words, never the child's error text.
+ *
+ * The row is user-role, so the parent model reads it as the user's own words on every request
+ * until compaction. The child's error text comes from a provider, a remote host or a model, and
+ * can quote the repo, so it stays out. The parent reads it as a tool result instead:
+ * `task_await` on `awaitTaskId` returns the error the task stored. The card shows this sentence
+ * to the user as well, so it reads right for both of them.
+ */
+function subagentFailureBody(errorType: string, awaitTaskId: string): string {
+  const read =
+    `open the sub-agent workspace, or call task_await once with ` +
+    `${JSON.stringify({ task_ids: [awaitTaskId], timeout_secs: 0 })}. ` +
+    `The call returns the stored error at once and does not wait. Do not call it again.`;
+  switch (errorType) {
+    case "workspace_turn_superseded":
+      return (
+        `New input in the sub-agent workspace took over this delegated turn, so it will not ` +
+        `return a report. To see why, ${read}`
+      );
+    case "workspace_turn_incomplete":
+      return `The delegated turn ended without a final report. To see why, ${read}`;
+    default:
+      return (
+        `The sub-agent failed with error type ${errorType}. Xum does not copy the error text ` +
+        `into this message. To read it, ${read}`
+      );
+  }
+}
+
 // Failure twin of formatSubagentReportUserMessage: terminal child failures are
 // delivered into the parent context as an explicit failure block (never as a
 // report) so a later wake-up — by ANY sibling's settlement — cannot present the
-// fanout as fully successful.
+// fanout as fully successful. The signature takes no error text: see subagentFailureBody.
 export function formatSubagentFailureUserMessage(params: {
   childWorkspaceId: string;
   agentType: string;
   executionVersion?: string;
   executionId?: string;
   errorType: string;
-  errorMessage: string;
+  /**
+   * The task ID the body tells the parent to pass to `task_await`. For a row about one workspace
+   * turn it is that turn's handle, which reads exactly the failed turn even after the child has
+   * started a newer one (`task_await` lets any ancestor of the child read a terminal handle).
+   * Otherwise it is the child workspace ID.
+   */
+  awaitTaskId: string;
 }): string {
   strictAssert(params.childWorkspaceId.length > 0, "subagent failure message requires child id");
   strictAssert(params.agentType.length > 0, "subagent failure message requires agent type");
-  strictAssert(params.errorMessage.length > 0, "subagent failure message requires error message");
+  strictAssert(params.awaitTaskId.length > 0, "subagent failure message requires an await task id");
+  // Checked once: the header and the body both name the checked value.
+  const errorType = SUBAGENT_FAILURE_ERROR_TYPE_PATTERN.test(params.errorType)
+    ? params.errorType
+    : "unknown";
 
   return [
     SUBAGENT_FAILURE_ENVELOPE_TAG,
@@ -191,9 +235,9 @@ export function formatSubagentFailureUserMessage(params: {
       : []),
     ...(params.executionId != null ? [`<execution_id>${params.executionId}</execution_id>`] : []),
     `<agent_type>${params.agentType}</agent_type>`,
-    `<error_type>${params.errorType}</error_type>`,
+    `<error_type>${errorType}</error_type>`,
     "<error_message>",
-    params.errorMessage,
+    subagentFailureBody(errorType, params.awaitTaskId),
     "</error_message>",
     // Older clients require this exact terminator to render persisted failures.
     SUBAGENT_FAILURE_FOOTER,
