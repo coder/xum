@@ -5,6 +5,11 @@
 # Keep PATH resolution and step logging deterministic across tool calls.
 # This mirrors the proven workflow the team liked in coder-k8s.
 
+# Leaked SSH vars make Debian's /etc/bash.bashrc SSH heuristic source itself in
+# non-interactive make recipe shells, where its unguarded $PS1 fails under
+# `.SHELLFLAGS -eu` and breaks make targets.
+unset SSH_CLIENT SSH_CONNECTION SSH2_CLIENT
+
 xum_use_nix_devshell_path() {
 	local flake_root=""
 
