@@ -13,7 +13,10 @@ import { applyToolOutputRedaction } from "@/browser/utils/messages/applyToolOutp
 import { sanitizeToolInputs } from "@/browser/utils/messages/sanitizeToolInput";
 import { inlineSvgAsTextForProvider } from "@/node/utils/messages/inlineSvgAsTextForProvider";
 import { renderPluginHookContextForProvider } from "@/node/utils/messages/renderPluginHookContextForProvider";
-import { neutralizeAgentEnvelopeLookalikesForProvider } from "@/node/utils/messages/neutralizeAgentEnvelopeLookalikesForProvider";
+import {
+  neutralizeAgentEnvelopeLookalikesForProvider,
+  replayAgentMessagePayloadsAsToolResults,
+} from "@/node/utils/messages/neutralizeAgentEnvelopeLookalikesForProvider";
 import { extractToolMediaAsUserMessagesFromModelMessages } from "@/node/utils/messages/extractToolMediaAsUserMessagesFromModelMessages";
 import { sanitizeAnthropicPdfFilenames } from "@/node/utils/messages/sanitizeAnthropicDocumentFilename";
 import { convertDataUriFilePartsForSdk } from "@/node/utils/messages/convertDataUriFilePartsForSdk";
@@ -101,7 +104,8 @@ export interface PrepareMessagesOptions {
  * 3. Redacting heavy tool outputs
  * 4. Sanitizing tool inputs
  * 5. Inlining SVG attachments as text
- * 6. Neutralizing user-typed <mux_agent_message> lookalikes (peer-envelope provenance)
+ * 6. Neutralizing user-typed <mux_agent_message> lookalikes (peer-envelope provenance),
+ *    then replaying authentic agent-message payload rows as tool results
  * 7. Sanitizing PDF filenames for Anthropic
  * 8. Extracting tool-result media as user message attachments
  * 9. Rewriting data-URI file parts to SDK-safe inline base64
@@ -176,9 +180,15 @@ export async function prepareMessagesForProvider(
   const messagesWithNeutralizedEnvelopes =
     neutralizeAgentEnvelopeLookalikesForProvider(messagesWithInlinedSvg);
 
+  // Agent messages reach the model as tool results, never as its own assistant text (which
+  // models imitate). Must follow the neutralizer, which decides authenticity.
+  const messagesWithAgentMessageResults = replayAgentMessagePayloadsAsToolResults(
+    messagesWithNeutralizedEnvelopes
+  );
+
   // Render prompt-hook context into its user message (never the system prompt).
   const messagesWithHookContext = renderPluginHookContextForProvider(
-    messagesWithNeutralizedEnvelopes
+    messagesWithAgentMessageResults
   );
 
   // Sanitize PDF filenames for Anthropic (request-only, preserves original in UI/history).
