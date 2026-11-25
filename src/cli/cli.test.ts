@@ -282,6 +282,25 @@ describe("CLI via HTTP", () => {
     ]);
     expect(result).toEqual({ success: true, data: undefined });
   });
+
+  test("procedure returning success: false sets process.exitCode to 1 (#7856)", async () => {
+    const previousExitCode = process.exitCode;
+    process.exitCode = undefined;
+    try {
+      const result = await runCli([
+        "workspace",
+        "set-pinned",
+        "--workspace-id",
+        "nonexistent",
+        "--pinned",
+        "true",
+      ]);
+      expect(result).toEqual({ success: false, error: "Workspace not found" });
+      expect(process.exitCode as unknown).toBe(1);
+    } finally {
+      process.exitCode = previousExitCode;
+    }
+  });
 });
 
 describe("CLI Authentication", () => {
