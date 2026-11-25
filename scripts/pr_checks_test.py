@@ -474,6 +474,16 @@ else:
             with self.subTest(conclusion=conclusion):
                 self.assert_gate(1, fixture([check(), check(suite=2, conclusion=conclusion)]))
 
+    def test_cancelled_duplicate_run_is_ignored_when_newer_run_passes(self):
+        older_cancelled = check(conclusion="CANCELLED", suite=1)
+        newer_passed = check(conclusion="SUCCESS", suite=2)
+        self.assert_gate(0, fixture([older_cancelled, newer_passed]))
+
+    def test_cancelled_duplicate_run_is_ignored_when_newer_run_is_active(self):
+        older_cancelled = check(conclusion="CANCELLED", suite=1)
+        newer_pending = check(status="IN_PROGRESS", suite=2)
+        self.assert_gate(10, fixture([older_cancelled, newer_pending]))
+
     def test_api_failure_after_a_successful_page_fails_closed(self):
         data = fixture([check()])
         data["fail_ref"] = MERGE
