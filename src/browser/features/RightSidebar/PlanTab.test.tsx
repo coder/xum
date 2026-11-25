@@ -383,7 +383,7 @@ describe("PlanTab", () => {
     });
   });
 
-  test("Implement runs the latest plan card's action and reports when none can run", async () => {
+  test("Implement runs the latest plan card's action and reports a failure or none to run", async () => {
     mockApi = { workspace: { getPlanContent: mock(() => Promise.resolve(planResult("# Plan"))) } };
     const view = renderWithApi(<PlanTab workspaceId="workspace-1" />);
     await waitFor(() => {
@@ -395,25 +395,39 @@ describe("PlanTab", () => {
     const composer = document.createElement("div");
     composer.setAttribute("data-component", "ChatInputSection");
     document.body.appendChild(composer);
-    const toasts: Array<{ type: string }> = [];
+    const toasts: Array<{ type: string; message: string }> = [];
     const onToast = (event: Event) => {
       toasts.push((event as CustomEventType<typeof CUSTOM_EVENTS.ANALYTICS_REBUILD_TOAST>).detail);
     };
     const requests: string[] = [];
+    let nextOutcome: string | null = null;
     const planCard = (event: Event) => {
       const { detail } = event as CustomEventType<typeof CUSTOM_EVENTS.RUN_LATEST_PLAN_ACTION>;
       requests.push(detail.workspaceId);
       detail.handled = true;
+      detail.outcome = Promise.resolve(nextOutcome);
     };
     window.addEventListener(CUSTOM_EVENTS.ANALYTICS_REBUILD_TOAST, onToast);
     window.addEventListener(CUSTOM_EVENTS.RUN_LATEST_PLAN_ACTION, planCard);
     try {
       // A plan card is listening: it runs the action, so there is nothing to report.
-      fireEvent.click(view.getByRole("button", { name: "Implement" }));
+      await act(async () => {
+        fireEvent.click(view.getByRole("button", { name: "Implement" }));
+        await Promise.resolve();
+      });
       expect(requests).toEqual(["workspace-1"]);
       expect(toasts).toEqual([]);
 
+      // The action fails after it started: the card's alert can be covered (the narrow
+      // layout's full-screen sidebar), so the tab reports the failure too.
+      nextOutcome = "Model openai:gpt-5.2 is not allowed";
+      fireEvent.click(view.getByRole("button", { name: "Implement" }));
+      await waitFor(() => {
+        expect(toasts).toEqual([{ type: "error", message: "Model openai:gpt-5.2 is not allowed" }]);
+      });
+
       // No card can run it (none rendered, or its action disabled): the tab says so.
+      toasts.length = 0;
       window.removeEventListener(CUSTOM_EVENTS.RUN_LATEST_PLAN_ACTION, planCard);
       fireEvent.click(view.getByRole("button", { name: "Implement" }));
       expect(toasts.map((toast) => toast.type)).toEqual(["error"]);

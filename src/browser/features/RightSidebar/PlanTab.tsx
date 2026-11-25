@@ -114,10 +114,16 @@ function PlanTabBody(props: PlanTabProps) {
     };
   }, [workspaceId]);
 
-  const handleImplement = () => {
-    if (!runLatestPlanAction(workspaceId)) {
+  const handleImplement = async () => {
+    const outcome = runLatestPlanAction(workspaceId);
+    if (outcome === null) {
       showFeedbackToast({ type: "error", message: NO_RUNNABLE_PLAN_MESSAGE });
+      return;
     }
+    // The plan card shows a failure under itself, but the narrow layout's full-screen sidebar
+    // covers the transcript: without this the button would seem to do nothing.
+    const error = await outcome;
+    if (error !== null) showFeedbackToast({ type: "error", message: error });
   };
 
   // One editor launch at a time: a second press (or click) while one is in flight would open
@@ -195,7 +201,7 @@ function PlanTabBody(props: PlanTabProps) {
             <button
               type="button"
               className={ACTION_CLASS}
-              onClick={handleImplement}
+              onClick={() => void handleImplement()}
               disabled={!hasPlan}
             >
               <Play className="h-3 w-3" />

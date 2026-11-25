@@ -236,6 +236,12 @@ export interface CustomEventPayloads {
     workspaceId: string;
     /** Set synchronously by the plan card that started the action. */
     handled: boolean;
+    /**
+     * Set with `handled`: settles with the action's failure message, or null when it started.
+     * The card shows a failure under itself; a caller that can cover the transcript (the narrow
+     * layout's full-screen Plan tab) reports it too.
+     */
+    outcome?: Promise<string | null>;
   };
   [CUSTOM_EVENTS.FOCUS_BACKGROUND_PROCESSES]: {
     workspaceId: string;

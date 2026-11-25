@@ -576,11 +576,13 @@ export const ProposePlanToolCall: React.FC<ProposePlanToolCallProps> = (props) =
       : formatted.message;
   };
 
-  const handleImplement = async () => {
-    if (!workspaceId || !api) return;
-    if (isImplementingRef.current) return;
+  // Both plan actions settle with their failure message (null when nothing failed), which a
+  // Plan tab request reports too (RUN_LATEST_PLAN_ACTION's `outcome`).
+  const handleImplement = async (): Promise<string | null> => {
+    if (!workspaceId || !api) return null;
+    if (isImplementingRef.current) return null;
     // The button is disabled while hydrating; this covers a click racing the barrier closing.
-    if (!isTranscriptMutationAllowed(workspaceId)) return;
+    if (!isTranscriptMutationAllowed(workspaceId)) return null;
 
     isImplementingRef.current = true;
     if (isMountedRef.current) {
@@ -596,9 +598,12 @@ export const ProposePlanToolCall: React.FC<ProposePlanToolCallProps> = (props) =
         replacementErrorContext: "Failed to replace chat history before implementing:",
       });
       if (isMountedRef.current) setPlanActionError(error);
+      return error;
     } catch (error) {
       // The user retries after reading why it failed.
-      if (isMountedRef.current) setPlanActionError(getErrorMessage(error));
+      const message = getErrorMessage(error);
+      if (isMountedRef.current) setPlanActionError(message);
+      return message;
     } finally {
       isImplementingRef.current = false;
       if (isMountedRef.current) {
@@ -606,10 +611,10 @@ export const ProposePlanToolCall: React.FC<ProposePlanToolCallProps> = (props) =
       }
     }
   };
-  const handleContinueInAuto = async () => {
-    if (!workspaceId || !api) return;
-    if (isContinuingInAutoRef.current) return;
-    if (!isTranscriptMutationAllowed(workspaceId)) return;
+  const handleContinueInAuto = async (): Promise<string | null> => {
+    if (!workspaceId || !api) return null;
+    if (isContinuingInAutoRef.current) return null;
+    if (!isTranscriptMutationAllowed(workspaceId)) return null;
 
     isContinuingInAutoRef.current = true;
     if (isMountedRef.current) {
@@ -625,8 +630,11 @@ export const ProposePlanToolCall: React.FC<ProposePlanToolCallProps> = (props) =
         replacementErrorContext: "Failed to replace chat history before continuing in auto:",
       });
       if (isMountedRef.current) setPlanActionError(error);
+      return error;
     } catch (error) {
-      if (isMountedRef.current) setPlanActionError(getErrorMessage(error));
+      const message = getErrorMessage(error);
+      if (isMountedRef.current) setPlanActionError(message);
+      return message;
     } finally {
       isContinuingInAutoRef.current = false;
       if (isMountedRef.current) {
@@ -753,11 +761,10 @@ export const ProposePlanToolCall: React.FC<ProposePlanToolCallProps> = (props) =
   const selectedWorkspaceId = workspaceContext?.selectedWorkspace?.workspaceId;
   useEffect(() => {
     if (!primaryPlanAction || !workspaceId) return;
-    const runIfEnabled = (): boolean => {
-      const { disabled, onClick } = primaryPlanAction;
-      if (disabled || !onClick) return false;
-      onClick();
-      return true;
+    // The button's own enablement, then its handler (Continue in Auto when it is the Auto button).
+    const runIfEnabled = (): Promise<string | null> | null => {
+      if (primaryPlanAction.disabled) return null;
+      return implementButton ? handleImplement() : handleContinueInAuto();
     };
     const handleKeyDown = (event: KeyboardEvent) => {
       if (!matchesKeybind(event, KEYBINDS.RUN_LATEST_PLAN_ACTION)) return;
@@ -778,12 +785,15 @@ export const ProposePlanToolCall: React.FC<ProposePlanToolCallProps> = (props) =
       if (isTypingInNonEmptyField(document.activeElement)) return;
       event.preventDefault();
       if (event.repeat) return;
-      runIfEnabled();
+      void runIfEnabled();
     };
     const handlePaletteRequest = (event: Event) => {
       const { detail } = event as CustomEventType<typeof CUSTOM_EVENTS.RUN_LATEST_PLAN_ACTION>;
       if (detail.workspaceId !== workspaceId) return;
-      if (runIfEnabled()) detail.handled = true;
+      const outcome = runIfEnabled();
+      if (outcome === null) return;
+      detail.handled = true;
+      detail.outcome = outcome;
     };
     window.addEventListener("keydown", handleKeyDown);
     window.addEventListener(CUSTOM_EVENTS.RUN_LATEST_PLAN_ACTION, handlePaletteRequest);

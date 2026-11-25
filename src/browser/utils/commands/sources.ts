@@ -1668,7 +1668,7 @@ export function buildCoreSources(p: BuildSourcesParams): Array<() => CommandActi
         keywords: ["plan", "implement", "continue in auto", "propose_plan"],
         shortcutHint: formatKeybind(KEYBINDS.RUN_LATEST_PLAN_ACTION),
         run: () => {
-          if (!runLatestPlanAction(id)) {
+          if (runLatestPlanAction(id) === null) {
             showCommandFeedbackToast({ type: "error", message: NO_RUNNABLE_PLAN_MESSAGE });
           }
         },

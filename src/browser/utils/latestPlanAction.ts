@@ -5,14 +5,16 @@ export const NO_RUNNABLE_PLAN_MESSAGE =
 
 /**
  * Run the latest plan card's primary action (Implement, or Continue in Auto in Auto mode) for a
- * workspace. The card marks the request handled synchronously (#4963); false means no card could
- * run it, and the caller says so (NO_RUNNABLE_PLAN_MESSAGE).
+ * workspace. The card marks the request handled synchronously (#4963). Returns null when no card
+ * could run it, and the caller says so (NO_RUNNABLE_PLAN_MESSAGE); otherwise the action's
+ * outcome: its failure message, or null once it started.
  */
-export function runLatestPlanAction(workspaceId: string): boolean {
+export function runLatestPlanAction(workspaceId: string): Promise<string | null> | null {
   const request = createCustomEvent(CUSTOM_EVENTS.RUN_LATEST_PLAN_ACTION, {
     workspaceId,
     handled: false,
   });
   window.dispatchEvent(request);
-  return request.detail.handled;
+  if (!request.detail.handled) return null;
+  return request.detail.outcome ?? Promise.resolve(null);
 }
