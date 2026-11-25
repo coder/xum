@@ -271,10 +271,13 @@ describe("iOS standalone viewport", () => {
     });
   });
 
-  test("keeps the resize sync and removes the probe when the viewport cannot be observed", () => {
+  test("keeps the resize sync and removes the probe when the observer cannot be built", () => {
     class FailingResizeObserver {
+      constructor() {
+        throw new Error("observer failed");
+      }
       observe() {
-        throw new Error("observe failed");
+        return undefined;
       }
       disconnect() {
         return undefined;
@@ -294,10 +297,31 @@ describe("iOS standalone viewport", () => {
         setInnerHeight(500);
         window.dispatchEvent(new window.Event("resize"));
         expect(appViewportHeight()).toBe("500px");
+
+        // No observer was built, so the remover must still clean up without throwing.
+        cleanupSync();
+        cleanupSync = null;
+        expect(document.body.childElementCount).toBe(bodyChildren);
       });
     } finally {
       consoleError.mockRestore();
     }
+  });
+
+  test("removes the probe cleanly when no ResizeObserver exists at all", () => {
+    withResizeObserver(undefined, () => {
+      setStandalone(true);
+      setInnerHeight(852);
+
+      cleanupSync = installViewportHeightSync();
+      setInnerHeight(500);
+      window.dispatchEvent(new window.Event("resize"));
+      expect(appViewportHeight()).toBe("500px");
+
+      cleanupSync();
+      cleanupSync = null;
+      expect(appViewportHeight()).toBe("");
+    });
   });
 });
 

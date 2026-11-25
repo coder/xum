@@ -1,4 +1,5 @@
 import { isIosStandaloneWebApp } from "@/browser/utils/env";
+import { observeLayoutViewportSize } from "@/browser/utils/viewportHeight";
 import { IOS_STATUS_BAND_HEIGHT_PX } from "@/constants/layout";
 
 /**
@@ -547,6 +548,11 @@ class CoverColumnViewport {
   }
 
   // Re-laying the page out fires resize too, so only a change of display or orientation syncs.
+  // The layout viewport box's resize (see installIosCoverColumn) re-checks through the same path: a
+  // fold's real layout can settle a few frames after its last resize event with no event of its
+  // own (the same settle installViewportHeightSync observes), which would leave the takeover on
+  // the wrong display. The keyboard also resizes that box while the takeover is off, but changes
+  // neither the geometry key nor a pinned layout, so it re-syncs nothing.
   onResize(): void {
     if (readGeometryKey() !== this.geometryKey) this.sync();
   }
@@ -607,6 +613,7 @@ export function installIosCoverColumn(): () => void {
     new ColumnTouchBridge(() => viewport.column).install(),
     listen("resize", onResize),
     listen("scroll", () => viewport.onScroll()),
+    observeLayoutViewportSize(onResize, "iOS cover column"),
     () => visualViewport?.removeEventListener("resize", onResize),
   ];
   return () => {

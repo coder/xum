@@ -230,6 +230,63 @@ describe("installIosCoverColumn", () => {
     expect(document.documentElement.style.getPropertyValue(IOS_COVER_COLUMN_PROPERTY)).toBe("");
   });
 
+  test("takes the column back when the fold settles after its resize events with no further one", () => {
+    setStandalone(true);
+    const visualViewport = new window.EventTarget();
+    Object.defineProperty(window, "visualViewport", { configurable: true, value: visualViewport });
+    // The real observer fires when the layout actually settles; the tests drive it by hand.
+    const settled: Array<() => void> = [];
+    class RecordingResizeObserver {
+      constructor(callback: () => void) {
+        settled.push(callback);
+      }
+      observe(): void {
+        return undefined;
+      }
+      disconnect(): void {
+        return undefined;
+      }
+    }
+    Object.defineProperty(window, "ResizeObserver", {
+      configurable: true,
+      value: RecordingResizeObserver,
+    });
+    uninstall = installIosCoverColumn();
+
+    // Fold back from the inner display: the resize events fire while the page still lays out at
+    // the inner display's size, so neither re-checks the geometry, and the cover layout then
+    // settles with no event of its own.
+    display.current = INNER;
+    window.dispatchEvent(new window.Event("resize"));
+    visualViewport.dispatchEvent(new window.Event("resize"));
+    expect(meta.content).toBe(DEVICE_WIDTH_META);
+
+    // The cover layout settles to 678: the observer fires on that settle and re-syncs, although no
+    // resize or visualViewport event names it.
+    display.current = COVER;
+    for (const callback of settled) callback();
+
+    expect(meta.content).toStartWith("width=466, height=678,");
+    expect(document.documentElement.style.getPropertyValue(IOS_COVER_COLUMN_PROPERTY)).toBe("84px");
+  });
+
+  test("re-syncs only when a resize or settle changes the display, not on every fire", () => {
+    setStandalone(true);
+    const layoutLog: string[] = [];
+    const mutationObserver = new window.MutationObserver(() => layoutLog.push(meta.content));
+    mutationObserver.observe(meta, { attributes: true });
+    try {
+      uninstall = installIosCoverColumn();
+
+      // The keyboard fires window resizes that change no geometry: re-laying the page out on each
+      // would flicker the composer the way the typing-flicker fix (#7986) had to undo.
+      window.dispatchEvent(new window.Event("resize"));
+      expect(layoutLog).toEqual([]);
+    } finally {
+      mutationObserver.disconnect();
+    }
+  });
+
   describe("a sideways scroll of the page", () => {
     const panPage = () => {
       Object.defineProperty(window, "scrollX", { configurable: true, value: 84 });
