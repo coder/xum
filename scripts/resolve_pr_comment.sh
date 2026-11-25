@@ -25,7 +25,8 @@ RESULT=$(gh api graphql \
   -f query="$MUTATION" \
   -F threadId="$THREAD_ID")
 
-RESOLVED=$(echo "$RESULT" | jq -r '.data.resolveReviewThread.thread.isResolved')
+# GitHub's isResolved is a Boolean!: compare with the boolean in jq, so the string "true" is no confirmation.
+RESOLVED=$(echo "$RESULT" | jq -r '(.data.resolveReviewThread.thread.isResolved == true)')
 
 if [ "$RESOLVED" == "true" ]; then
   echo "✅ Thread $THREAD_ID resolved"
