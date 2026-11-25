@@ -209,6 +209,77 @@ export GIT_ASKPASS=echo
 export SSH_ASKPASS=echo
 export GIT_SSH_COMMAND="\${GIT_SSH_COMMAND:-ssh} -o BatchMode=yes -o StrictHostKeyChecking=accept-new"
 
+# One-time heal for repos that previous versions of this script converted
+# into promisor/partial clones. --no-filter (used below) stops new damage, but
+# the persisted remote.origin.partialclonefilter keeps every plain user
+# "git fetch" filtered, and blobs that earlier filtered fetches omitted stay
+# missing, so "git worktree add" (workspace creation) lazy-fetches them
+# mid-checkout and fails on transient network errors. Only repos whose filter
+# is exactly the "blob:none" this script used to write are healed. This block
+# runs before any ls-remote/primary-branch gating on purpose: a stale
+# origin/HEAD (e.g. default branch renamed upstream) makes the checks below
+# exit early, which must not leave the repo poisoned forever.
+#
+# The heal removes only the filter and keeps remote.origin.promisor and
+# extensions.partialclone, so any object the backfill cannot restore (offline,
+# refs deleted upstream, pseudo-refs or reflogs the enumeration does not walk)
+# can still be lazy-fetched. Removing those keys too would need proof that no
+# object is missing anywhere in the repo, and a gap in that proof turns a
+# recoverable partial clone into one whose checkouts fail with "unable to read
+# sha1 file". The backfill is best-effort and runs once: after the filter is
+# gone the repo is no worse than any partial clone.
+#
+# Sibling worktrees share repo config and can run this script at once. The
+# unset is the claim: git rewrites the config under config.lock and looks for
+# the key while holding it, so exactly one run removes the filter and gets
+# exit 0; the others find the key gone or the lock taken and skip the
+# backfill.
+if [ "$(git config --local --get remote.origin.partialclonefilter 2>/dev/null)" = "blob:none" ] &&
+    git config --local --unset-all remote.origin.partialclonefilter 2>/dev/null; then
+  echo "HEAL: removed partial-clone filter; backfilling missing objects"
+  # Locally reachable objects the repo does not have, one OID per line.
+  # When rev-list fails (e.g. a ref names a commit the repo lacks) a
+  # sentinel is printed instead, so stage 2 still runs.
+  xum_missing_objects() {
+    if xum_rl_out=$(git rev-list --objects --missing=print --all --reflog 2>/dev/null); then
+      printf '%s\\n' "$xum_rl_out" | sed -n 's/^?//p'
+    else
+      echo "enumeration-failed"
+    fi
+  }
+  MISSING=$(xum_missing_objects)
+  # Stage 1: batch-fetch exactly the missing objects by OID. Downloads
+  # only the gaps (a --refetch re-sends the whole repo) and works on
+  # hosts whose git predates --refetch (2.36), e.g. Ubuntu 22.04's 2.34.
+  # OID wants ride the same server capability the repo's lazy fetch
+  # already depends on (this is a batched lazy fetch).
+  if [ -n "$MISSING" ] && [ "$MISSING" != "enumeration-failed" ]; then
+    printf '%s\\n' "$MISSING" | git -c protocol.version=2 \\
+        fetch origin \\
+        --stdin \\
+        --no-tags \\
+        --no-recurse-submodules \\
+        --no-write-fetch-head \\
+        2>&1
+    MISSING=$(xum_missing_objects)
+  fi
+  # Stage 2: full --refetch (git >= 2.36, hence feature-detected) for
+  # servers that refuse OID wants: it negotiates as if the repo had
+  # nothing, so the server re-sends every object reachable from its
+  # current refs, including previously filtered-out blobs.
+  if [ -n "$MISSING" ] && git fetch -h 2>&1 | grep -q refetch; then
+    git -c protocol.version=2 \\
+        fetch origin \\
+        --refetch \\
+        --no-filter \\
+        --prune \\
+        --no-tags \\
+        --no-recurse-submodules \\
+        --no-write-fetch-head \\
+        2>&1
+  fi
+fi
+
 # Get primary branch name
 PRIMARY_BRANCH=$(git symbolic-ref refs/remotes/origin/HEAD 2>/dev/null | sed 's@^refs/remotes/origin/@@')
 if [ -z "$PRIMARY_BRANCH" ]; then
@@ -235,6 +306,17 @@ if [ "$LOCAL_SHA" = "$REMOTE_SHA" ]; then
 fi
 
 # Remote has new commits or ref moved - fetch updates
+#
+# --no-filter (NOT --filter=blob:none): a filtered fetch permanently converts
+# the repo into a promisor/partial clone (git writes remote.origin.promisor +
+# remote.origin.partialclonefilter on the first filtered fetch, and the
+# configured filter then applies to every subsequent plain fetch). That leaves
+# every commit fetched by this background loop without its blobs, so a later
+# "git worktree add" (workspace creation) must lazy-fetch blobs from the
+# remote mid-checkout and any transient network failure aborts it with
+# "fatal: could not fetch <oid> from promisor remote". --no-filter avoids
+# poisoning healthy repos and keeps this fetch unfiltered even in a repo that
+# still has a filter configured (the heal block above removes it once).
 git -c protocol.version=2 \\
     -c fetch.negotiationAlgorithm=skipping \\
     fetch origin \\
@@ -242,6 +324,6 @@ git -c protocol.version=2 \\
     --no-tags \\
     --no-recurse-submodules \\
     --no-write-fetch-head \\
-    --filter=blob:none \\
+    --no-filter \\
     2>&1
 `;

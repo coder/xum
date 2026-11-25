@@ -159,7 +159,11 @@ function isUnresolvedDeltaPushFailure(errorMsg: string): boolean {
 }
 
 function isMissingObjectCheckoutFailure(message: string): boolean {
-  return /unable to read sha1 file|Could not reset index file|missing (blob|tree|commit)|bad object|unable to read tree|object file .* is empty|loose object .* is corrupt/i.test(
+  // "could not fetch ... from promisor remote": the checkout needed objects the
+  // repo does not have and a lazy fetch from upstream failed (e.g. transient
+  // network drop). The objects are still missing locally, so the same
+  // repair-from-local path applies.
+  return /unable to read sha1 file|Could not reset index file|missing (blob|tree|commit)|bad object|unable to read tree|object file .* is empty|loose object .* is corrupt|could not fetch .* from promisor remote/i.test(
     message
   );
 }
@@ -2890,6 +2894,24 @@ export class SSHRuntime extends RemoteRuntime {
       `git --git-dir=${baseRepoPathArg} symbolic-ref HEAD ${baseRepoUnbornHeadArg} 2>/dev/null || { echo WARM_MISS:base-head-normalization-failed; exit 0; }`,
     ];
 
+    // Best-effort heal, mirroring GIT_FETCH_SCRIPT's heal block. The warm path
+    // skips ensureBaseRepo(), and older background status fetches ran
+    // `git fetch --filter=blob:none` inside sibling worktrees, which registers
+    // the shared base repo as a blobless partial clone. `git worktree add`
+    // below would then lazy-fetch the omitted blobs mid-checkout, so a
+    // transient network drop aborts workspace creation. Remove the filter and
+    // batch-fetch the missing OIDs while origin is configured (an eager lazy
+    // fetch). The promisor keys stay: they keep lazy fetch working for any
+    // object the backfill could not restore, and a failed lazy fetch is
+    // classified as missing-objects below so the slow path repairs it.
+    const warmBaseRepoPromisorHealPreamble = [
+      // The unset is the claim against sibling status fetches healing the same repo.
+      `if [ "$(git --git-dir=${baseRepoPathArg} config --local --get remote.origin.partialclonefilter 2>/dev/null)" = "blob:none" ] && git --git-dir=${baseRepoPathArg} config --local --unset-all remote.origin.partialclonefilter 2>/dev/null; then`,
+      `  xum_base_missing=$(git --git-dir=${baseRepoPathArg} rev-list --objects --missing=print --all --reflog 2>/dev/null | sed -n 's/^?//p')`,
+      `  [ -z "$xum_base_missing" ] || printf '%s\\n' "$xum_base_missing" | git --git-dir=${baseRepoPathArg} -c protocol.version=2 fetch origin --stdin --no-tags --no-recurse-submodules --no-write-fetch-head >/dev/null 2>&1 || true`,
+      `fi`,
+    ].join("\n");
+
     const originPreamble = originUrlArg
       ? [
           `git -C ${baseRepoPathArg} remote set-url origin ${originUrlArg} 2>/dev/null || git -C ${baseRepoPathArg} remote add origin ${originUrlArg} >/dev/null 2>&1 || true`,
@@ -2913,6 +2935,8 @@ export class SSHRuntime extends RemoteRuntime {
       ...warmBaseRepoNormalizationPreamble,
       // Optional origin fetch (preserves slow-path origin-freshness).
       ...originPreamble,
+      // Promisor heal after origin setup so its backfill can reach upstream.
+      warmBaseRepoPromisorHealPreamble,
       // Choose the worktree base ref. Prefer freshly-fetched
       // `refs/remotes/origin/<trunk>` whenever the fetch succeeded; otherwise
       // fall back to the local-snapshot bundle ref, matching
@@ -2937,7 +2961,7 @@ export class SSHRuntime extends RemoteRuntime {
       "wt_status=$?",
       'if [ "$wt_status" -ne 0 ]; then',
       '  case "$wt_output" in',
-      '    *"unable to read sha1 file"*|*"Could not reset index file"*|*"missing blob"*|*"missing tree"*|*"missing commit"*|*"bad object"*|*"unable to read tree"*) wt_reason=missing-objects ;;',
+      '    *"unable to read sha1 file"*|*"Could not reset index file"*|*"missing blob"*|*"missing tree"*|*"missing commit"*|*"bad object"*|*"unable to read tree"*|*"from promisor remote"*) wt_reason=missing-objects ;;',
       "    *) wt_reason=worktree-add-failed ;;",
       "  esac",
       `  git -C ${baseRepoPathArg} worktree remove --force ${workspacePathArg} >/dev/null 2>&1 || rm -rf ${workspacePathArg}`,
