@@ -7,8 +7,10 @@ import {
   collectActiveWorkflowGroupKeys,
   computeSidebarTaskGroups,
   computeTaskGroupMemberRowMeta,
+  getTaskGroupHeaderChildTrunk,
   shortenWorkflowRunId,
 } from "./sidebarTaskGroups";
+import { getSubAgentParentRailX, getTaskGroupMemberDepth } from "../sidebarItemLayout";
 
 function createWorkspace(
   id: string,
@@ -256,7 +258,6 @@ describe("computeTaskGroupMemberRowMeta", () => {
     depth: 1,
     rowKind: "subagent",
     connectorPosition: "middle",
-    connectorStartsAtParent: true,
     sharedTrunkActiveThroughRow: true,
     sharedTrunkActiveBelowRow: true,
     ancestorTrunks: [{ depth: 1, active: false }],
@@ -282,7 +283,6 @@ describe("computeTaskGroupMemberRowMeta", () => {
     const firstMeta = meta.get("first");
     const secondMeta = meta.get("second");
     expect(firstMeta?.connectorPosition).toBe("middle");
-    expect(firstMeta?.connectorStartsAtParent).toBe(true);
     // Trunk animates down to the lowest running member.
     expect(firstMeta?.sharedTrunkActiveThroughRow).toBe(true);
     expect(firstMeta?.sharedTrunkActiveBelowRow).toBe(true);
@@ -336,5 +336,96 @@ describe("computeTaskGroupMemberRowMeta", () => {
 
     expect(meta.get("only")?.connectorPosition).toBe("single");
     expect(meta.get("only")?.ancestorTrunks).toEqual([]);
+  });
+});
+
+describe("getTaskGroupHeaderChildTrunk", () => {
+  const headerMeta: AgentRowRenderMeta = {
+    depth: 1,
+    rowKind: "subagent",
+    connectorPosition: "last",
+    sharedTrunkActiveThroughRow: false,
+    sharedTrunkActiveBelowRow: false,
+    ancestorTrunks: [],
+    hasHiddenCompletedChildren: false,
+    visibleCompletedChildrenCount: 0,
+  };
+
+  function groupWith(...members: FrontendWorkspaceMetadata[]) {
+    const rows = [parent, ...members];
+    const group = computeSidebarTaskGroups({ rows, allRows: rows }).groupsByStorageKey.get(
+      "workflow:parent:wfr_trunk"
+    );
+    expect(group).toBeDefined();
+    return group!;
+  }
+
+  test("an expanded header starts the member trunk on the member rail", () => {
+    const group = groupWith(
+      workflowChild("queued", "wfr_trunk", { taskStatus: "queued" }),
+      workflowChild("running", "wfr_trunk", { taskStatus: "running" })
+    );
+    const memberMetaByWorkspaceId = computeTaskGroupMemberRowMeta({
+      group,
+      headerMeta,
+      headerDepth: 1,
+    });
+
+    expect(
+      getTaskGroupHeaderChildTrunk({
+        group,
+        isExpanded: true,
+        headerDepth: 1,
+        memberMetaByWorkspaceId,
+      })
+    ).toEqual({
+      left: getSubAgentParentRailX(getTaskGroupMemberDepth(1), "task-group-member"),
+      // A lower member is running, so the trunk animates through the first member.
+      active: true,
+    });
+  });
+
+  test("the stub stays still when no member is running", () => {
+    const group = groupWith(workflowChild("queued", "wfr_trunk", { taskStatus: "queued" }));
+    const memberMetaByWorkspaceId = computeTaskGroupMemberRowMeta({
+      group,
+      headerMeta,
+      headerDepth: 1,
+    });
+
+    expect(
+      getTaskGroupHeaderChildTrunk({
+        group,
+        isExpanded: true,
+        headerDepth: 1,
+        memberMetaByWorkspaceId,
+      })?.active
+    ).toBe(false);
+  });
+
+  test("collapsed groups and members without row meta draw no stub", () => {
+    const group = groupWith(workflowChild("running", "wfr_trunk"));
+    const memberMetaByWorkspaceId = computeTaskGroupMemberRowMeta({
+      group,
+      headerMeta,
+      headerDepth: 1,
+    });
+
+    expect(
+      getTaskGroupHeaderChildTrunk({
+        group,
+        isExpanded: false,
+        headerDepth: 1,
+        memberMetaByWorkspaceId,
+      })
+    ).toBeUndefined();
+    expect(
+      getTaskGroupHeaderChildTrunk({
+        group,
+        isExpanded: true,
+        headerDepth: 1,
+        memberMetaByWorkspaceId: new Map(),
+      })
+    ).toBeUndefined();
   });
 });

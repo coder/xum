@@ -1260,8 +1260,10 @@ describe("sub-agent row render metadata", () => {
     const depthByWorkspaceId = computeWorkspaceDepthMap(flattened);
     const metadataByWorkspaceId = computeAgentRowRenderMeta(flattened, depthByWorkspaceId);
 
-    expect(metadataByWorkspaceId.get("child-1")?.connectorStartsAtParent).toBe(true);
-    expect(metadataByWorkspaceId.get("child-2")?.connectorStartsAtParent).toBe(false);
+    // The parent owns the top of the shared trunk; it animates because a child
+    // below is running.
+    expect(metadataByWorkspaceId.get("parent")?.childTrunkActive).toBe(true);
+    expect(metadataByWorkspaceId.get("child-1")?.childTrunkActive).toBeUndefined();
 
     expect(metadataByWorkspaceId.get("child-1")?.sharedTrunkActiveThroughRow).toBe(true);
     expect(metadataByWorkspaceId.get("child-2")?.sharedTrunkActiveThroughRow).toBe(true);
@@ -1288,6 +1290,8 @@ describe("sub-agent row render metadata", () => {
     expect(metadataByWorkspaceId.get("child-2")?.sharedTrunkActiveThroughRow).toBe(false);
     expect(metadataByWorkspaceId.get("child-1")?.sharedTrunkActiveBelowRow).toBe(false);
     expect(metadataByWorkspaceId.get("child-2")?.sharedTrunkActiveBelowRow).toBe(false);
+    // Children are visible, so the parent still renders a (static) trunk stub.
+    expect(metadataByWorkspaceId.get("parent")?.childTrunkActive).toBe(false);
   });
 
   it("assigns single connector position for an only child", () => {
@@ -1352,8 +1356,10 @@ describe("sub-agent row render metadata", () => {
     expect(metadataByWorkspaceId.get("active-grandchild")).toMatchObject({
       depth: 1,
       rowKind: "subagent",
-      connectorStartsAtParent: true,
     });
+    // The promoted child hangs off the visible root, so the root renders the
+    // trunk stub for it.
+    expect(metadataByWorkspaceId.get("root")?.childTrunkActive).toBe(true);
   });
 
   it("keeps running children with stale reportedAt visible and out of completed counts", () => {
@@ -1596,7 +1602,6 @@ describe("computeRowMetaForVisibleNodes", () => {
     depth,
     rowKind: "subagent",
     connectorPosition: "single",
-    connectorStartsAtParent: false,
     sharedTrunkActiveThroughRow: false,
     sharedTrunkActiveBelowRow: false,
     ancestorTrunks: [],
@@ -1623,12 +1628,16 @@ describe("computeRowMetaForVisibleNodes", () => {
 
     const header = meta.get("workflow:root:wfr_x");
     expect(header?.connectorPosition).toBe("middle");
-    expect(header?.connectorStartsAtParent).toBe(false);
     // The shared trunk animates down to the lowest running sibling (the header).
     expect(header?.sharedTrunkActiveThroughRow).toBe(true);
     expect(header?.sharedTrunkActiveBelowRow).toBe(false);
     expect(meta.get("child-a")?.sharedTrunkActiveBelowRow).toBe(true);
     expect(meta.get("child-b")?.connectorPosition).toBe("last");
+    // The root owns the top of the trunk shared by its running children.
+    expect(meta.get("root")?.childTrunkActive).toBe(true);
+    // child-b parents the grandchild, so it renders a static trunk stub.
+    expect(meta.get("child-b")?.childTrunkActive).toBe(false);
+    expect(meta.get("child-a")?.childTrunkActive).toBeUndefined();
 
     // Descendants of a middle sibling receive its continuing trunk.
     const grandchild = meta.get("grandchild");
